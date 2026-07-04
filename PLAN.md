@@ -110,13 +110,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 2A: lexer with quoting/escape rules | Missing: `src/shell/lex.rs` + unit tests. |
-| Incomplete | Work | 2B: parser to AST (pipes, redirects, lists) | Missing: `src/shell/parse.rs` + unit tests. |
-| Incomplete | Work | 2C: `$VAR` expansion and assignment prefixes | Missing: expansion tests incl. quoting interaction. |
-| Incomplete | Work | 2D: clear errors for unsupported grammar | Missing: error tests for globs/`$(...)`/`&`. |
-| Incomplete | Test | golden corpus vs bash behavior | Missing: fixture corpus. |
-| Incomplete | Test | fuzz/proptest no-panic | Missing: fuzz target in CI or justfile. |
-| Incomplete | Gate | corpus + fuzz green | Missing: passing run. |
+| Complete | Work | 2A: lexer with quoting/escape rules | `src/shell/lex.rs`: bash-rule escapes, newline separators, quoted-literal tracking + unit tests. |
+| Complete | Work | 2B: parser to AST (pipes, redirects, lists) | `src/shell/parse.rs`: `Program`/`AndOrList`/`Pipeline`/`Simple`, fd redirects, newline continuation after `&& \|\| \|` + unit tests. |
+| Complete | Work | 2C: `$VAR` expansion and assignment prefixes | Segmented words (`Literal{quoted}`/`Expansion`), unquoted-`NAME=` assignment detection, `$?` supported. |
+| Complete | Work | 2D: clear errors for unsupported grammar | Positioned errors for globs, `$(...)`, backticks, `&`, subshells, braces, heredocs, tilde, `$'...'`, special params, `+=`, `!`. |
+| Complete | Test | golden corpus vs bash behavior | `tests/fixtures/shell_golden.txt` (30+ bash-verified cases) + `tests/shell_golden.rs`. |
+| Complete | Test | fuzz/proptest no-panic | `tests/shell_proptest.rs`: metacharacter-biased no-panic + round-trip property. |
+| Complete | Gate | corpus + fuzz green | Reviewer approved after 3 rounds; local test + clippy green. |
 
 ## Phase 3: Machine, executor, builtins
 

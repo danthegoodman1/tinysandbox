@@ -1,0 +1,40 @@
+# Phase 2 shell parser golden corpus.
+# Observable word formation cases were manually checked against bash using
+# `set -- <case>; printf '<%s>\n' "$@"` style probes. Cases use \n for
+# literal newlines; <empty> pins empty input.
+<empty>
+echo "a b"
+echo 'a$B'
+echo a"b c"d
+echo \$HOME
+echo "\$HOME"
+echo "foo$"
+echo "$'x'"
+echo "a\\b"
+echo "" end
+echo a""b
+echo ''
+echo a\ b
+echo $HOME "$HOME" ${USER}
+echo pre${X}post
+echo hi # comment
+VAR=x
+VAR=x cmd
+VAR =x
+echo hi >file
+echo hi > file
+echo hi 2> f
+0<f
+cat <in 2>>log
+cmd 2>&1
+a && b || c; d
+a &&\nb
+left | right
+a |\nb
+left | middle | right
+echo done;
+echo first\necho second
+echo before # comment\necho after
+echo $?
+echo ""$X $X
+echo a:~
