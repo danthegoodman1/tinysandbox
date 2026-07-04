@@ -138,6 +138,9 @@ Scope:
   which; `/bin` synthesized read-only from the registry.
 - Thread dispatch policy for blocking VFS backends (`spawn_blocking` path)
   with a fast inline path for in-memory.
+- Observability: `Machine::stats()` (VFS bytes/files via optional `Vfs`
+  stats method, commands run) and per-exec metrics on `ExecResult` (wall
+  time per command/pipeline, pipe byte counts).
 
 Out of scope:
 - JS runtime, snapshots, concurrent streaming executor.
@@ -163,6 +166,7 @@ Status ledger:
 | Incomplete | Work | 3D: limits (wall clock, output caps, command count) | Missing: limit enforcement tests. |
 | Incomplete | Work | 3E: builtins with GNU-faithful flags | Missing: per-builtin golden tests. |
 | Incomplete | Work | 3F: blocking-VFS thread dispatch | Missing: slow fake VFS integration test. |
+| Incomplete | Work | 3G: `Machine::stats()` + `ExecResult` metrics | Missing: stats API + tests. |
 | Incomplete | Test | end-to-end pipeline suite via public API | Missing: `tests/e2e.rs`. |
 | Incomplete | Gate | e2e + golden + limit tests green | Missing: passing CI run. |
 
@@ -183,6 +187,8 @@ Scope:
   the machine wall-clock budget; OOM and timeout surface as script errors /
   exit 124.
 - Cargo feature `js` gating wasmtime and the wasm blob.
+- Peak wasm memory per execution (observed via `ResourceLimiter`) reported
+  in `ExecResult` metrics.
 
 Out of scope:
 - Async JS APIs, event loop, `node` alias decision, module resolution
@@ -208,7 +214,7 @@ Status ledger:
 | Incomplete | Work | 4A: quickjs-ng wasm artifact vendored + engine cache | Missing: artifact, build provenance note, `src/js/engine.rs`. |
 | Incomplete | Work | 4B: Node `fs` hostcalls over the VFS | Missing: hostcall impl + corpus tests. |
 | Incomplete | Work | 4C: console/process/stdio wiring, exit codes | Missing: unit tests. |
-| Incomplete | Work | 4D: memory + epoch limits | Missing: adversarial tests passing. |
+| Incomplete | Work | 4D: memory + epoch limits, peak-memory metric | Missing: adversarial tests passing. |
 | Incomplete | Work | 4E: `js` cargo feature gating | Missing: feature-matrix CI. |
 | Incomplete | Test | Node-compat script corpus | Missing: fixtures + runner. |
 | Incomplete | Gate | corpus + adversarial + feature matrix green | Missing: passing CI run. |
