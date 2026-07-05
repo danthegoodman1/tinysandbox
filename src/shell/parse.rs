@@ -4,6 +4,7 @@ use crate::shell::{
     Redirect, RedirectTarget, Segment, SimpleCommand, UnsupportedConstruct, Word,
 };
 
+/// Parses a shell program in the supported bash-compatible subset.
 pub fn parse(input: &str) -> Result<Program, ParseError> {
     Parser::new(input, lex(input)?).parse_program()
 }

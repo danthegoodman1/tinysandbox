@@ -6,9 +6,9 @@ use tinysandbox::sandbox::Sandbox;
 
 #[tokio::main]
 async fn main() {
-    let sandbox = Sandbox::builder().build();
+    let sandbox = Sandbox::builder().persist_session(true).build();
 
-    // cwd and env persist across execs, like a real shell session.
+    // This example opts into a persistent shell session across exec calls.
     sandbox
         .exec("mkdir -p /workspace/logs && cd /workspace")
         .await;

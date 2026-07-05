@@ -269,12 +269,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 5A: `VfsSnapshot` + CoW on `InMemoryVfs` | Missing: impl + isolation tests. |
-| Incomplete | Work | 5B: conformance suite snapshot extension | Missing: suite section + green run. |
-| Incomplete | Work | 5C: comprehensive edge-case coverage sweep | Missing: llvm-cov audit, gap list, new cases + fixes. |
-| Incomplete | Work | 5D: fuzz targets + findings fixed | Missing: fuzz run logs. |
-| Incomplete | Work | 5E: rustdoc, README, examples, publish dry-run | README + examples/ landed early; missing: rustdoc pass, semver review, dry-run output. |
-| Incomplete | Gate | coverage sweep + fuzz clean + dry-run + docs green | Missing: passing CI run. |
+| Complete | Work | 5A: `VfsSnapshot` + CoW on `InMemoryVfs` | `snapshot`/`restore`/`branch` with `Arc`-shared content, CoW via `Arc::make_mut` (shrink copies prefix only). Reviewer probe: 256 MiB snapshot 33 us, EBADF on pre-restore handles, quota recomputed. Structural sharing pinned via `Arc::ptr_eq` tests. |
+| Complete | Work | 5B: conformance suite snapshot extension | Opt-in `run_snapshots` (non-snapshot impls unaffected): isolation, restore fidelity, branch independence, quota-at-limit. |
+| Complete | Work | 5C: comprehensive edge-case coverage sweep | llvm-cov 85.0% -> 87.2% lines; shell/mod.rs 38% -> 100%, builtins 80% -> 86%. Closed: basename paths, echo -e escapes, sed/head/tail mid-stream errors, stat operand, all ParseError displays. Phase 7 follow-ups fixed (handle leaks + regression tests, builtin dedupe, dead fd arms). Deviations documented in builtins module docs (sed exit 2 vs GNU 4, trailing-slash normalization, no Try-help lines). |
+| Complete | Work | 5D: fuzz targets + findings fixed | Deviation: cargo-fuzz unavailable (no interactive installs); fallback PROPTEST_CASES=4096 runs of shell + model-based VFS op-sequence proptests, green. Committed fuzz/ dir deferred. |
+| Complete | Work | 5E: rustdoc, README, examples, publish dry-run | `#![warn(missing_docs)]` + doc build under `-D warnings`; README included as crate docs, 8 doctests; docs.rs-safe links; CI gains doc + publish dry-run gates; dry-run packages 39 files at 0.3.0. |
+| Complete | Work | 5F (added): `persist_session` builder option | Session persistence now off by default (base session per exec, no store-back, race-free concurrent execs); `persist_session(true)` restores prior semantics. Breaking default change -> 0.3.0. |
+| Complete | Gate | coverage sweep + fuzz clean + dry-run + docs green | All six gates verified by reviewer; approved after 1 fix round (3 majors + minors). Remaining nits documented as deviations. |
 
 ## Phase 6: Node.js bindings
 
@@ -295,6 +296,14 @@ Scope:
   can self-certify.
 - Node test suite (node:test) covering exec, tool calls, JS VFS, JS custom
   command, and limit behavior.
+- Docs/examples parity: every Rust code example in the README gains an
+  equivalent JS version, shown after the Rust one under lower-tier
+  sub-headers (e.g. "Rust" / "JavaScript") so both audiences can skim
+  their language; every on-disk example in `examples/` gains an equivalent
+  runnable JS example (e.g. `tinysandbox-node/examples/quickstart.mjs`,
+  `custom_command.mjs`, `js_scripts.mjs`, plus a JS-VFS example), verified
+  runnable against the locally built binding. README install/quickstart
+  covers both `cargo add` and `npm install`.
 
 Out of scope:
 - Prebuilt binary distribution matrix / npm publish automation (document
@@ -303,7 +312,8 @@ Out of scope:
 Completion gate:
 `npm test` green against a locally built binding, including the conformance
 suite running against a JS-implemented VFS and an end-to-end
-`exec("cat x | js t.js")` from Node.
+`exec("cat x | js t.js")` from Node; README shows Rust + JS variants for
+every example and all on-disk JS examples run against the built binding.
 
 Testing plan:
 - node:test suite: sandbox lifecycle, exec output/exit codes, direct VFS
@@ -319,6 +329,7 @@ Status ledger:
 | Incomplete | Work | 6B: Sandbox/exec/VFS/limits bindings | Missing: binding impl + node:test coverage. |
 | Incomplete | Work | 6C: `JsVfs` threadsafe-function adapter | Missing: adapter + deadlock-freedom test. |
 | Incomplete | Work | 6D: conformance runner exported to JS | Missing: JS-VFS conformance run green. |
+| Incomplete | Work | 6E: README Rust/JS example parity + on-disk JS examples | Missing: JS variants in README + runnable `.mjs` examples. |
 | Incomplete | Test | node:test suite incl. e2e pipeline from Node | Missing: `tinysandbox-node/__test__/`. |
 | Incomplete | Gate | `npm test` green with JS VFS conformance | Missing: passing run. |
 
@@ -407,3 +418,74 @@ Status ledger:
 | Complete | Work | 7D: streaming-aware output caps + metrics | `CappedOutput` byte-identical to old truncation; pipe_bytes via pipe counters. |
 | Complete | Test | generating-VFS byte-count + deadlock + 141 suites | `tests/streaming.rs`: 14 tests incl. 4 GiB virtual file served <= 2 MiB for `head -n 1`, timeout-abort, mid-stream read errors, pipeline-subshell semantics. |
 | Complete | Gate | full suite + clippy green with streaming proofs | 84 tests green all-features + no-default-features, clippy `-D warnings` clean. Reviewer approved after 1 fix round (1 blocker + 7 majors fixed); minor follow-ups noted: error-path handle leaks, duplicated shell-builtin fn. |
+
+## Phase 8: Release automation for crates.io and npm
+
+Runs after Phase 6 (the npm side publishes the `tinysandbox-node` package it
+creates). Mirrors the release pipeline in the sibling `durust` repo.
+
+Goal:
+Merges to `main` automatically version and publish the crate to crates.io
+and the Node package to npm, in lockstep, with no manual release steps.
+
+Scope:
+- `scripts/release-version.mjs` (adapted from durust): `next` computes the
+  next version from the current lockstep version and the bump signal
+  (`#major`/`#minor` in the commit message, else patch; `workflow_dispatch`
+  input can override); `apply` writes it to every manifest (root
+  `Cargo.toml`, `tinysandbox-node/Cargo.toml`, npm `package.json`s);
+  `check` verifies lockstep agreement.
+- `.github/workflows/release.yml` (adapted from durust): triggers on CI
+  success on `main` plus manual `workflow_dispatch` with a bump choice;
+  eligibility guard skips `chore(release):` commits and `[skip release]`
+  markers; commits the version bump back to `main` as
+  `chore(release): X.Y.Z [skip release]`; publishes crates with
+  already-published idempotency checks (curl the crates.io API before
+  `cargo publish --locked`), waiting for dependency crates to become
+  visible before publishing dependents; publishes npm packages via OIDC
+  trusted publishing with `npm view` idempotency checks.
+- CI workflow gains any missing release-blocking gates so "CI green on
+  main" is a trustworthy release trigger (doc build and publish dry-run
+  land in Phase 5).
+- Security posture, enforced by construction: pull requests run the test
+  workflow only — no secrets, no publish steps, no version commits (the
+  publish dry-run needs no token). Versioning and deployment happen
+  exclusively on push to `main` (direct or merged PR) via the
+  `workflow_run`-on-CI-success trigger, which never fires for PR runs.
+  Release-workflow permissions stay minimal (`contents: write`,
+  `id-token: write`); the test workflow keeps default read-only
+  permissions.
+- Secrets/settings documented in the workflow header comment:
+  `CARGO_REGISTRY_TOKEN`, npm trusted-publisher configuration for the
+  package, branch-protection interaction with the release commit, and the
+  Actions approval policy (already set: workflow runs from all external
+  contributors require approval from a maintainer).
+
+Out of scope:
+- Prebuilt native binary matrices for the Node package beyond what Phase 6
+  established; changelog generation; GitHub Releases/tags beyond what the
+  version commit provides.
+
+Completion gate:
+A merge to `main` with CI green produces a version-bump commit and both
+registries showing the new version (or idempotently skips when nothing
+changed); a `workflow_dispatch` with an explicit bump works; a
+`[skip release]` commit does not release; a PR run executes tests only,
+with read-only permissions and no access to publish secrets.
+
+Testing plan:
+- `release-version.mjs` unit-tested (node:test) for bump parsing, lockstep
+  application, and disagreement detection.
+- Dry-run exercise of the workflow steps locally (script `next`/`apply`/
+  `check` roundtrip, `cargo publish --dry-run`, `npm publish --dry-run`).
+- First real release observed end to end on both registries.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 8A: `scripts/release-version.mjs` lockstep versioning | Missing: script + unit tests. |
+| Incomplete | Work | 8B: `release.yml` auto-release workflow | Missing: workflow. |
+| Incomplete | Work | 8C: CI gates sufficient as release trigger | Missing: audit vs release requirements. |
+| Incomplete | Test | script unit tests + dry-run roundtrip | Missing: tests + logs. |
+| Incomplete | Gate | end-to-end auto-release on both registries | Missing: observed release. |

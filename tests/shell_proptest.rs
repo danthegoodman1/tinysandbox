@@ -9,6 +9,12 @@ proptest! {
     }
 
     #[test]
+    fn arbitrary_utf8_input_never_panics(input in arbitrary_utf8_input()) {
+        // The public parser accepts UTF-8 strings, so arbitrary Unicode should stay Result-based.
+        let _ = parse(&input);
+    }
+
+    #[test]
     fn rendered_plain_simple_commands_round_trip_words(words in plain_words()) {
         // Plain words avoid shell metacharacters, so parsing should preserve exact literal text.
         let input = words.join(" ");
@@ -46,6 +52,10 @@ fn shellish_input() -> impl Strategy<Value = String> {
 
     prop::collection::vec(prop::sample::select(ALPHABET), 0..256)
         .prop_map(|chars| chars.into_iter().collect())
+}
+
+fn arbitrary_utf8_input() -> impl Strategy<Value = String> {
+    prop::collection::vec(any::<char>(), 0..128).prop_map(|chars| chars.into_iter().collect())
 }
 
 fn plain_words() -> impl Strategy<Value = Vec<String>> {

@@ -1,17 +1,27 @@
+//! In-memory VFS with quota enforcement and copy-on-write snapshots.
+
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::path::normalize_path;
-use super::{DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsResult};
+use super::{
+    DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsResult,
+    VfsSnapshot,
+};
 
+/// Storage limits enforced by [`InMemoryVfs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsQuota {
+    /// Maximum total bytes stored in visible files and open unlinked files.
     pub max_bytes: u64,
+    /// Maximum non-root directory entries, including files and directories.
     pub max_files: u64,
+    /// Maximum size of any single file.
     pub max_file_size: u64,
 }
 
 impl VfsQuota {
+    /// Returns a quota with all limits set to `u64::MAX`.
     pub const fn unlimited() -> Self {
         Self {
             max_bytes: u64::MAX,
@@ -27,19 +37,30 @@ impl Default for VfsQuota {
     }
 }
 
+/// Current quota usage for a VFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsStats {
+    /// Total bytes stored in files.
     pub used_bytes: u64,
+    /// Count of non-root files and directories.
     pub file_count: u64,
 }
 
+/// Quota-enforced in-memory implementation of [`Vfs`].
 #[derive(Debug)]
 pub struct InMemoryVfs {
     quota: VfsQuota,
     state: Mutex<State>,
 }
 
+/// Copy-on-write snapshot captured from an [`InMemoryVfs`].
+#[derive(Debug, Clone)]
+pub struct InMemoryVfsSnapshot {
+    state: SnapshotState,
+}
+
 impl InMemoryVfs {
+    /// Creates an empty in-memory VFS with `quota`.
     pub fn new(quota: VfsQuota) -> Self {
         Self {
             quota,
@@ -47,11 +68,20 @@ impl InMemoryVfs {
         }
     }
 
+    /// Returns current quota usage.
     pub fn stats(&self) -> VfsResult<VfsStats> {
         let state = self.state();
         Ok(VfsStats {
             used_bytes: state.used_bytes,
             file_count: state.file_count,
+        })
+    }
+
+    fn from_snapshot(quota: VfsQuota, snapshot: &InMemoryVfsSnapshot) -> VfsResult<Self> {
+        ensure_snapshot_fits_quota(&snapshot.state, quota)?;
+        Ok(Self {
+            quota,
+            state: Mutex::new(State::from_snapshot(&snapshot.state, 1)),
         })
     }
 
@@ -89,7 +119,11 @@ impl InMemoryVfs {
             .files
             .get_mut(&inode)
             .ok_or(VfsError::new(Errno::ENOENT))?;
-        file.data.resize(new_len, 0);
+        if new_len < old_len && Arc::strong_count(&file.data) > 1 {
+            file.data = Arc::new(file.data[..new_len].to_vec());
+        } else {
+            Arc::make_mut(&mut file.data).resize(new_len, 0);
+        }
         state.used_bytes = used_bytes;
         Ok(())
     }
@@ -338,7 +372,6 @@ impl Vfs for InMemoryVfs {
     }
 
     fn write_at(&self, handle: FileHandle, offset: u64, data: &[u8]) -> VfsResult<usize> {
-        let offset = usize::try_from(offset).map_err(|_| VfsError::new(Errno::EINVAL))?;
         let mut state = self.state();
         let handle = state
             .handles
@@ -354,6 +387,7 @@ impl Vfs for InMemoryVfs {
             return Ok(0);
         }
 
+        let offset = usize::try_from(offset).map_err(|_| VfsError::new(Errno::EINVAL))?;
         let old_len = state
             .files
             .get(&handle.inode)
@@ -371,7 +405,7 @@ impl Vfs for InMemoryVfs {
             .files
             .get_mut(&handle.inode)
             .ok_or(VfsError::new(Errno::ENOENT))?;
-        file.data[write_offset..write_end].copy_from_slice(data);
+        Arc::make_mut(&mut file.data)[write_offset..write_end].copy_from_slice(data);
         Ok(data.len())
     }
 
@@ -407,6 +441,29 @@ impl Vfs for InMemoryVfs {
     }
 }
 
+impl VfsSnapshot for InMemoryVfs {
+    type Snapshot = InMemoryVfsSnapshot;
+
+    fn snapshot(&self) -> VfsResult<Self::Snapshot> {
+        let state = self.state();
+        Ok(InMemoryVfsSnapshot {
+            state: SnapshotState::from_state(&state)?,
+        })
+    }
+
+    fn restore(&self, snapshot: &Self::Snapshot) -> VfsResult<()> {
+        ensure_snapshot_fits_quota(&snapshot.state, self.quota)?;
+        let mut state = self.state();
+        let next_handle = state.next_handle;
+        *state = State::from_snapshot(&snapshot.state, next_handle);
+        Ok(())
+    }
+
+    fn branch(&self, snapshot: &Self::Snapshot) -> VfsResult<Self> {
+        Self::from_snapshot(self.quota, snapshot)
+    }
+}
+
 type Directory = BTreeMap<String, Node>;
 type Inode = u64;
 
@@ -435,14 +492,69 @@ impl Default for State {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct SnapshotState {
+    root: Node,
+    files: BTreeMap<Inode, FileNode>,
+    next_inode: Inode,
+    used_bytes: u64,
+    file_count: u64,
+}
+
+impl SnapshotState {
+    fn from_state(state: &State) -> VfsResult<Self> {
+        let mut files = BTreeMap::new();
+        let mut used_bytes = 0;
+        let mut file_count = 0;
+        collect_snapshot_entries(
+            &state.root,
+            &state.files,
+            &mut files,
+            &mut used_bytes,
+            &mut file_count,
+        )?;
+        Ok(Self {
+            root: state.root.clone(),
+            files,
+            next_inode: state.next_inode,
+            used_bytes,
+            file_count,
+        })
+    }
+}
+
+impl State {
+    fn from_snapshot(snapshot: &SnapshotState, next_handle: u64) -> Self {
+        Self {
+            root: snapshot.root.clone(),
+            files: snapshot.files.clone(),
+            next_inode: snapshot.next_inode,
+            next_handle,
+            handles: BTreeMap::new(),
+            used_bytes: snapshot.used_bytes,
+            file_count: snapshot.file_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FileNode {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     links: u64,
     open_handles: u64,
 }
 
-#[derive(Debug)]
+impl Default for FileNode {
+    fn default() -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            links: 0,
+            open_handles: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Node {
     File(Inode),
     Directory(Directory),
@@ -558,6 +670,66 @@ fn adjusted_used_bytes(used_bytes: u64, old_len: usize, new_len: usize) -> VfsRe
     }
 }
 
+fn collect_snapshot_entries(
+    node: &Node,
+    state_files: &BTreeMap<Inode, FileNode>,
+    snapshot_files: &mut BTreeMap<Inode, FileNode>,
+    used_bytes: &mut u64,
+    file_count: &mut u64,
+) -> VfsResult<()> {
+    match node {
+        Node::File(inode) => {
+            let file = state_files.get(inode).ok_or(VfsError::new(Errno::ENOENT))?;
+            let len = u64::try_from(file.data.len()).map_err(|_| VfsError::new(Errno::EINVAL))?;
+            *used_bytes = used_bytes
+                .checked_add(len)
+                .ok_or(VfsError::new(Errno::ENOSPC))?;
+            *file_count = file_count
+                .checked_add(1)
+                .ok_or(VfsError::new(Errno::ENOSPC))?;
+            snapshot_files.insert(
+                *inode,
+                FileNode {
+                    data: Arc::clone(&file.data),
+                    links: 1,
+                    open_handles: 0,
+                },
+            );
+            Ok(())
+        }
+        Node::Directory(entries) => {
+            for child in entries.values() {
+                *file_count = file_count
+                    .checked_add(matches!(child, Node::Directory(_)) as u64)
+                    .ok_or(VfsError::new(Errno::ENOSPC))?;
+                collect_snapshot_entries(
+                    child,
+                    state_files,
+                    snapshot_files,
+                    used_bytes,
+                    file_count,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_snapshot_fits_quota(snapshot: &SnapshotState, quota: VfsQuota) -> VfsResult<()> {
+    if snapshot.used_bytes > quota.max_bytes || snapshot.file_count > quota.max_files {
+        return Err(VfsError::new(Errno::ENOSPC));
+    }
+
+    for file in snapshot.files.values() {
+        let len = u64::try_from(file.data.len()).map_err(|_| VfsError::new(Errno::ENOSPC))?;
+        if len > quota.max_file_size {
+            return Err(VfsError::new(Errno::ENOSPC));
+        }
+    }
+
+    Ok(())
+}
+
 fn remove_tree(state: &mut State, node: Node) -> VfsResult<()> {
     match node {
         Node::File(inode) => {
@@ -602,8 +774,10 @@ fn has_prefix(path: &[String], prefix: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{InMemoryVfs, VfsQuota};
-    use crate::vfs::{Errno, OpenMode, Vfs};
+    use crate::vfs::{Errno, OpenMode, Vfs, VfsSnapshot};
 
     #[test]
     fn write_extending_past_eof_fills_gap_with_zeroes() {
@@ -654,5 +828,77 @@ mod tests {
 
         assert_eq!(err.errno(), Errno::ENOSPC);
         assert_eq!(vfs.stats().expect("stats").file_count, 1);
+    }
+
+    #[test]
+    fn snapshot_data_is_shared_until_live_write() {
+        // This pins the CoW invariant snapshots rely on: reads keep file data
+        // shared, while writes detach the live file from the snapshot.
+        let vfs = InMemoryVfs::default();
+        let handle = vfs
+            .open("/file", OpenMode::read_write().create_new())
+            .expect("file opens");
+        vfs.write_at(handle, 0, b"abcdef")
+            .expect("seed write succeeds");
+
+        let snapshot = vfs.snapshot().expect("snapshot succeeds");
+        let live_after_snapshot = only_file_data(&vfs);
+        let snapshot_data = snapshot
+            .state
+            .files
+            .values()
+            .next()
+            .expect("snapshot file exists")
+            .data
+            .clone();
+        assert!(Arc::ptr_eq(&live_after_snapshot, &snapshot_data));
+
+        let mut buf = [0; 3];
+        vfs.read_at(handle, 0, &mut buf)
+            .expect("read keeps data shared");
+        assert!(Arc::ptr_eq(&only_file_data(&vfs), &snapshot_data));
+
+        vfs.write_at(handle, 0, b"Z").expect("write detaches data");
+        assert!(!Arc::ptr_eq(&only_file_data(&vfs), &snapshot_data));
+        vfs.close(handle).expect("close handle");
+    }
+
+    #[test]
+    fn truncating_shared_snapshot_data_copies_only_the_prefix() {
+        // Shrinking a shared buffer should detach to the requested prefix
+        // without cloning the discarded suffix first.
+        let vfs = InMemoryVfs::default();
+        let handle = vfs
+            .open("/file", OpenMode::read_write().create_new())
+            .expect("file opens");
+        vfs.write_at(handle, 0, b"abcdef")
+            .expect("seed write succeeds");
+        let snapshot = vfs.snapshot().expect("snapshot succeeds");
+        let snapshot_data = snapshot
+            .state
+            .files
+            .values()
+            .next()
+            .expect("snapshot file exists")
+            .data
+            .clone();
+
+        vfs.truncate(handle, 3).expect("truncate succeeds");
+
+        let live_data = only_file_data(&vfs);
+        assert!(!Arc::ptr_eq(&live_data, &snapshot_data));
+        assert_eq!(&live_data[..], b"abc");
+        assert_eq!(&snapshot_data[..], b"abcdef");
+        vfs.close(handle).expect("close handle");
+    }
+
+    fn only_file_data(vfs: &InMemoryVfs) -> Arc<Vec<u8>> {
+        vfs.state()
+            .files
+            .values()
+            .next()
+            .expect("file exists")
+            .data
+            .clone()
     }
 }

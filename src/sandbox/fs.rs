@@ -1,3 +1,5 @@
+//! Async filesystem facade exposed to sandbox commands.
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
@@ -15,6 +17,7 @@ use crate::vfs::{
 
 pub(crate) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Filesystem handle scoped to a sandbox command's current directory.
 #[derive(Clone)]
 pub struct Fs {
     vfs: Arc<dyn Vfs>,
@@ -31,6 +34,7 @@ impl Fs {
         }
     }
 
+    /// Returns metadata for a path resolved relative to the current directory.
     pub async fn stat(&self, path: &str) -> VfsResult<Metadata> {
         let path = self.resolve(path);
         if let Some(metadata) = self.bin_stat(&path) {
@@ -39,6 +43,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.stat(&path)).await
     }
 
+    /// Reads directory entries for a path resolved relative to the current directory.
     pub async fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
         let path = self.resolve(path);
         if path == "/bin" {
@@ -60,6 +65,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.readdir(&path)).await
     }
 
+    /// Creates a directory.
     pub async fn mkdir(&self, path: &str) -> VfsResult<()> {
         let path = self.resolve(path);
         if is_bin_path(&path) {
@@ -68,6 +74,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.mkdir(&path)).await
     }
 
+    /// Renames a file or directory.
     pub async fn rename(&self, from: &str, to: &str) -> VfsResult<()> {
         let from = self.resolve(from);
         let to = self.resolve(to);
@@ -77,6 +84,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.rename(&from, &to)).await
     }
 
+    /// Removes a file.
     pub async fn unlink(&self, path: &str) -> VfsResult<()> {
         let path = self.resolve(path);
         if is_bin_path(&path) {
@@ -85,6 +93,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.unlink(&path)).await
     }
 
+    /// Removes an empty directory.
     pub async fn rmdir(&self, path: &str) -> VfsResult<()> {
         let path = self.resolve(path);
         if is_bin_path(&path) {
@@ -93,6 +102,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.rmdir(&path)).await
     }
 
+    /// Reads an entire file into memory.
     pub async fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
         let path = self.resolve(path);
         if path == "/bin" {
@@ -113,6 +123,7 @@ impl Fs {
         Ok(self.stream_reader_from_handle(handle))
     }
 
+    /// Writes a whole file, appending when `append` is true.
     pub async fn write_file(&self, path: &str, data: &[u8], append: bool) -> VfsResult<()> {
         let path = self.resolve(path);
         let data = data.to_vec();
@@ -123,6 +134,7 @@ impl Fs {
             .await
     }
 
+    /// Creates a file if needed or updates its metadata when supported.
     pub async fn touch(&self, path: &str) -> VfsResult<()> {
         let path = self.resolve(path);
         if is_bin_path(&path) {
@@ -138,6 +150,7 @@ impl Fs {
         .await
     }
 
+    /// Opens a VFS file handle for a path.
     pub async fn open(&self, path: &str, mode: OpenMode) -> VfsResult<FileHandle> {
         let path = self.resolve(path);
         if is_bin_path(&path) {
@@ -152,6 +165,7 @@ impl Fs {
         self.dispatch(move |vfs| vfs.open(&path, mode)).await
     }
 
+    /// Reads from a file handle at `offset`.
     pub async fn read_at(
         &self,
         handle: FileHandle,
@@ -165,6 +179,7 @@ impl Fs {
         .await
     }
 
+    /// Writes to a file handle at `offset`.
     pub async fn write_at(
         &self,
         handle: FileHandle,
@@ -175,10 +190,12 @@ impl Fs {
             .await
     }
 
+    /// Changes a file handle's length.
     pub async fn truncate(&self, handle: FileHandle, len: u64) -> VfsResult<()> {
         self.dispatch(move |vfs| vfs.truncate(handle, len)).await
     }
 
+    /// Closes a file handle.
     pub async fn close(&self, handle: FileHandle) -> VfsResult<()> {
         self.dispatch(move |vfs| vfs.close(handle)).await
     }

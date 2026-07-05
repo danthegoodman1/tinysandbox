@@ -1,6 +1,8 @@
+//! Public conformance suites for third-party VFS implementations.
+
 use std::collections::BTreeSet;
 
-use super::{DirEntry, Errno, FileType, OpenMode, Vfs, VfsQuota, VfsResult};
+use super::{DirEntry, Errno, FileType, OpenMode, Vfs, VfsQuota, VfsResult, VfsSnapshot};
 
 /// Runs the public VFS conformance suite against a VFS implementation.
 ///
@@ -22,10 +24,27 @@ where
     path_normalization_and_containment(&factory);
     closed_handle_errors(&factory);
     truncate_grows_and_shrinks(&factory);
+    offset_and_length_boundaries(&factory);
     readdir_semantics(&factory);
     mkdir_errors(&factory);
     open_handle_identity_semantics(&factory);
     directories_count_against_file_quota(&factory);
+}
+
+/// Runs the snapshot extension of the public VFS conformance suite.
+///
+/// Implementations that support [`VfsSnapshot`] should run this in addition to
+/// [`run`]. Snapshot tests require `Vfs::stats` to return quota usage because
+/// quota accounting across restore and branch is part of the snapshot contract.
+pub fn run_snapshots<V, F>(factory: F)
+where
+    V: VfsSnapshot,
+    F: Fn(VfsQuota) -> V,
+{
+    mutate_after_snapshot_is_isolated(&factory);
+    restore_recreates_the_snapshot_tree(&factory);
+    branches_are_independent(&factory);
+    snapshot_quota_accounting(&factory);
 }
 
 fn open_modes_and_errors<V, F>(factory: &F)
@@ -338,6 +357,36 @@ where
     assert_eq!(&buf[..2], b"ab");
 }
 
+fn offset_and_length_boundaries<V, F>(factory: &F)
+where
+    V: Vfs,
+    F: Fn(VfsQuota) -> V,
+{
+    let vfs = factory(VfsQuota {
+        max_bytes: 8,
+        max_files: 4,
+        max_file_size: 8,
+    });
+    let handle = vfs
+        .open("/file", OpenMode::read_write().create_new())
+        .expect("file opens");
+
+    assert_eq!(
+        vfs.write_at(handle, u64::MAX, b"")
+            .expect("empty writes do not consult offset growth"),
+        0
+    );
+    assert_errno(vfs.write_at(handle, u64::MAX, b"x"), Errno::EINVAL);
+    assert_errno(vfs.truncate(handle, u64::MAX), Errno::ENOSPC);
+
+    vfs.write_at(handle, 0, b"12345678")
+        .expect("exact byte quota write succeeds");
+    assert_errno(vfs.write_at(handle, 8, b"x"), Errno::ENOSPC);
+    vfs.truncate(handle, 0).expect("truncate to zero succeeds");
+    assert_eq!(vfs.stat("/file").expect("zero-length stat").len, 0);
+    vfs.close(handle).expect("close handle");
+}
+
 fn readdir_semantics<V, F>(factory: &F)
 where
     V: Vfs,
@@ -445,6 +494,125 @@ where
         .expect("freed directory slot can hold a file");
 }
 
+fn mutate_after_snapshot_is_isolated<V, F>(factory: &F)
+where
+    V: VfsSnapshot,
+    F: Fn(VfsQuota) -> V,
+{
+    let vfs = factory(generous_quota());
+    write_file(&vfs, "/file", b"before").expect("write original");
+    let snapshot = vfs.snapshot().expect("snapshot succeeds");
+
+    let handle = vfs
+        .open("/file", OpenMode::write_only())
+        .expect("open file");
+    vfs.write_at(handle, 0, b"after")
+        .expect("overwrite original");
+    vfs.close(handle).expect("close write handle");
+    vfs.unlink("/file").expect("remove current file");
+
+    let branch = vfs.branch(&snapshot).expect("branch from snapshot");
+    assert_contents(&branch, "/file", b"before");
+
+    vfs.restore(&snapshot).expect("restore snapshot");
+    assert_contents(&vfs, "/file", b"before");
+}
+
+fn restore_recreates_the_snapshot_tree<V, F>(factory: &F)
+where
+    V: VfsSnapshot,
+    F: Fn(VfsQuota) -> V,
+{
+    let vfs = factory(generous_quota());
+    vfs.mkdir("/dir").expect("mkdir dir");
+    write_file(&vfs, "/dir/a", b"alpha").expect("write nested file");
+    write_file(&vfs, "/root", b"root").expect("write root file");
+    let held = vfs.open("/root", OpenMode::read_only()).expect("open root");
+    let snapshot = vfs.snapshot().expect("snapshot succeeds");
+
+    vfs.rename("/dir/a", "/renamed")
+        .expect("rename after snapshot");
+    vfs.unlink("/root").expect("unlink after snapshot");
+    vfs.restore(&snapshot).expect("restore snapshot");
+
+    assert_contents(&vfs, "/dir/a", b"alpha");
+    assert_contents(&vfs, "/root", b"root");
+    assert_errno(vfs.stat("/renamed"), Errno::ENOENT);
+
+    let mut buf = [0; 1];
+    assert_errno(vfs.read_at(held, 0, &mut buf), Errno::EBADF);
+}
+
+fn branches_are_independent<V, F>(factory: &F)
+where
+    V: VfsSnapshot,
+    F: Fn(VfsQuota) -> V,
+{
+    let vfs = factory(generous_quota());
+    write_file(&vfs, "/file", b"base").expect("write base");
+    let snapshot = vfs.snapshot().expect("snapshot succeeds");
+    let branch = vfs.branch(&snapshot).expect("branch succeeds");
+
+    let source_handle = vfs
+        .open("/file", OpenMode::write_only())
+        .expect("open source");
+    vfs.write_at(source_handle, 0, b"src!")
+        .expect("source write succeeds");
+    vfs.close(source_handle).expect("close source");
+
+    let branch_handle = branch
+        .open("/file", OpenMode::write_only())
+        .expect("open branch");
+    branch
+        .write_at(branch_handle, 0, b"br")
+        .expect("branch write succeeds");
+    branch.close(branch_handle).expect("close branch");
+
+    assert_contents(&vfs, "/file", b"src!");
+    assert_contents(&branch, "/file", b"brse");
+}
+
+fn snapshot_quota_accounting<V, F>(factory: &F)
+where
+    V: VfsSnapshot,
+    F: Fn(VfsQuota) -> V,
+{
+    let quota = VfsQuota {
+        max_bytes: 4,
+        max_files: 2,
+        max_file_size: 4,
+    };
+    let vfs = factory(quota);
+    vfs.mkdir("/dir")
+        .expect("directory consumes exact file quota");
+    write_file(&vfs, "/file", b"1234").expect("write exact byte quota");
+    assert_stats(&vfs, 4, 2);
+    let snapshot = vfs.snapshot().expect("snapshot succeeds at quota");
+
+    vfs.unlink("/file").expect("free bytes after snapshot");
+    assert_stats(&vfs, 0, 1);
+    vfs.restore(&snapshot)
+        .expect("restore exact-quota snapshot");
+    assert_stats(&vfs, 4, 2);
+    assert_contents(&vfs, "/file", b"1234");
+
+    let branch = vfs.branch(&snapshot).expect("branch exact-quota snapshot");
+    assert_stats(&branch, 4, 2);
+    let handle = branch
+        .open("/file", OpenMode::write_only())
+        .expect("open branch file");
+    assert_errno(branch.write_at(handle, 0, b"12345"), Errno::ENOSPC);
+    branch.close(handle).expect("close branch handle");
+
+    let too_small = factory(VfsQuota {
+        max_bytes: 3,
+        max_files: 2,
+        max_file_size: 4,
+    });
+    assert_errno(too_small.restore(&snapshot), Errno::ENOSPC);
+    assert_stats(&too_small, 0, 0);
+}
+
 fn generous_quota() -> VfsQuota {
     VfsQuota {
         max_bytes: 1024,
@@ -468,6 +636,15 @@ fn assert_contents<V: Vfs>(vfs: &V, path: &str, expected: &[u8]) {
     vfs.close(handle).expect("close read handle");
     assert_eq!(read, expected.len());
     assert_eq!(&buf[..read], expected);
+}
+
+fn assert_stats<V: Vfs>(vfs: &V, used_bytes: u64, file_count: u64) {
+    let stats = vfs
+        .stats()
+        .expect("snapshot conformance requires Vfs::stats")
+        .expect("stats succeeds");
+    assert_eq!(stats.used_bytes, used_bytes);
+    assert_eq!(stats.file_count, file_count);
 }
 
 fn assert_entry(entries: &[DirEntry], name: &str, file_type: FileType) {

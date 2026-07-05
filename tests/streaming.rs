@@ -289,6 +289,26 @@ async fn mid_stream_vfs_read_errors_are_reported() {
 }
 
 #[tokio::test]
+async fn line_tools_report_mid_stream_vfs_read_errors() {
+    // Line-oriented commands must report read errors that happen after partial
+    // input, not silently treat the stream as EOF.
+    let vfs = Arc::new(GeneratingVfs::new(4 * 1024 * 1024).fail_after(128 * 1024));
+    let sandbox = Sandbox::builder().vfs_arc(vfs).build();
+
+    let sed = sandbox.exec("sed 's/p/q/' /huge").await;
+    assert_eq!(sed.exit_code, 2);
+    assert!(sed.stderr.contains("sed: /huge: Invalid argument"));
+
+    let head = sandbox.exec("head -n 100000 /huge").await;
+    assert_eq!(head.exit_code, 1);
+    assert!(head.stderr.contains("head: /huge: Invalid argument"));
+
+    let tail = sandbox.exec("tail /huge").await;
+    assert_eq!(tail.exit_code, 1);
+    assert!(tail.stderr.contains("tail: /huge: Invalid argument"));
+}
+
+#[tokio::test]
 async fn grep_closed_pipe_stops_without_stderr() {
     // GNU grep exits silently on SIGPIPE when a downstream command stops early.
     let vfs = Arc::new(GeneratingVfs::new(8 * 1024 * 1024));

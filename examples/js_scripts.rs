@@ -9,13 +9,15 @@ use tinysandbox::sandbox::{Limits, Sandbox};
 #[tokio::main]
 async fn main() {
     let sandbox = Sandbox::builder()
+        .persist_session(true)
         .limits(Limits {
             wasm_memory_bytes: 32 * 1024 * 1024,
             ..Limits::default()
         })
         .build();
 
-    // An agent writes a small multi-file program into the sandbox.
+    // Persistent cwd lets the example build a small multi-file program across
+    // separate exec calls, like one long shell session.
     sandbox
         .exec(concat!(
             "mkdir -p /app && cd /app && ",

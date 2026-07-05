@@ -33,6 +33,7 @@ const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_WASMTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// Registers the `js` command in a sandbox command registry.
 pub fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     commands.insert("js".to_owned(), Arc::new(js_command));
 }

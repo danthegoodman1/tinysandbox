@@ -7,6 +7,12 @@
 //!
 //! Line-oriented streaming commands cap any single buffered line at 1 MiB and
 //! report `line too long`; plain `cat` and `wc` remain byte-streaming commands.
+//!
+//! Other known GNU deviations: `sed` reports all input read failures with
+//! exit code 2 (GNU distinguishes mid-stream I/O errors with 4), and error
+//! messages omit GNU's `Try '<tool> --help'` second line. Trailing slashes on
+//! file paths (`ls file///`) are accepted because VFS path normalization
+//! strips them, where POSIX would fail with ENOTDIR.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -2096,5 +2102,19 @@ impl std::ops::AddAssign for Counts {
         self.lines += rhs.lines;
         self.words += rhs.words;
         self.bytes += rhs.bytes;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::basename;
+
+    #[test]
+    fn basename_handles_root_and_trailing_slashes() {
+        // Root-like paths have no non-empty path component; callers use "/"
+        // as the GNU-shaped display/name fallback.
+        assert_eq!(basename("/"), "/");
+        assert_eq!(basename("////"), "/");
+        assert_eq!(basename("/tmp/file///"), "file");
     }
 }

@@ -6,17 +6,26 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 An ultra-minimal, Linux-like sandbox for AI agents — a shell, coreutils, a
-filesystem, and a JavaScript runtime in a single Rust crate, with no
+filesystem, and a secure JavaScript runtime in a single Rust crate, with no
 containers, no VMs, and no access to the host.
 
-```rust
-let sandbox = Sandbox::builder().build();
+```rust no_run
+use tinysandbox::sandbox::Sandbox;
 
-sandbox.exec("mkdir /workspace && cd /workspace").await;
-sandbox.exec("echo 'hello from the sandbox' > greeting.txt").await;
+#[tokio::main]
+async fn main() {
+    let sandbox = Sandbox::builder().build();
 
-let result = sandbox.exec("cat greeting.txt | grep -c sandbox").await;
-assert_eq!(result.stdout, "1\n");
+    sandbox.exec("mkdir /workspace").await;
+    sandbox
+        .exec("echo 'hello from the sandbox' > /workspace/greeting.txt")
+        .await;
+
+    let result = sandbox
+        .exec("cat /workspace/greeting.txt | grep -c sandbox")
+        .await;
+    assert_eq!(result.stdout, "1\n");
+}
 ```
 
 ## Table of contents
@@ -29,6 +38,7 @@ assert_eq!(result.stdout, "1\n");
   - [JavaScript runtime](#javascript-runtime)
 - [Custom commands](#custom-commands)
 - [Bring your own VFS](#bring-your-own-vfs)
+- [Snapshots](#snapshots)
 - [Limits and observability](#limits-and-observability)
 - [Security model](#security-model)
 - [Comparison with just-bash](#comparison-with-just-bash)
@@ -71,27 +81,29 @@ that actually runs untrusted code: agent-authored JavaScript. The result:
 cargo add tinysandbox tokio
 ```
 
-```rust
+```rust no_run
 use tinysandbox::sandbox::Sandbox;
 
 #[tokio::main]
 async fn main() {
     let sandbox = Sandbox::builder().build();
 
-    // Sessions persist cwd and env across execs, like a real shell.
-    sandbox.exec("mkdir -p /workspace/data && cd /workspace").await;
-    sandbox.exec("echo 'alpha\nbeta\nalpha' > data/words.txt").await;
+    // By default, each exec starts from the builder's cwd/env. The VFS persists.
+    sandbox.exec("mkdir -p /workspace/data").await;
+    sandbox
+        .exec("echo 'alpha\nbeta\nalpha' > /workspace/data/words.txt")
+        .await;
 
     // GNU-faithful output shapes, down to wc padding stdin counts to width 7.
-    let result = sandbox.exec("sort -u data/words.txt | wc -l").await;
+    let result = sandbox.exec("sort -u /workspace/data/words.txt | wc -l").await;
     assert_eq!(result.stdout, "      2\n");
     assert_eq!(result.exit_code, 0);
 
     // JavaScript with a Node-compatible fs API, sandboxed under Wasmtime.
     sandbox
-        .exec(r#"echo 'const fs = require("fs"); console.log(fs.readFileSync("data/words.txt", "utf8").length)' > count.js"#)
+        .exec(r#"echo 'const fs = require("fs"); console.log(fs.readFileSync("/workspace/data/words.txt", "utf8").length)' > /workspace/count.js"#)
         .await;
-    let result = sandbox.exec("js count.js").await;
+    let result = sandbox.exec("js /workspace/count.js").await;
     assert_eq!(result.stdout, "17\n");
 }
 ```
@@ -99,13 +111,18 @@ async fn main() {
 The host can also work with the filesystem directly — useful for seeding
 input files or reading results without going through the shell:
 
-```rust
+```rust no_run
+use tinysandbox::sandbox::Sandbox;
 use tinysandbox::vfs::OpenMode;
 
-let vfs = sandbox.vfs();
-let handle = vfs.open("/workspace/report.txt", OpenMode::write_only().create())?;
-vfs.write_at(handle, 0, b"direct host access")?;
-vfs.close(handle)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let sandbox = Sandbox::builder().build();
+    let vfs = sandbox.vfs();
+    let handle = vfs.open("/workspace/report.txt", OpenMode::write_only().create())?;
+    vfs.write_at(handle, 0, b"direct host access")?;
+    vfs.close(handle)?;
+    Ok(())
+}
 ```
 
 ## What's inside
@@ -123,7 +140,7 @@ actually use. Semantics inside the subset are verified against real bash:
 - Quoting: single, double, backslash escapes, correct field splitting of
   unquoted `$VAR` expansions
 - Variables: `$VAR`, `${VAR}`, `$?`, `VAR=x cmd` prefixes, bare
-  assignments, `export` / `unset`, persistent cwd and env per `Sandbox`
+  assignments, `export` / `unset`, and opt-in persistent cwd/env per `Sandbox`
 - Loud, positioned errors for what's not supported: globs, `$(...)`,
   backticks, heredocs, `&`, subshells, tilde expansion
 
@@ -173,20 +190,23 @@ shows up in `/bin`, resolves via `which`, and composes in pipelines. A
 command is just an async function from `CommandContext` (args, env, cwd,
 stdio streams, a VFS handle, limits) to an exit code:
 
-```rust
+```rust no_run
 use tinysandbox::sandbox::{CommandContext, CommandResult, Sandbox};
 use tokio::io::AsyncWriteExt;
 
-let sandbox = Sandbox::builder()
-    .command("greet", |mut ctx: CommandContext| async move {
-        let name = ctx.args.first().map_or("world", String::as_str);
-        let _ = ctx.stdout.write_all(format!("hello {name}\n").as_bytes()).await;
-        CommandResult::success()
-    })
-    .build();
+#[tokio::main]
+async fn main() {
+    let sandbox = Sandbox::builder()
+        .command("greet", |mut ctx: CommandContext| async move {
+            let name = ctx.args.first().map_or("world", String::as_str);
+            let _ = ctx.stdout.write_all(format!("hello {name}\n").as_bytes()).await;
+            CommandResult::success()
+        })
+        .build();
 
-let result = sandbox.exec("greet agent | wc -w").await; // pipes like any builtin
-assert_eq!(result.stdout, "      2\n");
+    let result = sandbox.exec("greet agent | wc -w").await; // pipes like any builtin
+    assert_eq!(result.stdout, "      2\n");
+}
 ```
 
 This is the intended way to expose tools to an agent — file converters,
@@ -206,7 +226,7 @@ implementation opts into the in-memory fast path via `is_fast()`.
 Attach it in the builder and the whole sandbox — shell, builtins, JS
 scripts, and direct host access — runs against it:
 
-```rust
+```rust ignore
 use std::sync::Arc;
 use tinysandbox::sandbox::Sandbox;
 
@@ -224,7 +244,7 @@ you can prove your implementation behaves like a POSIX filesystem —
 open-mode enforcement, rename-over-existing, unlink-while-open handle
 semantics, quota accounting, path containment, and more:
 
-```rust
+```rust ignore
 #[test]
 fn my_vfs_conforms() {
     tinysandbox::vfs::conformance::run(|quota| MyVfs::new(quota));
@@ -234,6 +254,52 @@ fn my_vfs_conforms() {
 See the `tinysandbox::vfs` rustdoc for the full trait contract (errno
 expectations per method, quota semantics, handle identity rules).
 
+## Snapshots
+
+`InMemoryVfs` supports cheap copy-on-write snapshots for rollback and
+branching. A snapshot captures path-visible filesystem contents, not open file
+handles; restoring one invalidates handles opened before the restore.
+
+```rust
+use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota, VfsSnapshot};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let vfs = InMemoryVfs::new(VfsQuota::unlimited());
+    let handle = vfs.open("/draft.txt", OpenMode::write_only().create_new())?;
+    vfs.write_at(handle, 0, b"before")?;
+    vfs.close(handle)?;
+
+    let snapshot = vfs.snapshot()?;
+    let branch = vfs.branch(&snapshot)?;
+
+    vfs.unlink("/draft.txt")?;
+    assert!(vfs.stat("/draft.txt").is_err());
+    assert!(branch.stat("/draft.txt")?.is_file());
+    Ok(())
+}
+```
+
+`Sandbox::vfs()` returns `Arc<dyn Vfs>`, so snapshot-aware callers should keep
+their own concrete handle and pass a clone into the builder:
+
+```rust no_run
+use std::sync::Arc;
+use tinysandbox::sandbox::Sandbox;
+use tinysandbox::vfs::{InMemoryVfs, VfsQuota, VfsSnapshot};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let vfs = Arc::new(InMemoryVfs::new(VfsQuota::unlimited()));
+    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let before_turn = vfs.snapshot()?;
+    let result = sandbox.exec("echo draft > /answer.txt").await;
+    if result.exit_code != 0 {
+        vfs.restore(&before_turn)?;
+    }
+    Ok(())
+}
+```
+
 ## Limits and observability
 
 Every `Sandbox` enforces wall-clock timeouts (exit 124, like GNU `timeout`),
@@ -241,17 +307,19 @@ stdout/stderr caps with head+tail truncation, a per-exec command budget,
 VFS byte/file quotas (surfacing as `ENOSPC`), and a wasm memory cap for JS.
 All configurable via `Limits`:
 
-```rust
+```rust no_run
 use std::time::Duration;
 use tinysandbox::sandbox::{Limits, Sandbox};
 
-let sandbox = Sandbox::builder()
-    .limits(Limits {
-        wall_time: Duration::from_secs(5),
-        wasm_memory_bytes: 32 * 1024 * 1024,
-        ..Limits::default()
-    })
-    .build();
+fn main() {
+    let sandbox = Sandbox::builder()
+        .limits(Limits {
+            wall_time: Duration::from_secs(5),
+            wasm_memory_bytes: 32 * 1024 * 1024,
+            ..Limits::default()
+        })
+        .build();
+}
 ```
 
 `ExecResult` carries per-run metrics (wall time, per-command timings, pipe
@@ -264,7 +332,7 @@ reports VFS usage and total commands run.
   interpret command text against the VFS; the only thing that executes
   agent-authored *code* is the wasm guest.
 - **The wasm guest is capability-free.** The vendored QuickJS module
-  (see `assets/PROVENANCE.md` for the reproducible build) imports no WASI
+  (see [assets/PROVENANCE.md](https://github.com/danthegoodman1/tinysandbox/blob/main/assets/PROVENANCE.md) for the reproducible build) imports no WASI
   filesystem functions — no preopens, no `path_open`. Its only window to
   the world is the audited hostcall ABI, which routes through the same
   VFS, quotas, and path containment as everything else.
@@ -312,20 +380,19 @@ but the designs differ in ways that matter:
 
 Runnable with `cargo run --example <name>`:
 
-- [`quickstart`](examples/quickstart.rs) — sessions, pipelines, redirects,
+- [`quickstart`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/quickstart.rs) — sessions, pipelines, redirects,
   and reading results back from the host
-- [`custom_command`](examples/custom_command.rs) — registering a host
+- [`custom_command`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/custom_command.rs) — registering a host
   command and composing it with builtins
-- [`js_scripts`](examples/js_scripts.rs) — multi-file JS with `require`,
+- [`js_scripts`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_scripts.rs) — multi-file JS with `require`,
   the `fs` API, and a look at limits and metrics
 
 ## Roadmap
 
-- Copy-on-write VFS snapshots for rollback and branching
 - Node.js bindings (napi-rs): the whole sandbox — including VFS
   implementations written in JavaScript — usable from Node
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE), at your option.
+Licensed under either of [MIT](https://github.com/danthegoodman1/tinysandbox/blob/main/LICENSE-MIT) or
+[Apache-2.0](https://github.com/danthegoodman1/tinysandbox/blob/main/LICENSE-APACHE), at your option.

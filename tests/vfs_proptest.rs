@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
-use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
+use tinysandbox::vfs::{Errno, FileHandle, InMemoryVfs, OpenMode, Vfs, VfsQuota, VfsResult};
 
 const MAX_BYTES: u64 = 64;
 const MAX_FILES: u64 = 8;
@@ -9,7 +9,7 @@ const MAX_FILE_SIZE: u64 = 16;
 
 proptest! {
     #[test]
-    fn random_valid_sequences_match_a_simple_model(ops in proptest::collection::vec((0u8..10, 0u8..5, 0u8..3, 0u8..24), 0..128)) {
+    fn random_valid_sequences_match_a_simple_model(ops in proptest::collection::vec((0u8..11, 0u8..5, 0u8..3, 0u8..24), 0..128)) {
         let vfs = InMemoryVfs::new(VfsQuota {
             max_bytes: MAX_BYTES,
             max_files: MAX_FILES,
@@ -71,6 +71,16 @@ proptest! {
                         &dir_path
                     };
                     assert_readdir_matches_model(&vfs, &model, readdir_path)?;
+                }
+                9 => {
+                    let expected_open = model.open_create(&path);
+                    let opened = vfs.open(&path, OpenMode::read_write().create());
+                    prop_assert_eq!(opened.is_ok(), expected_open);
+                    if let Ok(handle) = opened {
+                        // Closed handles must fail cleanly without mutating quota state.
+                        vfs.close(handle).expect("close handle before stale-handle checks");
+                        assert_closed_handle_errors(&vfs, handle)?;
+                    }
                 }
                 _ => {
                     let data = vec![value; usize::from(value % 6)];
@@ -343,6 +353,29 @@ fn assert_tree_matches_model(vfs: &InMemoryVfs, model: &Model) -> Result<(), Tes
     }
 
     Ok(())
+}
+
+fn assert_closed_handle_errors(vfs: &InMemoryVfs, handle: FileHandle) -> Result<(), TestCaseError> {
+    let mut buf = [0; 1];
+    assert_errno(vfs.read_at(handle, 0, &mut buf), Errno::EBADF)?;
+    assert_errno(vfs.write_at(handle, 0, b"x"), Errno::EBADF)?;
+    assert_errno(vfs.truncate(handle, 0), Errno::EBADF)?;
+    assert_errno(vfs.close(handle), Errno::EBADF)
+}
+
+fn assert_errno<T>(result: VfsResult<T>, errno: Errno) -> Result<(), TestCaseError> {
+    match result {
+        Ok(_) => Err(TestCaseError::fail(format!(
+            "expected {}, got Ok",
+            errno.name()
+        ))),
+        Err(err) if err.errno() == errno => Ok(()),
+        Err(err) => Err(TestCaseError::fail(format!(
+            "expected {}, got {}",
+            errno.name(),
+            err
+        ))),
+    }
 }
 
 fn file_path(file: u8, dir: u8) -> String {

@@ -50,14 +50,20 @@ pub use command::{
 const PIPE_CAPACITY_BYTES: usize = STREAM_CHUNK_BYTES;
 const TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
 
+/// Result of a sandbox `exec` call.
 #[derive(Debug, Clone)]
 pub struct ExecResult {
+    /// Captured stdout, possibly truncated according to [`Limits::stdout_bytes`].
     pub stdout: String,
+    /// Captured stderr, possibly truncated according to [`Limits::stderr_bytes`].
     pub stderr: String,
+    /// Process-like exit code for the executed shell program.
     pub exit_code: i32,
+    /// Timing, pipe, truncation, and JS memory metrics.
     pub metrics: ExecMetrics,
 }
 
+/// Metrics collected during one sandbox `exec`.
 #[derive(Debug, Clone)]
 pub struct ExecMetrics {
     /// Total wall-clock time for the exec call.
@@ -75,45 +81,59 @@ pub struct ExecMetrics {
     pub peak_wasm_memory_bytes: Option<usize>,
 }
 
+/// Timing for one command stage.
 #[derive(Debug, Clone)]
 pub struct CommandTiming {
+    /// Command name.
     pub name: String,
+    /// Wall-clock duration observed for the command stage.
     pub duration: Duration,
+    /// Exit code returned by the command stage.
     pub exit_code: i32,
 }
 
+/// Aggregate sandbox state useful for observability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxStats {
+    /// VFS quota usage, when the configured VFS reports it.
     pub vfs: Option<VfsStats>,
+    /// Number of commands run by this sandbox.
     pub commands_run: u64,
 }
 
+/// In-process shell sandbox backed by a virtual filesystem.
 pub struct Sandbox {
     vfs: Arc<dyn Vfs>,
     commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
     command_names: Arc<BTreeSet<String>>,
     limits: Limits,
     session: Mutex<Session>,
+    persist_session: bool,
     commands_run: AtomicU64,
 }
 
+/// Builder for [`Sandbox`].
 pub struct SandboxBuilder {
     vfs: Arc<dyn Vfs>,
     commands: BTreeMap<String, Arc<dyn Command>>,
     limits: Limits,
     cwd: String,
     env: BTreeMap<String, String>,
+    persist_session: bool,
 }
 
 impl Sandbox {
+    /// Creates a builder with the default in-memory VFS and builtins.
     pub fn builder() -> SandboxBuilder {
         SandboxBuilder::new()
     }
 
+    /// Returns the shared VFS backing this sandbox.
     pub fn vfs(&self) -> Arc<dyn Vfs> {
         Arc::clone(&self.vfs)
     }
 
+    /// Returns aggregate sandbox statistics.
     pub fn stats(&self) -> SandboxStats {
         SandboxStats {
             vfs: self.vfs.stats().and_then(Result::ok),
@@ -121,15 +141,23 @@ impl Sandbox {
         }
     }
 
-    /// Executes a shell program against a snapshot of the current session.
+    /// Executes a shell program against this sandbox's VFS and shell session.
     ///
     /// The wall-clock timeout is exec-wide. When it fires, partial stdout,
     /// stderr, metrics, and session mutations are discarded and the result
     /// exits 124. Blocking host calls already running on worker threads are not
     /// cancelled by that timeout, so VFS implementations should keep individual
-    /// operations bounded. Concurrent execs each start from the session state
-    /// visible at their own start; when they complete, the last stored session
-    /// wins.
+    /// operations bounded.
+    ///
+    /// By default, each exec starts from the sandbox's base session: the
+    /// builder-configured cwd and environment (defaults: `/`, `PWD=/`). Shell mutations
+    /// such as `cd`, `export`, assignments, and `$?` updates are visible within
+    /// that exec and discarded afterward, so concurrent default execs have no
+    /// session last-writer-wins hazard. Filesystem mutations always persist.
+    ///
+    /// With [`SandboxBuilder::persist_session`] set to `true`, each exec snapshots the
+    /// stored session at start and stores the mutated session at completion; if
+    /// multiple execs overlap, the last completed exec wins for session state.
     pub async fn exec(&self, input: &str) -> ExecResult {
         let started = Instant::now();
         let future = self.exec_inner(input);
@@ -177,7 +205,9 @@ impl Sandbox {
         }
 
         session.last_status = exec.last_status;
-        self.store_session(session);
+        if self.persist_session {
+            self.store_session(session);
+        }
         self.commands_run.fetch_add(
             u64::try_from(exec.command_count).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -308,10 +338,7 @@ impl Sandbox {
             stdout: &mut special_stdout,
             stderr: &mut special_stderr,
         };
-        if let Some(mut status) = self
-            .run_shell_builtin(&command_name, &args, shell_ctx)
-            .await
-        {
+        if let Some(mut status) = run_shell_builtin_stage(&command_name, &args, shell_ctx).await {
             close_stdin_redirect(&fs, redirects.stdin.take()).await;
             let Some((mut stdout, stdout_sinks, _)) = writer_for_destination_or_report(
                 &command_name,
@@ -335,6 +362,8 @@ impl Sandbox {
             )
             .await
             else {
+                drop(stdout);
+                drain_file_sinks(stdout_sinks).await;
                 return 1;
             };
             let _ = stdout.write_all(&special_stdout).await;
@@ -389,6 +418,8 @@ impl Sandbox {
         )
         .await
         else {
+            drop(stdout);
+            drain_file_sinks(stdout_sinks).await;
             return 1;
         };
 
@@ -610,6 +641,8 @@ impl Sandbox {
             {
                 Ok(writer) => writer,
                 Err((path, err)) => {
+                    drop(stdout);
+                    drain_file_sinks(stdout_sinks).await;
                     outcomes[index] = Some(StageOutcome::failed(
                         index,
                         stage.name,
@@ -668,107 +701,6 @@ impl Sandbox {
         status
     }
 
-    async fn run_shell_builtin(
-        &self,
-        name: &str,
-        args: &[String],
-        ctx: ShellBuiltinContext<'_>,
-    ) -> Option<i32> {
-        match name {
-            "cd" => {
-                if args.len() > 1 {
-                    ctx.stderr.extend_from_slice(b"cd: too many arguments\n");
-                    return Some(1);
-                }
-                let target = if let Some(target) = args.first() {
-                    target.clone()
-                } else if let Some(home) = ctx.session.env.get("HOME") {
-                    home.clone()
-                } else {
-                    ctx.stderr.extend_from_slice(b"cd: HOME not set\n");
-                    return Some(1);
-                };
-                let path = ctx.fs.resolve(&target);
-                match ctx.fs.stat(&path).await {
-                    Ok(Metadata {
-                        file_type: FileType::Directory,
-                        ..
-                    }) => {
-                        let old_pwd = ctx.session.cwd.clone();
-                        ctx.session.cwd = path;
-                        ctx.session.env.insert("OLDPWD".to_owned(), old_pwd.clone());
-                        ctx.session
-                            .env
-                            .insert("PWD".to_owned(), ctx.session.cwd.clone());
-                        ctx.env.insert("OLDPWD".to_owned(), old_pwd);
-                        ctx.env.insert("PWD".to_owned(), ctx.session.cwd.clone());
-                        Some(0)
-                    }
-                    Ok(_) => {
-                        ctx.stderr.extend_from_slice(
-                            format!("cd: {target}: Not a directory\n").as_bytes(),
-                        );
-                        Some(1)
-                    }
-                    Err(err) => {
-                        ctx.stderr.extend_from_slice(
-                            format!("cd: {target}: {}\n", errno_message(err.errno())).as_bytes(),
-                        );
-                        Some(1)
-                    }
-                }
-            }
-            "export" => {
-                if args.is_empty() {
-                    // Tinysandbox tracks one session environment, not Bash's exported
-                    // bit, so listing shows every session variable.
-                    for (key, value) in &ctx.session.env {
-                        ctx.stdout.extend_from_slice(
-                            format!("declare -x {key}=\"{value}\"\n").as_bytes(),
-                        );
-                    }
-                    return Some(0);
-                }
-                for arg in args {
-                    if let Some((name, value)) = arg.split_once('=') {
-                        if is_assignment_name(name) {
-                            ctx.session.env.insert(name.to_owned(), value.to_owned());
-                            ctx.env.insert(name.to_owned(), value.to_owned());
-                        } else {
-                            ctx.stderr.extend_from_slice(
-                                format!("export: `{arg}': not a valid identifier\n").as_bytes(),
-                            );
-                            return Some(1);
-                        }
-                    } else if is_assignment_name(arg) {
-                        ctx.session.env.entry(arg.clone()).or_default();
-                    } else {
-                        ctx.stderr.extend_from_slice(
-                            format!("export: `{arg}': not a valid identifier\n").as_bytes(),
-                        );
-                        return Some(1);
-                    }
-                }
-                Some(0)
-            }
-            "unset" => {
-                for arg in args {
-                    if is_assignment_name(arg) {
-                        ctx.session.env.remove(arg);
-                        ctx.env.remove(arg);
-                    } else {
-                        ctx.stderr.extend_from_slice(
-                            format!("unset: `{arg}': not a valid identifier\n").as_bytes(),
-                        );
-                        return Some(1);
-                    }
-                }
-                Some(0)
-            }
-            _ => None,
-        }
-    }
-
     fn session_snapshot(&self) -> Session {
         self.session
             .lock()
@@ -814,19 +746,23 @@ impl SandboxBuilder {
             limits: Limits::default(),
             cwd: "/".to_owned(),
             env,
+            persist_session: false,
         }
     }
 
+    /// Replaces the VFS with a concrete implementation.
     pub fn vfs(mut self, vfs: impl Vfs + 'static) -> Self {
         self.vfs = Arc::new(vfs);
         self
     }
 
+    /// Replaces the VFS with a shared trait object.
     pub fn vfs_arc(mut self, vfs: Arc<dyn Vfs>) -> Self {
         self.vfs = vfs;
         self
     }
 
+    /// Registers a custom command by name.
     pub fn command<F, Fut>(mut self, name: impl Into<String>, command: F) -> Self
     where
         F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
@@ -838,6 +774,7 @@ impl SandboxBuilder {
         self
     }
 
+    /// Registers a custom command object by name.
     pub fn command_obj(mut self, name: impl Into<String>, command: impl Command + 'static) -> Self {
         let name = name.into();
         assert_not_reserved(&name);
@@ -845,22 +782,36 @@ impl SandboxBuilder {
         self
     }
 
+    /// Sets resource limits for the sandbox.
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
     }
 
+    /// Sets an initial session environment variable.
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(name.into(), value.into());
         self
     }
 
+    /// Sets the initial session current working directory.
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = normalize_absolute(cwd.into());
         self.env.insert("PWD".to_owned(), self.cwd.clone());
         self
     }
 
+    /// Enables or disables shell session persistence across exec calls.
+    ///
+    /// The default is `false`: every exec starts from the builder-provided cwd
+    /// and env, with `$?` reset to zero. Set this to `true` to keep `cd`,
+    /// assignment/export/unset, and `$?` changes between exec calls.
+    pub fn persist_session(mut self, persist: bool) -> Self {
+        self.persist_session = persist;
+        self
+    }
+
+    /// Builds the sandbox.
     pub fn build(self) -> Sandbox {
         let command_names = Arc::new(self.commands.keys().cloned().collect());
         Sandbox {
@@ -873,6 +824,7 @@ impl SandboxBuilder {
                 env: self.env,
                 last_status: 0,
             }),
+            persist_session: self.persist_session,
             commands_run: AtomicU64::new(0),
         }
     }
@@ -1418,6 +1370,12 @@ async fn await_file_sink(mut sink: FileSink) -> Result<(), (String, VfsError)> {
         .unwrap_or_else(|_| Err(("redirect".to_owned(), VfsError::new(Errno::EINVAL))))
 }
 
+async fn drain_file_sinks(sinks: Vec<FileSink>) {
+    for sink in sinks {
+        let _ = await_file_sink(sink).await;
+    }
+}
+
 async fn run_stage_task(
     index: usize,
     stage: PreparedStage,
@@ -1581,52 +1539,81 @@ async fn prepare_redirects(
 
     for redirect in &simple.redirects {
         match &redirect.target {
-            RedirectTarget::Fd(fd) => apply_fd_redirect(&mut redirects, redirect, *fd)?,
+            RedirectTarget::Fd(fd) => {
+                if let Err(err) = apply_fd_redirect(&mut redirects, redirect, *fd) {
+                    close_stdin_redirect(fs, redirects.stdin.take()).await;
+                    return Err(err);
+                }
+            }
             RedirectTarget::Word(word) => {
-                let path = redirect_target(word, env, last_status)?;
+                let path = match redirect_target(word, env, last_status) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        close_stdin_redirect(fs, redirects.stdin.take()).await;
+                        return Err(err);
+                    }
+                };
                 match (
                     redirect.fd.unwrap_or(default_redirect_fd(redirect.op)),
                     redirect.op,
                 ) {
                     (0, RedirectOp::Read) => {
-                        let handle = fs
-                            .open(&path, crate::vfs::OpenMode::read_only())
-                            .await
-                            .map_err(|err| (path.clone(), err))?;
+                        let handle = match fs.open(&path, crate::vfs::OpenMode::read_only()).await {
+                            Ok(handle) => handle,
+                            Err(err) => {
+                                close_stdin_redirect(fs, redirects.stdin.take()).await;
+                                return Err((path.clone(), err));
+                            }
+                        };
                         if let Some(previous) = redirects.stdin.replace(InputRedirect {
                             path: path.clone(),
                             handle,
-                        }) {
-                            fs.close(previous.handle)
-                                .await
-                                .map_err(|err| (previous.path, err))?;
+                        }) && let Err(err) = fs.close(previous.handle).await
+                        {
+                            close_stdin_redirect(fs, redirects.stdin.take()).await;
+                            return Err((previous.path, err));
                         }
                     }
                     (1, RedirectOp::Write) => {
-                        preflight_output(fs, &path, false).await?;
+                        if let Err(err) = preflight_output(fs, &path, false).await {
+                            close_stdin_redirect(fs, redirects.stdin.take()).await;
+                            return Err(err);
+                        }
                         redirects.stdout = OutputDestination::File(RedirectFile {
                             path,
                             append: false,
                         });
                     }
                     (1, RedirectOp::Append) => {
-                        preflight_output(fs, &path, true).await?;
+                        if let Err(err) = preflight_output(fs, &path, true).await {
+                            close_stdin_redirect(fs, redirects.stdin.take()).await;
+                            return Err(err);
+                        }
                         redirects.stdout =
                             OutputDestination::File(RedirectFile { path, append: true });
                     }
                     (2, RedirectOp::Write) => {
-                        preflight_output(fs, &path, false).await?;
+                        if let Err(err) = preflight_output(fs, &path, false).await {
+                            close_stdin_redirect(fs, redirects.stdin.take()).await;
+                            return Err(err);
+                        }
                         redirects.stderr = OutputDestination::File(RedirectFile {
                             path,
                             append: false,
                         });
                     }
                     (2, RedirectOp::Append) => {
-                        preflight_output(fs, &path, true).await?;
+                        if let Err(err) = preflight_output(fs, &path, true).await {
+                            close_stdin_redirect(fs, redirects.stdin.take()).await;
+                            return Err(err);
+                        }
                         redirects.stderr =
                             OutputDestination::File(RedirectFile { path, append: true });
                     }
-                    (_, _) => return Err((path, VfsError::new(Errno::EINVAL))),
+                    (_, _) => {
+                        close_stdin_redirect(fs, redirects.stdin.take()).await;
+                        return Err((path, VfsError::new(Errno::EINVAL)));
+                    }
                 }
             }
         }
@@ -1649,31 +1636,25 @@ fn apply_fd_redirect(
     if !matches!(fd, 1 | 2) || !matches!(target_fd, 1 | 2) {
         return Err((target_fd.to_string(), VfsError::new(Errno::EINVAL)));
     }
-    let mut target = match target_fd {
-        1 => redirects.stdout.clone(),
-        2 => redirects.stderr.clone(),
-        _ => unreachable!("validated target fd"),
+    let mut target = if target_fd == 1 {
+        redirects.stdout.clone()
+    } else {
+        redirects.stderr.clone()
     };
     if let OutputDestination::File(file) = &mut target {
         file.append = true;
-        match target_fd {
-            1 => {
-                if let OutputDestination::File(stdout) = &mut redirects.stdout {
-                    stdout.append = true;
-                }
+        if target_fd == 1 {
+            if let OutputDestination::File(stdout) = &mut redirects.stdout {
+                stdout.append = true;
             }
-            2 => {
-                if let OutputDestination::File(stderr) = &mut redirects.stderr {
-                    stderr.append = true;
-                }
-            }
-            _ => unreachable!("validated target fd"),
+        } else if let OutputDestination::File(stderr) = &mut redirects.stderr {
+            stderr.append = true;
         }
     }
-    match fd {
-        1 => redirects.stdout = target,
-        2 => redirects.stderr = target,
-        _ => unreachable!("validated source fd"),
+    if fd == 1 {
+        redirects.stdout = target;
+    } else {
+        redirects.stderr = target;
     }
     Ok(())
 }
