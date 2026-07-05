@@ -48,22 +48,39 @@ console.assert(result.stdout === '1\n')
 ## Table of contents
 
 - [tinysandbox](#tinysandbox)
+      - [Rust](#rust)
+      - [TypeScript](#typescript)
   - [Table of contents](#table-of-contents)
   - [Why](#why)
   - [Quickstart](#quickstart)
+      - [Rust](#rust-1)
+      - [TypeScript](#typescript-1)
+      - [Rust](#rust-2)
+      - [TypeScript](#typescript-2)
   - [What's inside](#whats-inside)
     - [Shell](#shell)
     - [Builtins](#builtins)
     - [JavaScript runtime](#javascript-runtime)
   - [Custom commands](#custom-commands)
+      - [Rust](#rust-3)
+      - [TypeScript](#typescript-3)
   - [Bring your own VFS](#bring-your-own-vfs)
+      - [Rust](#rust-4)
+      - [TypeScript](#typescript-4)
+      - [Rust](#rust-5)
+      - [TypeScript](#typescript-5)
   - [Snapshots](#snapshots)
+      - [Rust](#rust-6)
+      - [TypeScript](#typescript-6)
+      - [Rust](#rust-7)
+      - [TypeScript](#typescript-7)
   - [Limits and observability](#limits-and-observability)
+      - [Rust](#rust-8)
+      - [TypeScript](#typescript-8)
   - [Security model](#security-model)
   - [Comparison with just-bash](#comparison-with-just-bash)
   - [Feature flags](#feature-flags)
   - [Examples](#examples)
-  - [Roadmap](#roadmap)
   - [License](#license)
 
 ## Why
@@ -487,19 +504,21 @@ but the designs differ in ways that matter:
   based (`open`, `read_at`, `write_at`), and the JS runtime exposes the
   matching fd APIs (`fs.openSync` / `readSync` / `writeSync` with explicit
   positions). just-bash's filesystem interface is whole-file: reading one
-  byte means materializing the entire file in memory, and a command's output
-  is fully buffered before it can be written back. In tinysandbox, a VFS
+  byte means materializing the entire file in memory. In tinysandbox, a VFS
   backed by object storage or a database can serve TB-scale files while the
   sandbox only touches the KBs actually read.
+- **Streaming pipes and redirects.** Pipeline stages exchange data through
+  bounded async streams, and redirects write through VFS handles while the
+  command runs. just-bash buffers command output before it can be consumed or
+  written back; tinysandbox can run `cat /huge | head -n 1` without
+  materializing the full input or output.
 - **Agent code always runs in WebAssembly.** In tinysandbox, the only thing
   that executes agent-authored code is the capability-free QuickJS wasm
   guest, with hard memory and CPU limits enforced by Wasmtime. just-bash
   interprets the shell and its commands in the host JavaScript engine and
   relies on language-level hardening against engine breakouts.
 - **Host language.** tinysandbox is a Rust crate with Node.js bindings;
-  just-bash is TypeScript and runs in Node or the browser. If you want native
-  performance, a typed VFS trait, Rust embedding, or the same sandbox from
-  Node, that's tinysandbox.
+  just-bash is TypeScript and runs in Node or the browser.s
 
 ## Feature flags
 
@@ -525,11 +544,6 @@ dependencies are installed:
 - `custom_command.ts` — registering a TypeScript host command
 - `js_scripts.ts` — multi-file sandboxed JS with limits and metrics
 - `js_vfs.ts` — TypeScript-backed VFS callbacks plus `runConformance`
-
-## Roadmap
-
-- Prebuilt Node binary publishing is planned for a follow-up release. Local
-  development builds use `npm --prefix tinysandbox-node run build`.
 
 ## License
 
