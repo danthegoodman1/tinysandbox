@@ -23,7 +23,18 @@ int32_t tb_write_stderr(const uint8_t *ptr, int32_t len);
 
 static const char TINYSANDBOX_GLUE[] =
 "(() => {\n"
+"  const hostCall = globalThis.__tinysandbox_host_call\n"
+"  const writeStdout = globalThis.__tinysandbox_stdout\n"
+"  const writeStderr = globalThis.__tinysandbox_stderr\n"
+"  const exit = globalThis.__tinysandbox_exit\n"
+"  const evalModule = globalThis.__tinysandbox_eval_module\n"
 "  const config = globalThis.__tinysandboxConfig\n"
+"  delete globalThis.__tinysandbox_host_call\n"
+"  delete globalThis.__tinysandbox_stdout\n"
+"  delete globalThis.__tinysandbox_stderr\n"
+"  delete globalThis.__tinysandbox_exit\n"
+"  delete globalThis.__tinysandbox_eval_module\n"
+"  delete globalThis.__tinysandboxConfig\n"
 "  function lower(code) { return String(code || '').toLowerCase().replace(/^e/, '') }\n"
 "  function normalizeEncoding(encoding) {\n"
 "    const enc = encoding === undefined || encoding === null ? 'utf8' : lower(encoding)\n"
@@ -31,6 +42,7 @@ static const char TINYSANDBOX_GLUE[] =
 "    return enc\n"
 "  }\n"
 "  function fsError(e) {\n"
+"    if (!e || e.code === undefined) return new Error(e && e.message ? e.message : 'host call failed')\n"
 "    const where = e.path !== undefined ? `, ${e.syscall} '${e.path}'` : (e.syscall ? `, ${e.syscall}` : '')\n"
 "    const err = new Error(`${e.code}: ${e.message}${where}`)\n"
 "    err.code = e.code\n"
@@ -40,9 +52,27 @@ static const char TINYSANDBOX_GLUE[] =
 "    return err\n"
 "  }\n"
 "  function call(op, args) {\n"
-"    const response = __tinysandbox_host_call(op, JSON.stringify(args === undefined ? null : args))\n"
+"    const response = hostCall(op, JSON.stringify(args === undefined ? null : args))\n"
 "    if (response && response.error) throw fsError(response.error)\n"
 "    return response ? response.value : undefined\n"
+"  }\n"
+"  function syscallError(e) {\n"
+"    const err = new Error(e && e.message ? e.message : 'syscall failed')\n"
+"    if (e && e.code !== undefined) err.code = e.code\n"
+"    return err\n"
+"  }\n"
+"  function callSyscall(name, args) {\n"
+"    const response = hostCall('syscall', JSON.stringify({ name, args: args === undefined ? null : args }))\n"
+"    if (response && response.error) throw syscallError(response.error)\n"
+"    return response ? response.value : undefined\n"
+"  }\n"
+"  if (Array.isArray(config.syscalls) && config.syscalls.length > 0) {\n"
+"    // Null prototype keeps names like __proto__ as ordinary syscall properties.\n"
+"    const sandboxObject = Object.create(null)\n"
+"    for (const name of config.syscalls) {\n"
+"      sandboxObject[name] = arg => callSyscall(name, arg)\n"
+"    }\n"
+"    globalThis.sandbox = sandboxObject\n"
 "  }\n"
 "  function utf8Encode(value) {\n"
 "    const out = []\n"
@@ -332,7 +362,7 @@ static const char TINYSANDBOX_GLUE[] =
 "  }\n"
 "  function executeJsModule(module, source, thisArg) {\n"
 "    const wrapper = `(function (exports, require, module, __filename, __dirname) {${stripBomAndShebang(source)}\\n})`\n"
-"    const compiled = __tinysandbox_eval_module(wrapper, module.filename)\n"
+"    const compiled = evalModule(wrapper, module.filename)\n"
 "    const thisValue = arguments.length < 3 ? module.exports : thisArg\n"
 "    return compiled.call(thisValue, module.exports, module.require, module, module.filename, module.dirname)\n"
 "  }\n"
@@ -364,7 +394,7 @@ static const char TINYSANDBOX_GLUE[] =
 "      requireDepth--\n"
 "    }\n"
 "  }\n"
-"  globalThis.__tinysandbox_run_main = function(source, path) {\n"
+"  function runMain(source, path) {\n"
 "    const filename = path === '[eval]' ? path : normalizeAbsolute(path)\n"
 "    const module = createModule(filename, null)\n"
 "    const isEval = path === '[eval]'\n"
@@ -432,8 +462,9 @@ static const char TINYSANDBOX_GLUE[] =
 "  }\n"
 "  function line(args) { return format(args) + '\\n' }\n"
 "  globalThis.Buffer = Buffer\n"
-"  globalThis.console = { log: (...args) => __tinysandbox_stdout(line(args)), info: (...args) => __tinysandbox_stdout(line(args)), error: (...args) => __tinysandbox_stderr(line(args)), warn: (...args) => __tinysandbox_stderr(line(args)) }\n"
-"  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => __tinysandbox_exit(code === undefined ? 0 : Number(code) || 0) }\n"
+"  globalThis.console = { log: (...args) => writeStdout(line(args)), info: (...args) => writeStdout(line(args)), error: (...args) => writeStderr(line(args)), warn: (...args) => writeStderr(line(args)) }\n"
+"  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => exit(code === undefined ? 0 : Number(code) || 0) }\n"
+"  return runMain\n"
 "})()\n";
 
 __attribute__((export_name("tinysandbox_alloc")))
@@ -697,13 +728,41 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
     JS_SetPropertyStr(ctx, global, "__tinysandboxConfig", JS_DupValue(ctx, config));
     JS_FreeValue(ctx, global);
 
-    int32_t code = handle_eval_result(ctx, JS_Eval(ctx, TINYSANDBOX_GLUE, strlen(TINYSANDBOX_GLUE), "<tinysandbox>", JS_EVAL_TYPE_GLOBAL));
-    if (code != 0) {
+    JSValue run_main = JS_Eval(ctx, TINYSANDBOX_GLUE, strlen(TINYSANDBOX_GLUE), "<tinysandbox>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(run_main)) {
+        int32_t code = handle_eval_result(ctx, run_main);
         JS_FreeValue(ctx, config);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
         return code;
     }
+
+    JSValue prelude_value = JS_GetPropertyStr(ctx, config, "prelude");
+    size_t prelude_len = 0;
+    const char *prelude = JS_ToCStringLen(ctx, &prelude_len, prelude_value);
+    if (!prelude) {
+        JS_FreeValue(ctx, prelude_value);
+        JS_FreeValue(ctx, run_main);
+        JS_FreeValue(ctx, config);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        tb_write_stderr((const uint8_t *)"quickjs: invalid prelude config\n", 32);
+        return 1;
+    }
+    if (prelude_len > 0) {
+        int32_t code = handle_eval_result(ctx, JS_Eval(ctx, prelude, prelude_len, "<prelude>", JS_EVAL_TYPE_GLOBAL));
+        if (code != 0) {
+            JS_FreeCString(ctx, prelude);
+            JS_FreeValue(ctx, prelude_value);
+            JS_FreeValue(ctx, run_main);
+            JS_FreeValue(ctx, config);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+            return code;
+        }
+    }
+    JS_FreeCString(ctx, prelude);
+    JS_FreeValue(ctx, prelude_value);
 
     JSValue source_value = JS_GetPropertyStr(ctx, config, "code");
     JSValue path_value = JS_GetPropertyStr(ctx, config, "scriptPath");
@@ -719,6 +778,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
         }
         JS_FreeValue(ctx, source_value);
         JS_FreeValue(ctx, path_value);
+        JS_FreeValue(ctx, run_main);
         JS_FreeValue(ctx, config);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
@@ -726,14 +786,11 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
         return 1;
     }
 
-    global = JS_GetGlobalObject(ctx);
-    JSValue run_main = JS_GetPropertyStr(ctx, global, "__tinysandbox_run_main");
-    JS_FreeValue(ctx, global);
     JSValue run_args[2] = {
         JS_NewStringLen(ctx, source, source_len),
         JS_NewString(ctx, script_path),
     };
-    code = handle_eval_result(ctx, JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args));
+    int32_t code = handle_eval_result(ctx, JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args));
     JS_FreeValue(ctx, run_args[0]);
     JS_FreeValue(ctx, run_args[1]);
     JS_FreeValue(ctx, run_main);

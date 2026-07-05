@@ -11,7 +11,7 @@
 - Source patch: the build script enables QuickJS's stack-limit branch under WASI so `JS_SetMaxStackSize` raises catchable `RangeError` exceptions before wasmtime stack traps.
 - QuickJS sources linked: `quickjs.c`, `dtoa.c`, `libregexp.c`, `libunicode.c`
 - Tinysandbox shim: `src/js/quickjs_shim.c`
-- Artifact: 615,759 bytes, SHA-256 `a400326152ed702b58e1f3fc82be081878291b9aac05c355d8f755829ad73ed0`
+- Artifact: 617,311 bytes, SHA-256 `3a197274f337fa3de422f0c0ef817d92f291e34f96ee0eb71fb606975794e807`
 
 The shim uses QuickJS core only, not `quickjs-libc.c` or the QuickJS `std`/`os`
 modules. The guest has no WASI filesystem preopens and reaches the sandbox VFS

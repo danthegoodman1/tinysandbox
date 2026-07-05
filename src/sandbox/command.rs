@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::fs::Fs;
+#[cfg(feature = "js")]
+use super::syscall::Syscall;
 
 /// Future returned by sandbox commands.
 pub type CommandFuture = Pin<Box<dyn Future<Output = CommandResult> + Send>>;
@@ -53,6 +55,12 @@ pub struct CommandContext {
     pub limits: Limits,
     /// Names available through `/bin` and command lookup.
     pub commands: Arc<BTreeSet<String>>,
+    /// JavaScript syscalls registered on the sandbox.
+    #[cfg(feature = "js")]
+    pub js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    /// JavaScript prelude evaluated before each user script.
+    #[cfg(feature = "js")]
+    pub js_prelude: Arc<str>,
 }
 
 /// Exit status and optional resource metrics returned by a command.

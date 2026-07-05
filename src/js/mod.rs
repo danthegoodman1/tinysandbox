@@ -25,6 +25,7 @@ use wasmtime::{
 
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
 use crate::sandbox::fs::{Fs, join_path};
+use crate::sandbox::syscall::{Syscall, SyscallError};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
@@ -48,6 +49,8 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
             mut stderr,
             fs,
             limits,
+            js_syscalls,
+            js_prelude,
             ..
         } = ctx;
 
@@ -58,6 +61,7 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
                 return CommandResult::new(1);
             }
         };
+        let syscall_runtime = tokio::runtime::Handle::current();
 
         let result = match tokio::task::spawn_blocking(move || {
             run_quickjs_on_host_stack(
@@ -65,8 +69,11 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
                 env,
                 cwd,
                 fs,
+                js_syscalls,
+                js_prelude,
                 limits.wasm_memory_bytes,
                 limits.wall_time,
+                syscall_runtime,
             )
         })
         .await
@@ -91,14 +98,28 @@ fn run_quickjs_on_host_stack(
     env: BTreeMap<String, String>,
     cwd: String,
     fs: Fs,
+    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_prelude: Arc<str>,
     wasm_memory_bytes: usize,
     wall_time: Duration,
+    syscall_runtime: tokio::runtime::Handle,
 ) -> JsRunResult {
     match thread::Builder::new()
         .name("tinysandbox-js-runtime".to_owned())
         .stack_size(QUICKJS_HOST_THREAD_STACK_BYTES)
-        .spawn(move || run_quickjs(invocation, env, cwd, fs, wasm_memory_bytes, wall_time))
-    {
+        .spawn(move || {
+            run_quickjs(
+                invocation,
+                env,
+                cwd,
+                fs,
+                syscalls,
+                js_prelude,
+                wasm_memory_bytes,
+                wall_time,
+                syscall_runtime,
+            )
+        }) {
         Ok(handle) => match handle.join() {
             Ok(result) => result,
             Err(_) => JsRunResult {
@@ -167,6 +188,8 @@ struct GuestConfig<'a> {
     argv: &'a [String],
     env: &'a BTreeMap<String, String>,
     cwd: &'a str,
+    syscalls: &'a [String],
+    prelude: &'a str,
 }
 
 struct JsRunResult {
@@ -181,10 +204,23 @@ fn run_quickjs(
     env: BTreeMap<String, String>,
     cwd: String,
     fs: Fs,
+    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_prelude: Arc<str>,
     wasm_memory_bytes: usize,
     wall_time: Duration,
+    syscall_runtime: tokio::runtime::Handle,
 ) -> JsRunResult {
-    match run_quickjs_inner(invocation, env, cwd, fs, wasm_memory_bytes, wall_time) {
+    match run_quickjs_inner(
+        invocation,
+        env,
+        cwd,
+        fs,
+        syscalls,
+        js_prelude,
+        wasm_memory_bytes,
+        wall_time,
+        syscall_runtime,
+    ) {
         Ok(result) => result,
         Err(err) if is_epoch_timeout(&err) => JsRunResult {
             exit_code: 124,
@@ -206,8 +242,11 @@ fn run_quickjs_inner(
     env: BTreeMap<String, String>,
     cwd: String,
     fs: Fs,
+    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_prelude: Arc<str>,
     wasm_memory_bytes: usize,
     wall_time: Duration,
+    syscall_runtime: tokio::runtime::Handle,
 ) -> wasmtime::Result<JsRunResult> {
     let compiled = compiled_runtime()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -215,7 +254,14 @@ fn run_quickjs_inner(
         .map_err(wasmtime::Error::new)?;
     let mut store = Store::new(
         &compiled.engine,
-        HostState::new(fs, runtime, wasm_memory_bytes),
+        HostState::new(
+            fs,
+            runtime,
+            syscall_runtime,
+            syscalls,
+            wasm_memory_bytes,
+            wall_time,
+        ),
     );
     store.limiter(|state| &mut state.limiter);
     store.set_epoch_deadline(epoch_ticks(wall_time));
@@ -237,12 +283,15 @@ fn run_quickjs_inner(
     let free = instance.get_typed_func::<i32, ()>(&mut store, "tinysandbox_free")?;
     let run = instance.get_typed_func::<(i32, i32), i32>(&mut store, "tinysandbox_run")?;
 
+    let syscall_names = store.data().syscalls.keys().cloned().collect::<Vec<_>>();
     let config = GuestConfig {
         code: &invocation.code,
         script_path: &invocation.script_path,
         argv: &invocation.argv,
         env: &env,
         cwd: &cwd,
+        syscalls: &syscall_names,
+        prelude: &js_prelude,
     };
     let input = serde_json::to_vec(&config).map_err(wasmtime::Error::new)?;
     let len = i32::try_from(input.len()).map_err(|_| wasmtime::Error::msg("script too large"))?;
@@ -324,6 +373,8 @@ fn start_epoch_thread(engine: Engine) {
 struct HostState {
     fs: Fs,
     runtime: tokio::runtime::Runtime,
+    syscall_runtime: tokio::runtime::Handle,
+    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     response: Vec<u8>,
@@ -332,13 +383,23 @@ struct HostState {
     limiter: WasmLimiter,
     rng: u64,
     started: Instant,
+    wall_time: Duration,
 }
 
 impl HostState {
-    fn new(fs: Fs, runtime: tokio::runtime::Runtime, memory_limit: usize) -> Self {
+    fn new(
+        fs: Fs,
+        runtime: tokio::runtime::Runtime,
+        syscall_runtime: tokio::runtime::Handle,
+        syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+        memory_limit: usize,
+        wall_time: Duration,
+    ) -> Self {
         Self {
             fs,
             runtime,
+            syscall_runtime,
+            syscalls,
             stdout: Vec::new(),
             stderr: Vec::new(),
             response: Vec::new(),
@@ -347,11 +408,16 @@ impl HostState {
             limiter: WasmLimiter::new(memory_limit),
             rng: 0x7468_696e_626f_7821,
             started: Instant::now(),
+            wall_time,
         }
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
+    }
+
+    fn remaining_wall_time(&self) -> Duration {
+        self.wall_time.saturating_sub(self.started.elapsed())
     }
 }
 
@@ -427,8 +493,10 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
             let memory = memory(&mut caller)?;
             let op = read_utf8(&caller, &memory, op_ptr, op_len)?;
             let input = read_utf8(&caller, &memory, json_ptr, json_len)?;
-            let args: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
-            let response = handle_host_call(caller.data_mut(), &op, args);
+            let response = match serde_json::from_str(&input) {
+                Ok(args) => handle_host_call(caller.data_mut(), &op, args),
+                Err(err) => HostResponse::error(HostCallError::invalid_json(err)),
+            };
             caller.data_mut().response =
                 serde_json::to_vec(&response).map_err(wasmtime::Error::new)?;
             Ok(0)
@@ -646,7 +714,7 @@ struct HostResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<NodeError>,
+    error: Option<Value>,
 }
 
 impl HostResponse {
@@ -657,10 +725,41 @@ impl HostResponse {
         }
     }
 
-    fn error(error: NodeError) -> Self {
+    fn error(error: impl Serialize) -> Self {
         Self {
             value: None,
-            error: Some(error),
+            error: Some(serde_json::to_value(error).expect("host errors serialize")),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HostCallError {
+    code: &'static str,
+    message: String,
+}
+
+impl HostCallError {
+    fn invalid_json(error: serde_json::Error) -> Self {
+        Self {
+            code: "EINVAL",
+            message: format!("invalid host call JSON: {error}"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SyscallHostError {
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+impl From<SyscallError> for SyscallHostError {
+    fn from(error: SyscallError) -> Self {
+        Self {
+            message: error.message,
+            code: error.code,
         }
     }
 }
@@ -676,9 +775,39 @@ struct NodeError {
 }
 
 fn handle_host_call(state: &mut HostState, op: &str, args: Value) -> HostResponse {
-    match handle_host_call_result(state, op, &args) {
-        Ok(value) => HostResponse::value(value),
-        Err(err) => HostResponse::error(err),
+    if op == "syscall" {
+        match handle_syscall(state, &args) {
+            Ok(value) => HostResponse::value(value),
+            Err(err) => HostResponse::error(SyscallHostError::from(err)),
+        }
+    } else {
+        match handle_host_call_result(state, op, &args) {
+            Ok(value) => HostResponse::value(value),
+            Err(err) => HostResponse::error(err),
+        }
+    }
+}
+
+fn handle_syscall(state: &mut HostState, args: &Value) -> Result<Value, SyscallError> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SyscallError::new("syscall host call requires a string name"))?;
+    let syscall = state
+        .syscalls
+        .get(name)
+        .cloned()
+        .ok_or_else(|| SyscallError::new(format!("unknown syscall '{name}'")))?;
+    let payload = args.get("args").cloned().unwrap_or(Value::Null);
+    // Fire before the outer command deadline so the guest can observe the syscall error.
+    let remaining = state.remaining_wall_time().saturating_sub(EPOCH_TICK * 2);
+    let future = syscall.call(payload);
+    match state
+        .syscall_runtime
+        .block_on(async move { tokio::time::timeout(remaining, future).await })
+    {
+        Ok(result) => result,
+        Err(_) => Err(SyscallError::new(format!("syscall '{name}' timed out"))),
     }
 }
 

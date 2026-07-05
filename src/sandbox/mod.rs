@@ -22,6 +22,8 @@
 mod builtins;
 pub mod command;
 pub mod fs;
+#[cfg(feature = "js")]
+pub mod syscall;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -46,6 +48,8 @@ use crate::vfs::{Errno, FileType, InMemoryVfs, Metadata, Vfs, VfsError, VfsStats
 pub use command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult, Limits,
 };
+#[cfg(feature = "js")]
+pub use syscall::{Syscall, SyscallError, SyscallFuture};
 
 const PIPE_CAPACITY_BYTES: usize = STREAM_CHUNK_BYTES;
 const TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
@@ -106,6 +110,10 @@ pub struct Sandbox {
     vfs: Arc<dyn Vfs>,
     commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
     command_names: Arc<BTreeSet<String>>,
+    #[cfg(feature = "js")]
+    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    #[cfg(feature = "js")]
+    js_prelude: Arc<str>,
     limits: Limits,
     session: Mutex<Session>,
     persist_session: bool,
@@ -116,6 +124,10 @@ pub struct Sandbox {
 pub struct SandboxBuilder {
     vfs: Arc<dyn Vfs>,
     commands: BTreeMap<String, Arc<dyn Command>>,
+    #[cfg(feature = "js")]
+    syscalls: Vec<(String, Arc<dyn Syscall>)>,
+    #[cfg(feature = "js")]
+    js_prelude: Option<String>,
     limits: Limits,
     cwd: String,
     env: BTreeMap<String, String>,
@@ -445,6 +457,10 @@ impl Sandbox {
                 redirects,
                 limits: self.limits,
                 commands: Arc::clone(&self.command_names),
+                #[cfg(feature = "js")]
+                js_syscalls: Arc::clone(&self.syscalls),
+                #[cfg(feature = "js")]
+                js_prelude: Arc::clone(&self.js_prelude),
                 counts_command: true,
                 kind: StageKind::Command,
             },
@@ -511,6 +527,10 @@ impl Sandbox {
                     redirects: PreparedRedirects::default(),
                     limits: self.limits,
                     commands: Arc::clone(&self.command_names),
+                    #[cfg(feature = "js")]
+                    js_syscalls: Arc::clone(&self.syscalls),
+                    #[cfg(feature = "js")]
+                    js_prelude: Arc::clone(&self.js_prelude),
                     counts_command: !words.is_empty(),
                     kind: StageKind::Failed {
                         message: format!("{name}: {path}: {}\n", errno_message(err.errno())),
@@ -541,6 +561,10 @@ impl Sandbox {
             redirects,
             limits: self.limits,
             commands: Arc::clone(&self.command_names),
+            #[cfg(feature = "js")]
+            js_syscalls: Arc::clone(&self.syscalls),
+            #[cfg(feature = "js")]
+            js_prelude: Arc::clone(&self.js_prelude),
             counts_command: matches!(kind, StageKind::Command),
             kind,
         }
@@ -753,6 +777,10 @@ impl SandboxBuilder {
         Self {
             vfs: Arc::new(InMemoryVfs::default()),
             commands,
+            #[cfg(feature = "js")]
+            syscalls: Vec::new(),
+            #[cfg(feature = "js")]
+            js_prelude: None,
             limits: Limits::default(),
             cwd: "/".to_owned(),
             env,
@@ -792,6 +820,25 @@ impl SandboxBuilder {
         self
     }
 
+    /// Registers a host syscall callable from sandboxed JavaScript.
+    #[cfg(feature = "js")]
+    pub fn syscall<F, Fut>(mut self, name: impl Into<String>, syscall: F) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, SyscallError>> + Send + 'static,
+    {
+        self.syscalls.push((name.into(), Arc::new(syscall)));
+        self
+    }
+
+    /// Sets JavaScript code evaluated before each sandboxed JavaScript script.
+    /// Preludes run before CommonJS globals exist, so define globals instead of using `require`.
+    #[cfg(feature = "js")]
+    pub fn js_prelude(mut self, code: impl Into<String>) -> Self {
+        self.js_prelude = Some(code.into());
+        self
+    }
+
     /// Sets resource limits for the sandbox.
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -823,11 +870,19 @@ impl SandboxBuilder {
 
     /// Builds the sandbox.
     pub fn build(self) -> Sandbox {
+        #[cfg(feature = "js")]
+        let syscalls = Arc::new(build_syscall_registry(self.syscalls));
+        #[cfg(feature = "js")]
+        let js_prelude = Arc::<str>::from(self.js_prelude.unwrap_or_default());
         let command_names = Arc::new(self.commands.keys().cloned().collect());
         Sandbox {
             vfs: self.vfs,
             commands: Arc::new(self.commands),
             command_names,
+            #[cfg(feature = "js")]
+            syscalls,
+            #[cfg(feature = "js")]
+            js_prelude,
             limits: self.limits,
             session: Mutex::new(Session {
                 cwd: self.cwd,
@@ -1158,6 +1213,10 @@ struct PreparedStage {
     redirects: PreparedRedirects,
     limits: Limits,
     commands: Arc<BTreeSet<String>>,
+    #[cfg(feature = "js")]
+    js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    #[cfg(feature = "js")]
+    js_prelude: Arc<str>,
     counts_command: bool,
     kind: StageKind,
 }
@@ -1487,6 +1546,10 @@ async fn run_registered_stage(
             fs: stage.fs,
             limits: stage.limits,
             commands: stage.commands,
+            #[cfg(feature = "js")]
+            js_syscalls: stage.js_syscalls,
+            #[cfg(feature = "js")]
+            js_prelude: stage.js_prelude,
         };
         return command.run(ctx).await;
     }
@@ -1811,6 +1874,30 @@ fn assert_not_reserved(name: &str) {
             "SandboxBuilder::command cannot register reserved shell builtin '{name}'; cd, export, and unset are interpreted by the shell"
         );
     }
+}
+
+#[cfg(feature = "js")]
+fn build_syscall_registry(
+    entries: Vec<(String, Arc<dyn Syscall>)>,
+) -> BTreeMap<String, Arc<dyn Syscall>> {
+    let mut syscalls = BTreeMap::new();
+    for (name, syscall) in entries {
+        if !is_js_syscall_name(&name) {
+            panic!(
+                "SandboxBuilder::syscall cannot register invalid name '{name}'; names must match [A-Za-z_][A-Za-z0-9_]*"
+            );
+        }
+        if syscalls.insert(name.clone(), syscall).is_some() {
+            panic!("SandboxBuilder::syscall cannot register duplicate name '{name}'");
+        }
+    }
+    syscalls
+}
+
+#[cfg(feature = "js")]
+fn is_js_syscall_name(name: &str) -> bool {
+    // JavaScript syscall names use the same identifier shape as shell assignments.
+    is_assignment_name(name)
 }
 
 fn is_assignment_name(name: &str) -> bool {
