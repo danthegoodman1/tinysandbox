@@ -183,6 +183,8 @@ Scope:
   write_at/stat/readdir/mkdir/rename/rm/truncate/append) over `Arc<dyn Vfs>`.
 - JS globals: `console`, `process.argv`, `process.env` (sandbox env),
   stdin/stdout/stderr wiring, exit codes.
+- CommonJS `require` subset for built-in `fs` plus relative/absolute `.js`,
+  `.json`, and directory `index.js` modules over the VFS.
 - Store memory limits (`ResourceLimiter`), epoch-based CPU deadline wired to
   the machine wall-clock budget; OOM and timeout surface as script errors /
   exit 124.
@@ -191,8 +193,8 @@ Scope:
   in `ExecResult` metrics.
 
 Out of scope:
-- Async JS APIs, event loop, `node` alias decision, module resolution
-  beyond a single script file.
+- Async JS APIs, event loop, `node` alias decision, ESM/import, node_modules,
+  package.json, and broader Node module resolution.
 
 Completion gate:
 Node-compat script corpus passes (same scripts produce identical output
@@ -216,6 +218,7 @@ Status ledger:
 | Complete | Work | 4C: console/process/stdio wiring, exit codes | `src/js/quickjs_shim.c`: console stdout/stderr, `process.argv/env/cwd/exit`, `require('fs')`; uncaught errors flow to stderr. |
 | Complete | Work | 4D: memory + epoch limits, peak-memory metric | `Limits::wasm_memory_bytes`, Wasmtime `ResourceLimiter`, epoch deadline setup, `ExecMetrics::peak_wasm_memory_bytes`; adversarial tests cover timeout and memory cap. |
 | Complete | Work | 4E: `js` cargo feature gating | `Cargo.toml`: default `js` feature gates serde/wasmtime/runtime; CI includes no-default build/test. |
+| Complete | Work | 4F: CommonJS `require` subset | `src/js/quickjs_shim.c`: VFS-backed path resolution/cache/cycles/module globals; `tests/js_runtime.rs`: Node-verified path, JSON, cache, cycle, error, stack, and depth cases. |
 | Complete | Test | Node-compat script corpus | `tests/js_runtime.rs`: console/process Node-verified shape plus VFS-backed fs round trips, descriptor offsets, error codes, quota, pipeline, metrics, timeout/OOM. |
 | Complete | Gate | corpus + adversarial + feature matrix green | Reviewer approved after 3 rounds; test --all-features / --no-default-features + clippy green locally. |
 

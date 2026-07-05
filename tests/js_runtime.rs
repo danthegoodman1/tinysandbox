@@ -50,6 +50,19 @@ async fn js_usage_errors_report_message_and_status() {
 }
 
 #[tokio::test]
+async fn js_eval_commonjs_entry_matches_node() {
+    // Node v24.15.0 eval entries have no require.main, keep module.id as
+    // [eval], and do not bind top-level this to module.exports.
+    let machine = Machine::builder().build();
+    let result = machine
+        .exec("js -e 'console.log(require.main === undefined, require.main === module, module.id, this === module.exports)'")
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "true false [eval] false\n");
+}
+
+#[tokio::test]
 async fn js_config_json_is_stable_across_allocator_alignment() {
     // Varies script length across and beyond a mod-16 allocator window so the
     // QuickJS JSON parser must rely on thinbox's explicit NUL sentinel.
@@ -425,6 +438,350 @@ console.log(fs.existsSync('/missing'))
 }
 
 #[tokio::test]
+async fn js_commonjs_resolves_paths_and_sets_module_globals() {
+    // These expectations mirror the same fixture tree under Node v24.15.0:
+    // relative paths resolve from the requiring file, not process.cwd().
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app", "/app/sub", "/app/dir"],
+        &[
+            (
+                "/app/main.js",
+                r#"
+const h = require('./helper.js')
+console.log(h.fn())
+console.log(require('./helper') === h)
+console.log(require('./sub/child').value)
+console.log(require('/app/dir'))
+console.log(require('./data').name, require('./data.json').flag)
+console.log(__filename)
+console.log(__dirname)
+console.log(require.main === module)
+console.log(require('./sub/main-check'))
+"#,
+            ),
+            (
+                "/app/helper.js",
+                "exports.fn = () => `help:${__dirname}:${__filename}`\n",
+            ),
+            (
+                "/app/sub/child.js",
+                "module.exports = { value: require('../helper').fn() }\n",
+            ),
+            (
+                "/app/sub/main-check.js",
+                "module.exports = require.main === module\n",
+            ),
+            ("/app/dir/index.js", "module.exports = 'indexed'\n"),
+            ("/app/data.json", r#"{"name":"thinbox","flag":true}"#),
+        ],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder()
+        .vfs_arc(machine_vfs)
+        .cwd("/elsewhere")
+        .build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "help:/app:/app/helper.js\ntrue\nhelp:/app:/app/helper.js\nindexed\nthinbox true\n/app/main.js\n/app\ntrue\nfalse\n"
+    );
+}
+
+#[tokio::test]
+async fn js_commonjs_trailing_slash_uses_directory_resolution_only() {
+    // Node v24.15.0 resolves trailing slash specifiers through directory
+    // index.js only: it chooses dir/index.js over dir.js and rejects x/ even
+    // when x.js exists.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app", "/app/dir"],
+        &[
+            (
+                "/app/main.js",
+                r#"
+console.log(require('./dir/'))
+try { require('./x/') } catch (err) {
+  console.log(err.code)
+  console.log(err.message === "Cannot find module './x/'\nRequire stack:\n- /app/main.js")
+}
+"#,
+            ),
+            ("/app/dir.js", "module.exports = 'file'\n"),
+            ("/app/dir/index.js", "module.exports = 'index'\n"),
+            ("/app/x.js", "module.exports = 'x-file'\n"),
+        ],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "index\nMODULE_NOT_FOUND\ntrue\n");
+}
+
+#[tokio::test]
+async fn js_commonjs_bare_dot_and_dotdot_are_directory_specifiers() {
+    // Node v24.15.0 treats "." and ".." as relative directory requests:
+    // require('.') loads the requiring directory's index.js, and require('..')
+    // from a child loads the parent index.js.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app", "/app/sub"],
+        &[
+            (
+                "/app/main.js",
+                r#"
+console.log(require('.'))
+console.log(require('./sub/child'))
+"#,
+            ),
+            ("/app/index.js", "module.exports = 'app-index'\n"),
+            ("/app.js", "module.exports = 'app-file'\n"),
+            ("/app/sub/child.js", "module.exports = require('..')\n"),
+        ],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "app-index\napp-index\n");
+}
+
+#[tokio::test]
+async fn js_commonjs_caches_modules_and_returns_partial_cycle_exports() {
+    // Node inserts a module into the cache before executing it, so side effects
+    // happen once and a cycle observes the other module's current exports.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app"],
+        &[
+            (
+                "/app/main.js",
+                r#"
+const first = require('./counter')
+const second = require('./counter')
+console.log('same', first === second)
+const a = require('./a')
+const b = require('./b')
+console.log('main', a.done, b.done)
+"#,
+            ),
+            (
+                "/app/counter.js",
+                "console.log('counter loaded')\nmodule.exports = { marker: {} }\n",
+            ),
+            (
+                "/app/a.js",
+                r#"
+exports.done = false
+const b = require('./b')
+console.log('in a, b.done =', b.done)
+exports.done = true
+"#,
+            ),
+            (
+                "/app/b.js",
+                r#"
+exports.done = false
+const a = require('./a')
+console.log('in b, a.done =', a.done)
+exports.done = true
+"#,
+            ),
+        ],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "counter loaded\nsame true\nin b, a.done = false\nin a, b.done = true\nmain true true\n"
+    );
+}
+
+#[tokio::test]
+async fn js_commonjs_reports_module_not_found_and_bare_specifiers_loudly() {
+    // The relative MODULE_NOT_FOUND shape follows Node's code/message/stack;
+    // bare packages add thinbox's explicit no-node_modules reason.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app"],
+        &[(
+            "/app/main.js",
+            r#"
+try { require('./missing') } catch (err) {
+  console.log(err.code)
+  console.log(err.message === "Cannot find module './missing'\nRequire stack:\n- /app/main.js")
+  console.log(err.requireStack.join('|'))
+}
+try { require('left-pad') } catch (err) {
+  console.log(err.code)
+  console.log(err.message.includes('no node_modules in thinbox'))
+}
+"#,
+        )],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "MODULE_NOT_FOUND\ntrue\n/app/main.js\nMODULE_NOT_FOUND\ntrue\n"
+    );
+}
+
+#[tokio::test]
+async fn js_commonjs_json_and_exports_alias_match_node_semantics() {
+    // JSON modules export the parsed value, while rebinding `exports` alone
+    // does not replace `module.exports`.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app"],
+        &[
+            (
+                "/app/main.js",
+                r#"
+console.log(JSON.stringify(require('./alias')))
+console.log(require('./valid.json').nested.value)
+try { require('./bad.json') } catch (err) {
+  console.log(err.name)
+  console.log(err.message.includes('/app/bad.json'))
+  console.log(err.code === undefined)
+}
+"#,
+            ),
+            (
+                "/app/alias.js",
+                r#"
+exports.a = 1
+exports = { a: 2 }
+module.exports.b = 3
+module.exports = { c: 4 }
+exports.d = 5
+"#,
+            ),
+            ("/app/valid.json", r#"{"nested":{"value":7}}"#),
+            ("/app/bad.json", "{ nope"),
+        ],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "{\"c\":4}\n7\nSyntaxError\ntrue\ntrue\n");
+}
+
+#[tokio::test]
+async fn js_commonjs_required_module_errors_keep_required_filename_in_stack() {
+    // Required modules are evaled with their resolved filename so uncaught
+    // stacks identify the throwing file, matching Node's debugging surface.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(
+        vfs.as_ref(),
+        &["/app"],
+        &[
+            ("/app/main.js", "require('./helper')\n"),
+            (
+                "/app/helper.js",
+                r#"
+function boom() {
+  throw new Error('helper boom')
+}
+boom()
+"#,
+            ),
+        ],
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let result = machine.exec("js /app/main.js").await;
+
+    assert_eq!(result.exit_code, 1);
+    assert!(result.stderr.starts_with("Error: helper boom\n"));
+    assert!(
+        result.stderr.contains("/app/helper.js"),
+        "{}",
+        result.stderr
+    );
+    assert!(!result.stderr.contains("wasm trap"));
+}
+
+#[tokio::test]
+async fn js_commonjs_deep_require_chains_are_bounded_cleanly() {
+    // A 200-module chain runs under the cap; a longer chain throws a catchable
+    // JS error instead of reaching a wasm stack trap.
+    let vfs = Arc::new(InMemoryVfs::default());
+    seed_vfs(vfs.as_ref(), &["/chain", "/cap"], &[]);
+    for index in 0..=200 {
+        let source = if index == 200 {
+            "module.exports = 200\n".to_owned()
+        } else {
+            format!("module.exports = require('./m{}')\n", index + 1)
+        };
+        write_vfs_file(
+            vfs.as_ref(),
+            &format!("/chain/m{index}.js"),
+            source.as_bytes(),
+        );
+    }
+    for index in 0..=260 {
+        let source = if index == 260 {
+            "module.exports = 260\n".to_owned()
+        } else {
+            format!("module.exports = require('./m{}')\n", index + 1)
+        };
+        write_vfs_file(
+            vfs.as_ref(),
+            &format!("/cap/m{index}.js"),
+            source.as_bytes(),
+        );
+    }
+    write_vfs_file(
+        vfs.as_ref(),
+        "/chain/main.js",
+        b"console.log(require('./m0'))\n",
+    );
+    write_vfs_file(
+        vfs.as_ref(),
+        "/cap/main.js",
+        b"try { require('./m0'); console.log('unexpected') } catch (err) { console.log(err.code); console.log(err.message.includes('256')) }\n",
+    );
+    let machine_vfs: Arc<dyn Vfs> = vfs;
+    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+
+    let successful = machine.exec("js /chain/main.js").await;
+    assert_eq!(successful.exit_code, 0, "stderr: {}", successful.stderr);
+    assert_eq!(successful.stdout, "200\n");
+
+    let capped = machine.exec("js /cap/main.js").await;
+    assert_eq!(capped.exit_code, 0, "stderr: {}", capped.stderr);
+    assert_eq!(capped.stdout, "ERR_REQUIRE_DEPTH\ntrue\n");
+    assert!(!capped.stderr.contains("wasm trap"));
+}
+
+#[tokio::test]
 async fn js_pipeline_and_redirects_use_command_stdio() {
     // The JS phase does not expose stdin to scripts yet, but command stdout is
     // still ordinary pipeline/redirect data handled by the shell executor.
@@ -470,6 +827,15 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
 
 fn shell_single_quote(input: &str) -> String {
     input.replace('\'', "'\\''")
+}
+
+fn seed_vfs(vfs: &dyn Vfs, dirs: &[&str], files: &[(&str, &str)]) {
+    for dir in dirs {
+        vfs.mkdir(dir).expect("create fixture directory");
+    }
+    for (path, data) in files {
+        write_vfs_file(vfs, path, data.as_bytes());
+    }
 }
 
 fn write_vfs_file(vfs: &dyn Vfs, path: &str, data: &[u8]) {

@@ -239,6 +239,148 @@ static const char THINBOX_GLUE[] =
 "  function syncOnly(name) { return function() { throw new Error(`fs.${name} is not supported in thinbox: sync-only`) } }\n"
 "  const fs = { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, rmdirSync, existsSync, openSync, readSync, writeSync, ftruncateSync, closeSync, copyFileSync,\n"
 "    readFile: syncOnly('readFile'), writeFile: syncOnly('writeFile'), appendFile: syncOnly('appendFile'), mkdir: syncOnly('mkdir'), readdir: syncOnly('readdir'), stat: syncOnly('stat'), rename: syncOnly('rename'), rm: syncOnly('rm'), unlink: syncOnly('unlink'), rmdir: syncOnly('rmdir'), open: syncOnly('open'), read: syncOnly('read'), write: syncOnly('write'), ftruncate: syncOnly('ftruncate'), close: syncOnly('close'), copyFile: syncOnly('copyFile') }\n"
+"  const moduleCache = Object.create(null)\n"
+"  const MAX_REQUIRE_DEPTH = 256\n"
+"  let mainModule = null\n"
+"  let requireDepth = 0\n"
+"  function normalizeAbsolute(path) {\n"
+"    const parts = []\n"
+"    for (const part of String(path).split('/')) {\n"
+"      if (part === '' || part === '.') continue\n"
+"      if (part === '..') parts.pop()\n"
+"      else parts.push(part)\n"
+"    }\n"
+"    return parts.length === 0 ? '/' : `/${parts.join('/')}`\n"
+"  }\n"
+"  function dirname(path) {\n"
+"    if (path === '[eval]') return config.cwd\n"
+"    const normalized = normalizeAbsolute(path)\n"
+"    const index = normalized.lastIndexOf('/')\n"
+"    return index <= 0 ? '/' : normalized.slice(0, index)\n"
+"  }\n"
+"  function joinPath(dir, name) { return normalizeAbsolute(dir === '/' ? `/${name}` : `${dir}/${name}`) }\n"
+"  function isPathSpecifier(specifier) { return specifier === '.' || specifier === '..' || specifier.startsWith('/') || specifier.startsWith('./') || specifier.startsWith('../') }\n"
+"  function statOrNull(path) {\n"
+"    try { return fs.statSync(path) }\n"
+"    catch (err) {\n"
+"      if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) return null\n"
+"      throw err\n"
+"    }\n"
+"  }\n"
+"  function fileCandidate(path) {\n"
+"    const stat = statOrNull(path)\n"
+"    return stat && stat.isFile() ? normalizeAbsolute(path) : null\n"
+"  }\n"
+"  function requireStack(parent) {\n"
+"    const stack = []\n"
+"    for (let module = parent; module; module = module.parent) {\n"
+"      if (module.filename !== '[eval]') stack.push(module.filename)\n"
+"    }\n"
+"    return stack\n"
+"  }\n"
+"  function moduleNotFound(specifier, parent) {\n"
+"    const stack = requireStack(parent)\n"
+"    const suffix = stack.length === 0 ? '' : `\\nRequire stack:\\n${stack.map(path => `- ${path}`).join('\\n')}`\n"
+"    const err = new Error(`Cannot find module '${specifier}'${suffix}`)\n"
+"    err.code = 'MODULE_NOT_FOUND'\n"
+"    err.requireStack = stack\n"
+"    return err\n"
+"  }\n"
+"  function bareSpecifierError(specifier, parent) {\n"
+"    const err = moduleNotFound(specifier, parent)\n"
+"    err.message = `Cannot find module '${specifier}': there is no node_modules in thinbox`\n"
+"    return err\n"
+"  }\n"
+"  function resolveModule(specifier, parent) {\n"
+"    const request = String(specifier)\n"
+"    if (!isPathSpecifier(request)) throw bareSpecifierError(request, parent)\n"
+"    const base = request.startsWith('/') ? normalizeAbsolute(request) : joinPath(parent.dirname, request)\n"
+"    const directoryOnly = request === '.' || request === '..' || request.endsWith('/')\n"
+"    if (!directoryOnly) {\n"
+"      const file = fileCandidate(base) || fileCandidate(`${base}.js`) || fileCandidate(`${base}.json`)\n"
+"      if (file) return file\n"
+"    }\n"
+"    const stat = statOrNull(base)\n"
+"    if (stat && stat.isDirectory()) {\n"
+"      const index = fileCandidate(joinPath(base, 'index.js'))\n"
+"      if (index) return index\n"
+"    }\n"
+"    throw moduleNotFound(request, parent)\n"
+"  }\n"
+"  function stripBomAndShebang(source) {\n"
+"    source = String(source)\n"
+"    if (source.charCodeAt(0) === 0xfeff) source = source.slice(1)\n"
+"    if (!source.startsWith('#!')) return source\n"
+"    const end = source.indexOf('\\n')\n"
+"    return end === -1 ? '' : `\\n${source.slice(end + 1)}`\n"
+"  }\n"
+"  function readModuleText(path) { return utf8Decode(base64Decode(call('readFile', { path }))) }\n"
+"  function createModule(path, parent) {\n"
+"    const module = { id: path, filename: path, path: dirname(path), dirname: dirname(path), exports: {}, loaded: false, parent: parent || null, children: [] }\n"
+"    module.require = makeRequire(module)\n"
+"    return module\n"
+"  }\n"
+"  function makeRequire(module) {\n"
+"    function localRequire(specifier) {\n"
+"      if (specifier === 'fs') return fs\n"
+"      if (typeof specifier !== 'string') throw new TypeError(`The \"id\" argument must be of type string. Received ${typeof specifier}`)\n"
+"      return loadModule(resolveModule(specifier, module), module)\n"
+"    }\n"
+"    Object.defineProperty(localRequire, 'main', { get: () => mainModule === null ? undefined : mainModule })\n"
+"    localRequire.cache = moduleCache\n"
+"    return localRequire\n"
+"  }\n"
+"  function executeJsModule(module, source, thisArg) {\n"
+"    const wrapper = `(function (exports, require, module, __filename, __dirname) {${stripBomAndShebang(source)}\\n})`\n"
+"    const compiled = __thinbox_eval_module(wrapper, module.filename)\n"
+"    const thisValue = arguments.length < 3 ? module.exports : thisArg\n"
+"    return compiled.call(thisValue, module.exports, module.require, module, module.filename, module.dirname)\n"
+"  }\n"
+"  function executeJsonModule(module, source) {\n"
+"    try { module.exports = JSON.parse(stripBomAndShebang(source)) }\n"
+"    catch (err) { throw new SyntaxError(`${module.filename}: ${err && err.message ? err.message : String(err)}`) }\n"
+"  }\n"
+"  function loadModule(path, parent) {\n"
+"    if (Object.prototype.hasOwnProperty.call(moduleCache, path)) return moduleCache[path].exports\n"
+"    if (requireDepth >= MAX_REQUIRE_DEPTH) {\n"
+"      const err = new Error(`Maximum CommonJS require depth of ${MAX_REQUIRE_DEPTH} exceeded in thinbox`)\n"
+"      err.code = 'ERR_REQUIRE_DEPTH'\n"
+"      throw err\n"
+"    }\n"
+"    const module = createModule(path, parent)\n"
+"    moduleCache[path] = module\n"
+"    if (parent) parent.children.push(module)\n"
+"    requireDepth++\n"
+"    try {\n"
+"      const source = readModuleText(path)\n"
+"      if (path.endsWith('.json')) executeJsonModule(module, source)\n"
+"      else executeJsModule(module, source)\n"
+"      module.loaded = true\n"
+"      return module.exports\n"
+"    } catch (err) {\n"
+"      delete moduleCache[path]\n"
+"      throw err\n"
+"    } finally {\n"
+"      requireDepth--\n"
+"    }\n"
+"  }\n"
+"  globalThis.__thinbox_run_main = function(source, path) {\n"
+"    const filename = path === '[eval]' ? path : normalizeAbsolute(path)\n"
+"    const module = createModule(filename, null)\n"
+"    const isEval = path === '[eval]'\n"
+"    mainModule = isEval ? null : module\n"
+"    if (!isEval) module.id = '.'\n"
+"    moduleCache[filename] = module\n"
+"    globalThis.module = module\n"
+"    globalThis.exports = module.exports\n"
+"    globalThis.require = module.require\n"
+"    globalThis.__filename = module.filename\n"
+"    globalThis.__dirname = module.dirname\n"
+"    executeJsModule(module, source, isEval ? globalThis : module.exports)\n"
+"    module.loaded = true\n"
+"    globalThis.exports = module.exports\n"
+"    return module.exports\n"
+"  }\n"
 "  function quote(value) { return `'${String(value).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\")}'` }\n"
 "  function inspect(value, nested, depth, seen, state) {\n"
 "    depth = depth || 0\n"
@@ -292,9 +434,6 @@ static const char THINBOX_GLUE[] =
 "  globalThis.Buffer = Buffer\n"
 "  globalThis.console = { log: (...args) => __thinbox_stdout(line(args)), info: (...args) => __thinbox_stdout(line(args)), error: (...args) => __thinbox_stderr(line(args)), warn: (...args) => __thinbox_stderr(line(args)) }\n"
 "  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => __thinbox_exit(code === undefined ? 0 : Number(code) || 0) }\n"
-"  globalThis.require = name => { if (name === 'fs') return fs; throw new Error(`Cannot find module '${name}'`) }\n"
-"  globalThis.module = { exports: {} }\n"
-"  globalThis.exports = globalThis.module.exports\n"
 "})()\n";
 
 __attribute__((export_name("thinbox_alloc")))
@@ -403,6 +542,32 @@ static JSValue js_process_exit(JSContext *ctx, JSValueConst this_val, int argc, 
     JS_SetPropertyStr(ctx, exit, "code", JS_NewInt32(ctx, code));
     JS_SetUncatchableError(ctx, exit);
     return JS_Throw(ctx, exit);
+}
+
+static JSValue js_eval_module(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "module eval requires source and filename");
+    }
+
+    size_t source_len = 0;
+    const char *source = JS_ToCStringLen(ctx, &source_len, argv[0]);
+    const char *filename = JS_ToCString(ctx, argv[1]);
+    if (!source || !filename) {
+        if (source) {
+            JS_FreeCString(ctx, source);
+        }
+        if (filename) {
+            JS_FreeCString(ctx, filename);
+        }
+        return JS_EXCEPTION;
+    }
+
+    JSValue result = JS_Eval(ctx, source, source_len, filename, JS_EVAL_TYPE_GLOBAL);
+    JS_FreeCString(ctx, source);
+    JS_FreeCString(ctx, filename);
+    return result;
 }
 
 static void set_function(JSContext *ctx, const char *name, JSCFunction *func, int argc)
@@ -518,6 +683,7 @@ int32_t thinbox_run(const uint8_t *input, int32_t input_len)
     set_function(ctx, "__thinbox_stdout", js_write_stdout, 1);
     set_function(ctx, "__thinbox_stderr", js_write_stderr, 1);
     set_function(ctx, "__thinbox_exit", js_process_exit, 1);
+    set_function(ctx, "__thinbox_eval_module", js_eval_module, 2);
 
     JSValue config = JS_ParseJSON(ctx, (const char *)input, (size_t)input_len, "<thinbox-config>");
     if (JS_IsException(config)) {
@@ -560,7 +726,17 @@ int32_t thinbox_run(const uint8_t *input, int32_t input_len)
         return 1;
     }
 
-    code = handle_eval_result(ctx, JS_Eval(ctx, source, source_len, script_path, JS_EVAL_TYPE_GLOBAL));
+    global = JS_GetGlobalObject(ctx);
+    JSValue run_main = JS_GetPropertyStr(ctx, global, "__thinbox_run_main");
+    JS_FreeValue(ctx, global);
+    JSValue run_args[2] = {
+        JS_NewStringLen(ctx, source, source_len),
+        JS_NewString(ctx, script_path),
+    };
+    code = handle_eval_result(ctx, JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args));
+    JS_FreeValue(ctx, run_args[0]);
+    JS_FreeValue(ctx, run_args[1]);
+    JS_FreeValue(ctx, run_main);
     JS_FreeCString(ctx, source);
     JS_FreeCString(ctx, script_path);
     JS_FreeValue(ctx, source_value);

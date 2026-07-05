@@ -4,6 +4,9 @@
 //! inode, uid, and gid fields until the VFS exposes them. JS execution uses the
 //! machine wall-clock budget, but timeout handling returns a clean 124 result
 //! and discards buffered JS stdout/stderr instead of returning partial output.
+//! Module stack traces still reflect QuickJS details: wrapper prefixes leave a
+//! line-1 column offset, method frames are named like `at boom`, and visible
+//! `<thinbox>` glue frames can appear below user frames.
 
 use std::collections::BTreeMap;
 use std::future::Future;
