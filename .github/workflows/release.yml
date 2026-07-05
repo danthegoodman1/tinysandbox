@@ -1,0 +1,239 @@
+# Required repository setup:
+# - CARGO_REGISTRY_TOKEN must allow publishing the tinysandbox crate.
+# - npm trusted publishing must trust this workflow for the @tinysandbox/tinysandbox package.
+# - Branch protection must allow github-actions[bot] to push the release commit to main.
+# - External contributor Actions runs should require maintainer approval before CI runs.
+name: Release
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply.
+        required: true
+        default: patch
+        type: choice
+        options:
+          - current
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.eligibility.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.release_ref.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Check release eligibility
+        id: eligibility
+        run: |
+          message="$(git log -1 --format=%B)"
+          release=true
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            if [[ "$message" == *"[skip release]"* || "$message" == chore\(release\):* ]]; then
+              release=false
+            fi
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          {
+            echo "message<<EOF"
+            echo "$message"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.eligibility.outputs.release == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.eligibility.outputs.release == 'true'
+        with:
+          node-version: 24
+
+      - name: Configure Git author
+        if: steps.eligibility.outputs.release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine release version
+        if: steps.eligibility.outputs.release == 'true'
+        id: version
+        env:
+          RELEASE_BUMP: ${{ inputs.bump || 'auto' }}
+          RELEASE_MESSAGE: ${{ steps.eligibility.outputs.message }}
+        run: |
+          version="$(node scripts/release-version.mjs next --bump "$RELEASE_BUMP" --message "$RELEASE_MESSAGE")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+      - name: Apply lockstep version
+        if: steps.eligibility.outputs.release == 'true'
+        run: |
+          node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
+          cargo update -w
+          npm install --prefix tinysandbox-node --package-lock-only --ignore-scripts
+          node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
+
+      - name: Commit and push release version
+        if: steps.eligibility.outputs.release == 'true'
+        run: |
+          git diff --check
+          if git diff --quiet; then
+            echo "No release version changes to commit"
+            exit 0
+          fi
+          git add Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json
+          git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip release]"
+          git push origin HEAD:main
+
+      - name: Record release source
+        if: steps.eligibility.outputs.release == 'true'
+        id: release_ref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-native:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux
+          - os: macos-latest
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: tinysandbox-node
+
+      - name: Build native binding
+        run: npm run build
+        working-directory: tinysandbox-node
+
+      - name: Collect native binding
+        run: |
+          mkdir native-artifact
+          cp tinysandbox-node/*.node native-artifact/
+          ls -lh native-artifact
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          path: native-artifact/*.node
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - prepare
+      - build-native
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: tinysandbox-node
+
+      - name: Build package wrapper
+        run: npm run build
+        working-directory: tinysandbox-node
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+          merge-multiple: true
+
+      - name: Assemble native package artifacts
+        run: |
+          set -euo pipefail
+          cp native-artifacts/*.node tinysandbox-node/
+          native_count="$(find tinysandbox-node -maxdepth 1 -name '*.node' | wc -l | tr -d ' ')"
+          if [ "$native_count" -lt 2 ]; then
+            echo "expected at least 2 native package artifacts, found ${native_count}" >&2
+            exit 1
+          fi
+          ls -lh tinysandbox-node/*.node
+
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if curl -fsSL -H "User-Agent: tinysandbox-release-ci" "https://crates.io/api/v1/crates/tinysandbox/${VERSION}" >/dev/null 2>&1; then
+            echo "tinysandbox ${VERSION} is already published"
+            exit 0
+          fi
+
+          cargo publish --locked -p tinysandbox --token "$CARGO_REGISTRY_TOKEN"
+
+      - name: Publish npm package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        working-directory: tinysandbox-node
+        run: |
+          set -euo pipefail
+          npm --version
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC request environment is missing" >&2
+            exit 1
+          fi
+
+          if npm view "@tinysandbox/tinysandbox@${VERSION}" version >/dev/null 2>&1; then
+            echo "@tinysandbox/tinysandbox ${VERSION} is already published"
+            exit 0
+          fi
+
+          npm publish --access public

@@ -33,7 +33,7 @@ async fn main() {
 #### TypeScript
 
 ```ts
-import { Sandbox } from 'tinysandbox'
+import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox()
 
@@ -97,7 +97,7 @@ that actually runs untrusted code: agent-authored JavaScript. The result:
 
 ```bash
 cargo add tinysandbox tokio
-npm install tinysandbox
+npm install @tinysandbox/tinysandbox
 ```
 
 #### Rust
@@ -132,7 +132,7 @@ async fn main() {
 #### TypeScript
 
 ```ts
-import { Sandbox } from 'tinysandbox'
+import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox()
 
@@ -173,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #### TypeScript
 
 ```ts
-import { Sandbox } from 'tinysandbox'
+import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox()
 await sandbox.fs.mkdir('/workspace')
@@ -269,7 +269,7 @@ async fn main() {
 #### TypeScript
 
 ```ts
-import { Sandbox } from 'tinysandbox'
+import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
   commands: {
@@ -319,7 +319,7 @@ let sandbox = Sandbox::builder().vfs_arc(Arc::clone(&vfs)).build();
 #### TypeScript
 
 ```ts
-import { Sandbox } from 'tinysandbox'
+import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
   vfs: MyVfs.connect('s3://agent-42-workspace')
@@ -343,7 +343,7 @@ fn my_vfs_conforms() {
 #### TypeScript
 
 ```ts
-import { runConformance } from 'tinysandbox'
+import { runConformance } from '@tinysandbox/tinysandbox'
 
 await runConformance((quota) => new MyVfs(quota))
 ```
@@ -443,7 +443,7 @@ fn main() {
 #### TypeScript
 
 ```ts
-import { Sandbox } from 'tinysandbox'
+import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
   limits: {

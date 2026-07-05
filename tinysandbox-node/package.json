@@ -1,5 +1,5 @@
 {
-  "name": "tinysandbox",
+  "name": "@tinysandbox/tinysandbox",
   "version": "0.3.0",
   "description": "Node.js bindings for the tinysandbox in-process AI agent sandbox",
   "main": "index.js",
@@ -39,7 +39,8 @@
     "index.js",
     "index.d.ts",
     "native.cjs",
-    "native.d.ts"
+    "native.d.ts",
+    "*.node"
   ],
   "napi": {
     "binaryName": "tinysandbox-node",

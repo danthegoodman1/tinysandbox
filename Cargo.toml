@@ -12,7 +12,7 @@ repository = "https://github.com/danthegoodman1/tinysandbox"
 readme = "README.md"
 keywords = ["sandbox", "agent", "shell", "vfs", "quickjs"]
 categories = ["virtualization", "filesystem", "development-tools"]
-exclude = ["PLAN.md", "original-plan.md", ".github/", ".vscode/", "tinysandbox-node/"]
+exclude = ["PLAN.md", "original-plan.md", ".github/", ".vscode/", "scripts/release-version*.mjs", "tinysandbox-node/"]
 
 [dependencies]
 base64 = { version = "0.22.1", optional = true }
