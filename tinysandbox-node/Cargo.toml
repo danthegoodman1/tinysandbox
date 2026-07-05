@@ -1,6 +1,6 @@
 [package]
 name = "tinysandbox-node"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -14,7 +14,7 @@ napi-derive = "3"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
-tinysandbox = { version = "0.3.1", path = ".." }
+tinysandbox = { version = "0.3.2", path = ".." }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "time"] }
 
 [build-dependencies]

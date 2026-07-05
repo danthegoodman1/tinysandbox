@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/tinysandbox",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Node.js bindings for the tinysandbox in-process AI agent sandbox",
   "main": "index.js",
   "types": "index.d.ts",
