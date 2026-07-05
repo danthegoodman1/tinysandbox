@@ -102,6 +102,14 @@ impl Default for InMemoryVfs {
 }
 
 impl Vfs for InMemoryVfs {
+    fn is_fast(&self) -> bool {
+        true
+    }
+
+    fn stats(&self) -> Option<VfsResult<VfsStats>> {
+        Some(InMemoryVfs::stats(self))
+    }
+
     fn stat(&self, path: &str) -> VfsResult<Metadata> {
         let path = normalize_path(path)?;
         let state = self.state();

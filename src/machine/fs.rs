@@ -1,0 +1,268 @@
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use tokio::task;
+
+use crate::vfs::{
+    DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsResult,
+};
+
+#[derive(Clone)]
+pub struct Fs {
+    vfs: Arc<dyn Vfs>,
+    bin_commands: Arc<BTreeSet<String>>,
+    cwd: String,
+}
+
+impl Fs {
+    pub(crate) fn new(vfs: Arc<dyn Vfs>, bin_commands: Arc<BTreeSet<String>>, cwd: String) -> Self {
+        Self {
+            vfs,
+            bin_commands,
+            cwd,
+        }
+    }
+
+    pub async fn stat(&self, path: &str) -> VfsResult<Metadata> {
+        let path = self.resolve(path);
+        if let Some(metadata) = self.bin_stat(&path) {
+            return metadata;
+        }
+        self.dispatch(move |vfs| vfs.stat(&path)).await
+    }
+
+    pub async fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
+        let path = self.resolve(path);
+        if path == "/bin" {
+            return Ok(self
+                .bin_commands
+                .iter()
+                .map(|name| DirEntry {
+                    name: name.clone(),
+                    metadata: Metadata {
+                        file_type: FileType::File,
+                        len: 0,
+                    },
+                })
+                .collect());
+        }
+        if path.starts_with("/bin/") {
+            return Err(VfsError::new(Errno::ENOTDIR));
+        }
+        self.dispatch(move |vfs| vfs.readdir(&path)).await
+    }
+
+    pub async fn mkdir(&self, path: &str) -> VfsResult<()> {
+        let path = self.resolve(path);
+        if is_bin_path(&path) {
+            return Err(VfsError::new(Errno::EACCES));
+        }
+        self.dispatch(move |vfs| vfs.mkdir(&path)).await
+    }
+
+    pub async fn rename(&self, from: &str, to: &str) -> VfsResult<()> {
+        let from = self.resolve(from);
+        let to = self.resolve(to);
+        if is_bin_path(&from) || is_bin_path(&to) {
+            return Err(VfsError::new(Errno::EACCES));
+        }
+        self.dispatch(move |vfs| vfs.rename(&from, &to)).await
+    }
+
+    pub async fn unlink(&self, path: &str) -> VfsResult<()> {
+        let path = self.resolve(path);
+        if is_bin_path(&path) {
+            return Err(VfsError::new(Errno::EACCES));
+        }
+        self.dispatch(move |vfs| vfs.unlink(&path)).await
+    }
+
+    pub async fn rmdir(&self, path: &str) -> VfsResult<()> {
+        let path = self.resolve(path);
+        if is_bin_path(&path) {
+            return Err(VfsError::new(Errno::EACCES));
+        }
+        self.dispatch(move |vfs| vfs.rmdir(&path)).await
+    }
+
+    pub async fn read_file(&self, path: &str) -> VfsResult<Vec<u8>> {
+        let path = self.resolve(path);
+        if path == "/bin" {
+            return Err(VfsError::new(Errno::EISDIR));
+        }
+        if let Some(name) = path.strip_prefix("/bin/") {
+            return if self.bin_commands.contains(name) {
+                Ok(Vec::new())
+            } else {
+                Err(VfsError::new(Errno::ENOENT))
+            };
+        }
+        self.dispatch(move |vfs| read_file_sync(vfs, &path)).await
+    }
+
+    pub async fn write_file(&self, path: &str, data: &[u8], append: bool) -> VfsResult<()> {
+        let path = self.resolve(path);
+        let data = data.to_vec();
+        if is_bin_path(&path) {
+            return Err(VfsError::new(Errno::EACCES));
+        }
+        self.dispatch(move |vfs| write_file_sync(vfs, &path, &data, append))
+            .await
+    }
+
+    pub async fn touch(&self, path: &str) -> VfsResult<()> {
+        let path = self.resolve(path);
+        if is_bin_path(&path) {
+            return Err(VfsError::new(Errno::EACCES));
+        }
+        self.dispatch(move |vfs| {
+            let handle = match vfs.open(&path, OpenMode::write_only().create()) {
+                Ok(handle) => handle,
+                Err(err) => return Err(err),
+            };
+            vfs.close(handle)
+        })
+        .await
+    }
+
+    async fn dispatch<R, F>(&self, op: F) -> VfsResult<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&dyn Vfs) -> VfsResult<R> + Send + 'static,
+    {
+        if self.vfs.is_fast() {
+            return op(self.vfs.as_ref());
+        }
+
+        let vfs = Arc::clone(&self.vfs);
+        task::spawn_blocking(move || op(vfs.as_ref()))
+            .await
+            .unwrap_or_else(|_| Err(VfsError::new(Errno::EINVAL)))
+    }
+
+    fn bin_stat(&self, path: &str) -> Option<VfsResult<Metadata>> {
+        if path == "/bin" {
+            return Some(Ok(Metadata {
+                file_type: FileType::Directory,
+                len: 0,
+            }));
+        }
+
+        let name = path.strip_prefix("/bin/")?;
+        Some(if !name.contains('/') && self.bin_commands.contains(name) {
+            Ok(Metadata {
+                file_type: FileType::File,
+                len: 0,
+            })
+        } else {
+            Err(VfsError::new(Errno::ENOENT))
+        })
+    }
+
+    pub(crate) fn resolve(&self, path: &str) -> String {
+        normalize_absolute(if path.starts_with('/') {
+            path.to_owned()
+        } else if self.cwd == "/" {
+            format!("/{path}")
+        } else {
+            format!("{}/{path}", self.cwd)
+        })
+    }
+}
+
+pub(crate) fn errno_message(errno: Errno) -> &'static str {
+    match errno {
+        Errno::EBADF => "Bad file descriptor",
+        Errno::EBUSY => "Device or resource busy",
+        Errno::EACCES => "Permission denied",
+        Errno::EEXIST => "File exists",
+        Errno::EINVAL => "Invalid argument",
+        Errno::EISDIR => "Is a directory",
+        Errno::ENOENT => "No such file or directory",
+        Errno::ENOSPC => "No space left on device",
+        Errno::ENOTDIR => "Not a directory",
+        Errno::ENOTEMPTY => "Directory not empty",
+    }
+}
+
+pub(crate) fn join_path(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+fn read_file_sync(vfs: &dyn Vfs, path: &str) -> VfsResult<Vec<u8>> {
+    let handle = vfs.open(path, OpenMode::read_only())?;
+    let result = read_all_from_handle(vfs, handle);
+    let close = vfs.close(handle);
+    match (result, close) {
+        (Ok(data), Ok(())) => Ok(data),
+        (Err(err), _) | (_, Err(err)) => Err(err),
+    }
+}
+
+fn read_all_from_handle(vfs: &dyn Vfs, handle: FileHandle) -> VfsResult<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut offset = 0_u64;
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = vfs.read_at(handle, offset, &mut buf)?;
+        if read == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..read]);
+        offset += u64::try_from(read).map_err(|_| VfsError::new(Errno::EINVAL))?;
+    }
+}
+
+fn write_file_sync(vfs: &dyn Vfs, path: &str, data: &[u8], append: bool) -> VfsResult<()> {
+    let mode = if append {
+        OpenMode::write_only().create().append()
+    } else {
+        OpenMode::write_only().create().truncate()
+    };
+    let handle = vfs.open(path, mode)?;
+    let result = write_all_to_handle(vfs, handle, data);
+    let close = vfs.close(handle);
+    result.and(close)
+}
+
+fn write_all_to_handle(vfs: &dyn Vfs, handle: FileHandle, data: &[u8]) -> VfsResult<()> {
+    let mut written = 0;
+    while written < data.len() {
+        let n = vfs.write_at(
+            handle,
+            u64::try_from(written).map_err(|_| VfsError::new(Errno::EINVAL))?,
+            &data[written..],
+        )?;
+        if n == 0 {
+            return Err(VfsError::new(Errno::ENOSPC));
+        }
+        written += n;
+    }
+    Ok(())
+}
+
+fn is_bin_path(path: &str) -> bool {
+    path == "/bin" || path.starts_with("/bin/")
+}
+
+pub(crate) fn normalize_absolute(path: String) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
+}

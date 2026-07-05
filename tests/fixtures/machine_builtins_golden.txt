@@ -1,0 +1,276 @@
+# Builtin golden corpus for Phase 3.
+# Expected shapes were checked against GNU coreutils/bash behavior where the
+# supported feature is a GNU-compatible surface. macOS BSD-compatible cases
+# were also spot-checked locally. Known documented deviations: grep and sed use
+# Rust regex syntax rather than GNU BRE/ERE syntax for linear-time matching.
+
+CASE cat stdin dash
+COMMAND
+echo -e 'a\nb' | cat -
+END_COMMAND
+EXIT 0
+STDOUT
+a
+b
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE ls all long shape
+COMMAND
+mkdir -p /d; touch /d/.hidden /d/file; ls -a -l /d
+END_COMMAND
+EXIT 0
+STDOUT
+drwxr-xr-x 1 0 0      0 Jan  1 00:00 .
+drwxr-xr-x 1 0 0      0 Jan  1 00:00 ..
+-rw-r--r-- 1 0 0      0 Jan  1 00:00 .hidden
+-rw-r--r-- 1 0 0      0 Jan  1 00:00 file
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE cp mv rm mkdir touch
+COMMAND
+mkdir -p /a; echo data > /a/src; cp /a/src /a/copy; mkdir /b; mv /a/copy /b/moved; rm /a/src; ls /a /b
+END_COMMAND
+EXIT 0
+STDOUT
+/a:
+
+/b:
+moved
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE echo clusters literals and escapes
+COMMAND
+echo -nnee 'x\ny'; echo -- -x
+END_COMMAND
+EXIT 0
+STDOUT
+x
+y-- -x
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE pwd after cd
+COMMAND
+mkdir -p /work; cd /work; pwd
+END_COMMAND
+EXIT 0
+STDOUT
+/work
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE grep flags and no match
+COMMAND
+echo -e 'Alpha\nbeta\nALPHA' > /g; grep -i -n alpha /g; grep -c -v beta /g; grep zzz /g
+END_COMMAND
+EXIT 1
+STDOUT
+1:Alpha
+3:ALPHA
+2
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE grep read error exits two
+COMMAND
+echo ok > /g; grep ok /g /missing
+END_COMMAND
+EXIT 2
+STDOUT
+/g:ok
+END_STDOUT
+STDERR
+grep: /missing: No such file or directory
+END_STDERR
+END
+
+CASE grep recursive prefixes paths
+COMMAND
+mkdir -p /r; echo one > /r/a; echo two > /r/b; grep -r o /r
+END_COMMAND
+EXIT 0
+STDOUT
+/r/a:one
+/r/b:two
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE head tail headers and plus count
+COMMAND
+echo -e 'a\nb\nc' > /h1; echo -e 'd\ne\nf' > /h2; head -n 1 /h1 /h2; tail -n +2 /h1
+END_COMMAND
+EXIT 0
+STDOUT
+==> /h1 <==
+a
+
+==> /h2 <==
+d
+b
+c
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE head rejects plus count
+COMMAND
+echo -e 'a\nb' | head -n +1
+END_COMMAND
+EXIT 1
+STDOUT
+END_STDOUT
+STDERR
+head: invalid number of lines: '+1'
+END_STDERR
+END
+
+CASE sort numeric reverse unique
+COMMAND
+echo -e '10abc\n2\nx\n-3.5z\n2' | sort -n -u; echo -e 'a\nc\nb' | sort -r
+END_COMMAND
+EXIT 0
+STDOUT
+-3.5z
+x
+2
+10abc
+c
+b
+a
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE sort numeric unique dedups by key
+COMMAND
+echo -e '10\n10abc' | sort -n -u
+END_COMMAND
+EXIT 0
+STDOUT
+10
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE uniq count repeated unique
+COMMAND
+echo -e 'a\na\nb\nc\nc' > /u; uniq -c /u; uniq -d /u; uniq -u /u
+END_COMMAND
+EXIT 0
+STDOUT
+      2 a
+      1 b
+      2 c
+a
+c
+b
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE wc width rules
+COMMAND
+echo -e -n 'one two\n' | wc; echo -e 'a b\nc' > /w; wc -l /w; wc -l -w -c /w /w
+END_COMMAND
+EXIT 0
+STDOUT
+      1       2       8
+2 /w
+ 2  3  6 /w
+ 2  3  6 /w
+ 4  6 12 total
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE sed per line replacement rules
+COMMAND
+echo -e 'a\na\nprice\naba' | sed 's/a/b/'; echo price | sed 's/price/$100/'; echo ab | sed 's/(a)(b)/\2\1&/'; echo aa | sed 's/a/X/g'
+END_COMMAND
+EXIT 0
+STDOUT
+b
+b
+price
+bba
+$100
+baab
+XX
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE sed replacement newline
+COMMAND
+echo a | sed 's/a/1\n2/'
+END_COMMAND
+EXIT 0
+STDOUT
+1
+2
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE sed invalid replacement reference
+COMMAND
+echo x | sed 's/x/\1/'
+END_COMMAND
+EXIT 1
+STDOUT
+END_STDOUT
+STDERR
+sed: invalid reference \1 on `s' command's RHS
+END_STDERR
+END
+
+CASE sed usage error exits one
+COMMAND
+sed y
+END_COMMAND
+EXIT 1
+STDOUT
+END_STDOUT
+STDERR
+sed: unsupported command; thinbox supports s/// with g and i flags
+END_STDERR
+END
+
+CASE which and stat
+COMMAND
+which cat; stat /bin/cat
+END_COMMAND
+EXIT 0
+STDOUT
+/bin/cat
+  File: /bin/cat
+  Size: 0
+  Type: regular file
+END_STDOUT
+STDERR
+END_STDERR
+END

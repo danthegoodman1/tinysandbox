@@ -160,15 +160,15 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: `Command` trait + registry + `/bin` synthesis | Missing: `src/machine/command.rs` + tests. |
-| Incomplete | Work | 3B: `Machine` builder/session API | Missing: `src/machine/mod.rs`, doc tests. |
-| Incomplete | Work | 3C: executor (pipes, redirects, lists, exit codes) | Missing: `src/shell/exec.rs` + tests. |
-| Incomplete | Work | 3D: limits (wall clock, output caps, command count) | Missing: limit enforcement tests. |
-| Incomplete | Work | 3E: builtins with GNU-faithful flags | Missing: per-builtin golden tests. |
-| Incomplete | Work | 3F: blocking-VFS thread dispatch | Missing: slow fake VFS integration test. |
-| Incomplete | Work | 3G: `Machine::stats()` + `ExecResult` metrics | Missing: stats API + tests. |
-| Incomplete | Test | end-to-end pipeline suite via public API | Missing: `tests/e2e.rs`. |
-| Incomplete | Gate | e2e + golden + limit tests green | Missing: passing CI run. |
+| Complete | Work | 3A: `Command` trait + registry + `/bin` synthesis | `src/machine/command.rs` + `fs.rs` facade; builder panics on reserved names (cd/export/unset). |
+| Complete | Work | 3B: `Machine` builder/session API | `src/machine/mod.rs`: persistent cwd/env, `$PWD`/`OLDPWD`, executing doc test. |
+| Complete | Work | 3C: executor (pipes, redirects, lists, exit codes) | Left-to-right fd resolution (bash-correct `2>&1` ordering), preflighted redirect targets, field splitting, `$?`. |
+| Complete | Work | 3D: limits (wall clock, output caps, command count) | Timeout → 124, head+tail truncation marker, max command count → 125; all tested. |
+| Complete | Work | 3E: builtins with GNU-faithful flags | 18 builtins; grep/sed regex dialect documented as deliberate deviation; GNU exit codes (grep 0/1/2, sed 1/2). |
+| Complete | Work | 3F: blocking-VFS thread dispatch | `Vfs::is_fast()` inline path, `spawn_blocking` otherwise; 4-way concurrency test discriminates serial vs parallel. |
+| Complete | Work | 3G: `Machine::stats()` + `ExecResult` metrics | Stats (VFS bytes/files, commands run) + wall time, per-command timings, pipe bytes; tested. |
+| Complete | Test | end-to-end pipeline suite via public API | `tests/machine_e2e.rs` + `tests/fixtures/machine_builtins_golden.txt` (20+ GNU-verified cases). |
+| Complete | Gate | e2e + golden + limit tests green | Reviewer approved after 3 rounds; local test + clippy green. |
 
 ## Phase 4: JS runtime (feature `js`, default on)
 

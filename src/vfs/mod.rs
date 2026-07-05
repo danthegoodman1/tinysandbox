@@ -15,6 +15,7 @@ pub type VfsResult<T> = Result<T, VfsError>;
 pub enum Errno {
     EBADF,
     EBUSY,
+    EACCES,
     EEXIST,
     EINVAL,
     EISDIR,
@@ -29,6 +30,7 @@ impl Errno {
         match self {
             Self::EBADF => 9,
             Self::EBUSY => 16,
+            Self::EACCES => 13,
             Self::EEXIST => 17,
             Self::EINVAL => 22,
             Self::EISDIR => 21,
@@ -43,6 +45,7 @@ impl Errno {
         match self {
             Self::EBADF => "EBADF",
             Self::EBUSY => "EBUSY",
+            Self::EACCES => "EACCES",
             Self::EEXIST => "EEXIST",
             Self::EINVAL => "EINVAL",
             Self::EISDIR => "EISDIR",
@@ -205,7 +208,7 @@ impl OpenMode {
     }
 }
 
-pub trait Vfs {
+pub trait Vfs: Send + Sync {
     fn stat(&self, path: &str) -> VfsResult<Metadata>;
 
     fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>>;
@@ -231,6 +234,14 @@ pub trait Vfs {
     fn truncate(&self, handle: FileHandle, len: u64) -> VfsResult<()>;
 
     fn close(&self, handle: FileHandle) -> VfsResult<()>;
+
+    fn is_fast(&self) -> bool {
+        false
+    }
+
+    fn stats(&self) -> Option<VfsResult<VfsStats>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +251,7 @@ mod tests {
     #[test]
     fn errno_values_match_linux_numbers() {
         assert_eq!(Errno::ENOENT.code(), 2);
+        assert_eq!(Errno::EACCES.code(), 13);
         assert_eq!(Errno::EBUSY.code(), 16);
         assert_eq!(Errno::ENOSPC.code(), 28);
         assert_eq!(Errno::ENOTEMPTY.code(), 39);
