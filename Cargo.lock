@@ -974,19 +974,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thinbox"
-version = "0.1.0"
-dependencies = [
- "base64",
- "proptest",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "wasmtime",
-]
-
-[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1004,6 +991,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tinysandbox"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wasmtime",
 ]
 
 [[package]]

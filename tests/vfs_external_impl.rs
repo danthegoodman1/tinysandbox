@@ -1,4 +1,4 @@
-use thinbox::vfs::{DirEntry, Errno, FileHandle, Metadata, OpenMode, Vfs, VfsError, VfsResult};
+use tinysandbox::vfs::{DirEntry, Errno, FileHandle, Metadata, OpenMode, Vfs, VfsError, VfsResult};
 
 struct ExternalStyleVfs;
 

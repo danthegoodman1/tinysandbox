@@ -1,5 +1,5 @@
 use proptest::prelude::*;
-use thinbox::shell::{Command, Segment, parse};
+use tinysandbox::shell::{Command, Segment, parse};
 
 proptest! {
     #[test]

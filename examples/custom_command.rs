@@ -2,12 +2,12 @@
 //!
 //! Run with: cargo run --example custom_command
 
-use thinbox::machine::{CommandContext, CommandResult, Machine};
+use tinysandbox::sandbox::{CommandContext, CommandResult, Sandbox};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() {
-    let machine = Machine::builder()
+    let sandbox = Sandbox::builder()
         // A command is an async fn from CommandContext to an exit code. This
         // one reads stdin, uppercases it, and writes the result to a VFS path
         // given as an argument (or stdout when no argument is given).
@@ -37,16 +37,16 @@ async fn main() {
 
     // Custom commands appear in /bin and resolve via which, so the
     // environment stays coherent when an agent probes it.
-    let result = machine.exec("which shout && ls /bin | grep shout").await;
+    let result = sandbox.exec("which shout && ls /bin | grep shout").await;
     print!("{}", result.stdout);
 
     // They compose with builtins in pipelines and redirects.
-    let result = machine.exec("echo make some noise | shout").await;
+    let result = sandbox.exec("echo make some noise | shout").await;
     assert_eq!(result.stdout, "MAKE SOME NOISE\n");
     print!("{}", result.stdout);
 
-    machine.exec("echo quiet words | shout /loud.txt").await;
-    let result = machine.exec("cat /loud.txt").await;
+    sandbox.exec("echo quiet words | shout /loud.txt").await;
+    let result = sandbox.exec("cat /loud.txt").await;
     assert_eq!(result.stdout, "QUIET WORDS\n");
     print!("{}", result.stdout);
 }

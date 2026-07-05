@@ -56,7 +56,7 @@ pub struct Assignment {
 
 /// A shell word before field splitting.
 ///
-/// Bash field-splits unquoted expansion results after parsing. Thinbox keeps
+/// Bash field-splits unquoted expansion results after parsing. Tinysandbox keeps
 /// that information here so the executor can apply splitting with the final
 /// environment instead of flattening words during parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

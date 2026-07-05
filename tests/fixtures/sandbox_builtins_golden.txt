@@ -312,7 +312,7 @@ EXIT 1
 STDOUT
 END_STDOUT
 STDERR
-sed: unsupported command; thinbox supports s/// with g and i flags
+sed: unsupported command; tinysandbox supports s/// with g and i flags
 END_STDERR
 END
 

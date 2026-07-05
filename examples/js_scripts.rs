@@ -4,11 +4,11 @@
 
 use std::time::Duration;
 
-use thinbox::machine::{Limits, Machine};
+use tinysandbox::sandbox::{Limits, Sandbox};
 
 #[tokio::main]
 async fn main() {
-    let machine = Machine::builder()
+    let sandbox = Sandbox::builder()
         .limits(Limits {
             wasm_memory_bytes: 32 * 1024 * 1024,
             ..Limits::default()
@@ -16,7 +16,7 @@ async fn main() {
         .build();
 
     // An agent writes a small multi-file program into the sandbox.
-    machine
+    sandbox
         .exec(concat!(
             "mkdir -p /app && cd /app && ",
             r#"echo 'exports.stats = (text) => {
@@ -25,7 +25,7 @@ async fn main() {
 }' > helper.js"#,
         ))
         .await;
-    machine
+    sandbox
         .exec(
             r#"echo 'const fs = require("fs")
 const { stats } = require("./helper.js")
@@ -36,33 +36,33 @@ fs.writeFileSync("/app/stats.json", JSON.stringify(result))' > main.js"#,
         )
         .await;
 
-    machine
+    sandbox
         .exec("echo 'the quick brown fox jumps over the lazy dog' > input.txt")
         .await;
 
-    // Scripts run under Wasmtime with the machine's memory/CPU limits and see
+    // Scripts run under Wasmtime with the sandbox's memory/CPU limits and see
     // only the VFS. require resolves like Node (cache, cycles, index.js...).
-    let result = machine.exec("js main.js input.txt").await;
+    let result = sandbox.exec("js main.js input.txt").await;
     print!("stdout: {}", result.stdout);
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stdout, "{\"words\":9,\"unique\":8}\n");
 
     // Results land in the VFS like any other file.
-    let result = machine.exec("cat /app/stats.json | wc -c").await;
+    let result = sandbox.exec("cat /app/stats.json | wc -c").await;
     print!("stats.json bytes: {}", result.stdout);
 
     // Peak wasm memory for the run is reported in the metrics.
-    let result = machine.exec("js -e 'console.log(6 * 7)'").await;
+    let result = sandbox.exec("js -e 'console.log(6 * 7)'").await;
     println!(
         "js -e output: {}peak wasm memory: {:?} bytes",
         result.stdout, result.metrics.peak_wasm_memory_bytes
     );
 
     // Runaway scripts hit the wall-clock deadline and exit 124, like GNU
-    // timeout would report. A tighter machine makes the demo quick (the wasm
-    // module itself is compiled once per process and cached, so this machine
+    // timeout would report. A tighter sandbox makes the demo quick (the wasm
+    // module itself is compiled once per process and cached, so this sandbox
     // doesn't pay that cost again).
-    let impatient = Machine::builder()
+    let impatient = Sandbox::builder()
         .limits(Limits {
             wall_time: Duration::from_secs(2),
             ..Limits::default()

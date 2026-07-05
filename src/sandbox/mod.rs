@@ -1,8 +1,8 @@
-//! In-process shell machine over a VFS.
+//! In-process shell sandbox over a VFS.
 //!
 //! ```
-//! use thinbox::machine::Machine;
-//! use thinbox::vfs::{InMemoryVfs, VfsQuota};
+//! use tinysandbox::sandbox::Sandbox;
+//! use tinysandbox::vfs::{InMemoryVfs, VfsQuota};
 //!
 //! # fn main() {
 //! # tokio::runtime::Builder::new_current_thread()
@@ -10,9 +10,9 @@
 //! #     .build()
 //! #     .unwrap()
 //! #     .block_on(async {
-//! let machine = Machine::builder().vfs(InMemoryVfs::new(VfsQuota::unlimited())).build();
+//! let sandbox = Sandbox::builder().vfs(InMemoryVfs::new(VfsQuota::unlimited())).build();
 //!
-//! let result = machine.exec("echo hello").await;
+//! let result = sandbox.exec("echo hello").await;
 //! assert_eq!(result.exit_code, 0);
 //! assert_eq!(result.stdout, "hello\n");
 //! #     });
@@ -70,12 +70,12 @@ pub struct CommandTiming {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineStats {
+pub struct SandboxStats {
     pub vfs: Option<VfsStats>,
     pub commands_run: u64,
 }
 
-pub struct Machine {
+pub struct Sandbox {
     vfs: Arc<dyn Vfs>,
     commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
     command_names: Arc<BTreeSet<String>>,
@@ -84,7 +84,7 @@ pub struct Machine {
     commands_run: AtomicU64,
 }
 
-pub struct MachineBuilder {
+pub struct SandboxBuilder {
     vfs: Arc<dyn Vfs>,
     commands: BTreeMap<String, Arc<dyn Command>>,
     limits: Limits,
@@ -92,17 +92,17 @@ pub struct MachineBuilder {
     env: BTreeMap<String, String>,
 }
 
-impl Machine {
-    pub fn builder() -> MachineBuilder {
-        MachineBuilder::new()
+impl Sandbox {
+    pub fn builder() -> SandboxBuilder {
+        SandboxBuilder::new()
     }
 
     pub fn vfs(&self) -> Arc<dyn Vfs> {
         Arc::clone(&self.vfs)
     }
 
-    pub fn stats(&self) -> MachineStats {
-        MachineStats {
+    pub fn stats(&self) -> SandboxStats {
+        SandboxStats {
             vfs: self.vfs.stats().and_then(Result::ok),
             commands_run: self.commands_run.load(Ordering::Relaxed),
         }
@@ -127,7 +127,7 @@ impl Machine {
             }
             Err(_) => ExecResult {
                 stdout: String::new(),
-                stderr: "thinbox: command timed out\n".to_owned(),
+                stderr: "tinysandbox: command timed out\n".to_owned(),
                 exit_code: 124,
                 metrics: ExecMetrics {
                     wall_time: started.elapsed(),
@@ -247,7 +247,7 @@ impl Machine {
     ) -> (Vec<u8>, i32) {
         if exec.command_count >= self.limits.max_commands {
             exec.stderr
-                .extend_from_slice(b"thinbox: maximum command count exceeded\n");
+                .extend_from_slice(b"tinysandbox: maximum command count exceeded\n");
             exec.limit_hit = true;
             return (Vec::new(), 125);
         }
@@ -433,7 +433,7 @@ impl Machine {
             }
             "export" => {
                 if args.is_empty() {
-                    // Thinbox tracks one session environment, not Bash's exported
+                    // Tinysandbox tracks one session environment, not Bash's exported
                     // bit, so listing shows every session variable.
                     for (key, value) in &ctx.session.env {
                         ctx.stdout.extend_from_slice(
@@ -494,7 +494,7 @@ impl Machine {
     }
 }
 
-impl MachineBuilder {
+impl SandboxBuilder {
     fn new() -> Self {
         let mut commands = BTreeMap::new();
         builtins::register(&mut commands);
@@ -574,9 +574,9 @@ impl MachineBuilder {
         self
     }
 
-    pub fn build(self) -> Machine {
+    pub fn build(self) -> Sandbox {
         let command_names = Arc::new(self.commands.keys().cloned().collect());
-        Machine {
+        Sandbox {
             vfs: self.vfs,
             commands: Arc::new(self.commands),
             command_names,
@@ -870,7 +870,7 @@ fn expansion_value(name: &str, env: &BTreeMap<String, String>, last_status: i32)
 fn assert_not_reserved(name: &str) {
     if matches!(name, "cd" | "export" | "unset") {
         panic!(
-            "MachineBuilder::command cannot register reserved shell builtin '{name}'; cd, export, and unset are interpreted by the shell"
+            "SandboxBuilder::command cannot register reserved shell builtin '{name}'; cd, export, and unset are interpreted by the shell"
         );
     }
 }
@@ -885,7 +885,7 @@ fn truncate_output(mut bytes: Vec<u8>, cap: usize) -> (Vec<u8>, bool) {
     if bytes.len() <= cap {
         return (bytes, false);
     }
-    let marker = b"\n[thinbox: output truncated]\n";
+    let marker = b"\n[tinysandbox: output truncated]\n";
     if cap <= marker.len() {
         return (marker.to_vec(), true);
     }

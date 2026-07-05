@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${ROOT}/assets/quickjs.wasm"
-WORK="${THINBOX_QUICKJS_BUILD_DIR:-${ROOT}/target/quickjs-wasm-build}"
+WORK="${TINYSANDBOX_QUICKJS_BUILD_DIR:-${ROOT}/target/quickjs-wasm-build}"
 
 QUICKJS_REPO="https://github.com/quickjs-ng/quickjs.git"
 QUICKJS_TAG="v0.15.1"
@@ -50,7 +50,7 @@ import sys
 path = Path(sys.argv[1])
 text = path.read_text()
 old = "#if defined(__wasi__)\n    rt->stack_limit = 0; /* no limit */\n#else\n"
-new = "#if defined(__wasi__) && !defined(THINBOX_WASI_STACK_LIMIT)\n    rt->stack_limit = 0; /* no limit */\n#else\n"
+new = "#if defined(__wasi__) && !defined(TINYSANDBOX_WASI_STACK_LIMIT)\n    rt->stack_limit = 0; /* no limit */\n#else\n"
 if old in text:
     path.write_text(text.replace(old, new, 1))
 elif new not in text:
@@ -59,7 +59,7 @@ PY
 
 CC="${SDK_DIR}/bin/clang"
 STRIP="${SDK_DIR}/bin/llvm-strip"
-TMP_OUT="${WORK}/quickjs-thinbox.wasm"
+TMP_OUT="${WORK}/quickjs-tinysandbox.wasm"
 
 "${CC}" \
   --target=wasm32-wasip1 \
@@ -67,7 +67,7 @@ TMP_OUT="${WORK}/quickjs-thinbox.wasm"
   -Oz \
   -DNDEBUG \
   -D_GNU_SOURCE \
-  -DTHINBOX_WASI_STACK_LIMIT \
+  -DTINYSANDBOX_WASI_STACK_LIMIT \
   -I"${SRC_DIR}" \
   "${ROOT}/src/js/quickjs_shim.c" \
   "${SRC_DIR}/quickjs.c" \
@@ -76,9 +76,9 @@ TMP_OUT="${WORK}/quickjs-thinbox.wasm"
   "${SRC_DIR}/libunicode.c" \
   -Wl,--allow-undefined \
   -Wl,-z,stack-size=4194304 \
-  -Wl,--export=thinbox_alloc \
-  -Wl,--export=thinbox_free \
-  -Wl,--export=thinbox_run \
+  -Wl,--export=tinysandbox_alloc \
+  -Wl,--export=tinysandbox_free \
+  -Wl,--export=tinysandbox_run \
   -Wl,--export=memory \
   -Wl,--strip-all \
   -o "${TMP_OUT}"

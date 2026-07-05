@@ -2,33 +2,33 @@
 //!
 //! Run with: cargo run --example quickstart
 
-use thinbox::machine::Machine;
+use tinysandbox::sandbox::Sandbox;
 
 #[tokio::main]
 async fn main() {
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
 
     // cwd and env persist across execs, like a real shell session.
-    machine
+    sandbox
         .exec("mkdir -p /workspace/logs && cd /workspace")
         .await;
-    machine
+    sandbox
         .exec("echo 'error: disk full\ninfo: started\nerror: disk full' > logs/app.log")
         .await;
 
-    let result = machine.exec("grep -c error logs/app.log").await;
+    let result = sandbox.exec("grep -c error logs/app.log").await;
     println!("error lines: {}", result.stdout.trim());
     assert_eq!(result.stdout, "2\n");
 
     // Pipelines, && chains, and $? behave like bash.
-    let result = machine
+    let result = sandbox
         .exec("sort -u logs/app.log | wc -l && echo exit=$?")
         .await;
     print!("{}", result.stdout);
 
     // Redirects write into the VFS; the host can read them back directly.
-    machine.exec("grep error logs/app.log > errors.txt").await;
-    let result = machine.exec("cat /workspace/errors.txt").await;
+    sandbox.exec("grep error logs/app.log > errors.txt").await;
+    let result = sandbox.exec("cat /workspace/errors.txt").await;
     print!("{}", result.stdout);
 
     // Every exec reports metrics.
@@ -38,7 +38,7 @@ async fn main() {
         result.metrics.commands.len()
     );
 
-    // Machine-wide stats: VFS usage and total commands run.
-    let stats = machine.stats();
+    // Sandbox-wide stats: VFS usage and total commands run.
+    let stats = sandbox.stats();
     println!("stats: {stats:?}");
 }

@@ -1,16 +1,24 @@
-# thinbox
+# tinysandbox
+
+[![crates.io](https://img.shields.io/crates/v/tinysandbox.svg)](https://crates.io/crates/tinysandbox)
+[![docs.rs](https://docs.rs/tinysandbox/badge.svg)](https://docs.rs/tinysandbox)
+[![CI](https://github.com/danthegoodman1/tinysandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/danthegoodman1/tinysandbox/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 An ultra-minimal, Linux-like sandbox for AI agents — a shell, coreutils, a
 filesystem, and a JavaScript runtime in a single Rust crate, with no
 containers, no VMs, and no access to the host.
 
+- **Docs:** [docs.rs/tinysandbox](https://docs.rs/tinysandbox)
+- **Crate:** [crates.io/crates/tinysandbox](https://crates.io/crates/tinysandbox)
+
 ```rust
-let machine = Machine::builder().build();
+let sandbox = Sandbox::builder().build();
 
-machine.exec("mkdir /workspace && cd /workspace").await;
-machine.exec("echo 'hello from the sandbox' > greeting.txt").await;
+sandbox.exec("mkdir /workspace && cd /workspace").await;
+sandbox.exec("echo 'hello from the sandbox' > greeting.txt").await;
 
-let result = machine.exec("cat greeting.txt | grep -c sandbox").await;
+let result = sandbox.exec("cat greeting.txt | grep -c sandbox").await;
 assert_eq!(result.stdout, "1\n");
 ```
 
@@ -29,6 +37,7 @@ assert_eq!(result.stdout, "1\n");
 - [Feature flags](#feature-flags)
 - [Examples](#examples)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 ## Why
 
@@ -38,12 +47,12 @@ network, and your process table — so the usual answer is a container or a
 microVM, which costs seconds of startup, megabytes of memory per instance,
 and an orchestration layer you now own.
 
-thinbox takes a different trade. It executes a bash-compatible shell and
+tinysandbox takes a different trade. It executes a bash-compatible shell and
 GNU-faithful coreutils *natively in your process* against a virtual
 filesystem, and reserves heavyweight isolation (Wasmtime) for the one thing
 that actually runs untrusted code: agent-authored JavaScript. The result:
 
-- **Boot is instant and idle machines cost kilobytes.** A `Machine` is a
+- **Boot is instant and idle sandboxes cost kilobytes.** A `Sandbox` is a
   plain struct around an in-memory filesystem. `echo hello > out.txt` is
   microseconds — no VM, no fork/exec, no syscall filter.
 - **The happy path feels exactly like Linux.** Supported commands, flags,
@@ -61,30 +70,30 @@ that actually runs untrusted code: agent-authored JavaScript. The result:
 ## Quickstart
 
 ```bash
-cargo add thinbox tokio
+cargo add tinysandbox tokio
 ```
 
 ```rust
-use thinbox::machine::Machine;
+use tinysandbox::sandbox::Sandbox;
 
 #[tokio::main]
 async fn main() {
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
 
     // Sessions persist cwd and env across execs, like a real shell.
-    machine.exec("mkdir -p /workspace/data && cd /workspace").await;
-    machine.exec("echo 'alpha\nbeta\nalpha' > data/words.txt").await;
+    sandbox.exec("mkdir -p /workspace/data && cd /workspace").await;
+    sandbox.exec("echo 'alpha\nbeta\nalpha' > data/words.txt").await;
 
     // GNU-faithful output shapes, down to wc padding stdin counts to width 7.
-    let result = machine.exec("sort -u data/words.txt | wc -l").await;
+    let result = sandbox.exec("sort -u data/words.txt | wc -l").await;
     assert_eq!(result.stdout, "      2\n");
     assert_eq!(result.exit_code, 0);
 
     // JavaScript with a Node-compatible fs API, sandboxed under Wasmtime.
-    machine
+    sandbox
         .exec(r#"echo 'const fs = require("fs"); console.log(fs.readFileSync("data/words.txt", "utf8").length)' > count.js"#)
         .await;
-    let result = machine.exec("js count.js").await;
+    let result = sandbox.exec("js count.js").await;
     assert_eq!(result.stdout, "17\n");
 }
 ```
@@ -93,9 +102,9 @@ The host can also work with the filesystem directly — useful for seeding
 input files or reading results without going through the shell:
 
 ```rust
-use thinbox::vfs::OpenMode;
+use tinysandbox::vfs::OpenMode;
 
-let vfs = machine.vfs();
+let vfs = sandbox.vfs();
 let handle = vfs.open("/workspace/report.txt", OpenMode::write_only().create())?;
 vfs.write_at(handle, 0, b"direct host access")?;
 vfs.close(handle)?;
@@ -116,7 +125,7 @@ actually use. Semantics inside the subset are verified against real bash:
 - Quoting: single, double, backslash escapes, correct field splitting of
   unquoted `$VAR` expansions
 - Variables: `$VAR`, `${VAR}`, `$?`, `VAR=x cmd` prefixes, bare
-  assignments, `export` / `unset`, persistent cwd and env per `Machine`
+  assignments, `export` / `unset`, persistent cwd and env per `Sandbox`
 - Loud, positioned errors for what's not supported: globs, `$(...)`,
   backticks, heredocs, `&`, subshells, tilde expansion
 
@@ -167,10 +176,10 @@ command is just an async function from `CommandContext` (args, env, cwd,
 stdio streams, a VFS handle, limits) to an exit code:
 
 ```rust
-use thinbox::machine::{CommandContext, CommandResult, Machine};
+use tinysandbox::sandbox::{CommandContext, CommandResult, Sandbox};
 use tokio::io::AsyncWriteExt;
 
-let machine = Machine::builder()
+let sandbox = Sandbox::builder()
     .command("greet", |mut ctx: CommandContext| async move {
         let name = ctx.args.first().map_or("world", String::as_str);
         let _ = ctx.stdout.write_all(format!("hello {name}\n").as_bytes()).await;
@@ -178,7 +187,7 @@ let machine = Machine::builder()
     })
     .build();
 
-let result = machine.exec("greet agent | wc -w").await; // pipes like any builtin
+let result = sandbox.exec("greet agent | wc -w").await; // pipes like any builtin
 assert_eq!(result.stdout, "      2\n");
 ```
 
@@ -190,10 +199,10 @@ own code does with the results.
 
 The filesystem is a trait, and the in-memory implementation is just the
 default. Back it with SQLite, object storage, or a network service by
-implementing `thinbox::vfs::Vfs` — eleven synchronous, FUSE-style methods
+implementing `tinysandbox::vfs::Vfs` — eleven synchronous, FUSE-style methods
 (`stat`, `readdir`, `mkdir`, `rename`, `unlink`, `rmdir`, `open`,
 `read_at`, `write_at`, `truncate`, `close`). Blocking implementations are
-fine: the machine dispatches VFS calls to worker threads unless your
+fine: the sandbox dispatches VFS calls to worker threads unless your
 implementation opts into the in-memory fast path via `is_fast()`.
 
 Attach it in the builder and the whole sandbox — shell, builtins, JS
@@ -201,15 +210,15 @@ scripts, and direct host access — runs against it:
 
 ```rust
 use std::sync::Arc;
-use thinbox::machine::Machine;
+use tinysandbox::sandbox::Sandbox;
 
-let machine = Machine::builder()
+let sandbox = Sandbox::builder()
     .vfs(MyVfs::connect("s3://agent-42-workspace")?)
     .build();
 
-// Or share one VFS between machines / keep a handle for yourself:
+// Or share one VFS between sandboxes / keep a handle for yourself:
 let vfs = Arc::new(MyVfs::connect("s3://agent-42-workspace")?);
-let machine = Machine::builder().vfs_arc(Arc::clone(&vfs)).build();
+let sandbox = Sandbox::builder().vfs_arc(Arc::clone(&vfs)).build();
 ```
 
 The crate ships the same conformance suite that validates `InMemoryVfs`, so
@@ -220,25 +229,25 @@ semantics, quota accounting, path containment, and more:
 ```rust
 #[test]
 fn my_vfs_conforms() {
-    thinbox::vfs::conformance::run(|quota| MyVfs::new(quota));
+    tinysandbox::vfs::conformance::run(|quota| MyVfs::new(quota));
 }
 ```
 
-See the `thinbox::vfs` rustdoc for the full trait contract (errno
+See the `tinysandbox::vfs` rustdoc for the full trait contract (errno
 expectations per method, quota semantics, handle identity rules).
 
 ## Limits and observability
 
-Every `Machine` enforces wall-clock timeouts (exit 124, like GNU `timeout`),
+Every `Sandbox` enforces wall-clock timeouts (exit 124, like GNU `timeout`),
 stdout/stderr caps with head+tail truncation, a per-exec command budget,
 VFS byte/file quotas (surfacing as `ENOSPC`), and a wasm memory cap for JS.
 All configurable via `Limits`:
 
 ```rust
 use std::time::Duration;
-use thinbox::machine::{Limits, Machine};
+use tinysandbox::sandbox::{Limits, Sandbox};
 
-let machine = Machine::builder()
+let sandbox = Sandbox::builder()
     .limits(Limits {
         wall_time: Duration::from_secs(5),
         wasm_memory_bytes: 32 * 1024 * 1024,
@@ -248,7 +257,7 @@ let machine = Machine::builder()
 ```
 
 `ExecResult` carries per-run metrics (wall time, per-command timings, pipe
-byte counts, truncation flags, peak wasm memory), and `Machine::stats()`
+byte counts, truncation flags, peak wasm memory), and `Sandbox::stats()`
 reports VFS usage and total commands run.
 
 ## Security model
@@ -265,7 +274,7 @@ reports VFS usage and total commands run.
   (epoch interruption), wall clock, output size, file quotas.
 - `..` traversal is contained at the VFS root; `/bin` is read-only.
 
-thinbox is one layer, not the whole story: for hostile multi-tenant
+tinysandbox is one layer, not the whole story: for hostile multi-tenant
 workloads you should still run your process under OS-level defense in depth
 (non-root, seccomp/cgroups, or a microVM) appropriate to your threat model.
 
@@ -289,5 +298,10 @@ Runnable with `cargo run --example <name>`:
 ## Roadmap
 
 - Copy-on-write VFS snapshots for rollback and branching
-- Node.js bindings (napi-rs): the whole machine — including VFS
+- Node.js bindings (napi-rs): the whole sandbox — including VFS
   implementations written in JavaScript — usable from Node
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE), at your option.

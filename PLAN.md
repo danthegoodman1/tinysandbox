@@ -2,11 +2,11 @@
 
 ## Overarching Goal
 
-Build `thinbox`: a Rust crate providing an ultra-minimal, Linux-like agent
+Build `tinysandbox`: a Rust crate providing an ultra-minimal, Linux-like agent
 sandbox — a VFS behind a trait, a bash-compatible shell subset, native
 coreutils builtins, and a Wasmtime-hosted QuickJS runtime — that other Rust
-projects embed via `Machine::builder().vfs(...).command(...).build()`. The
-final phase adds Node.js bindings (napi-rs) so the whole machine, including
+projects embed via `Sandbox::builder().vfs(...).command(...).build()`. The
+final phase adds Node.js bindings (napi-rs) so the whole sandbox, including
 custom JS-implemented VFS backends, is usable from Node.
 
 Non-goals: no real network access from the sandbox, no Python runtime, no
@@ -20,7 +20,7 @@ container/microVM tiers, no persistence backends beyond what snapshots need.
 - Smallest production-quality implementation; simple and correct over clever.
 - `Vfs` is a synchronous, FUSE-style trait. Blocking impls (network-backed)
   are supported by dispatching calls to worker threads; async exists only at
-  the `Machine` API boundary.
+  the `Sandbox` API boundary.
 - Quotas enforce inside the `Vfs` implementation so shell, JS hostcalls, and
   direct host calls share one enforcement point.
 - Interfaces stream, implementations may buffer: the `Command` trait takes
@@ -33,13 +33,13 @@ container/microVM tiers, no persistence backends beyond what snapshots need.
 ## Testing Strategy
 
 - Unit tests alongside every module; doc tests on the public API.
-- Public VFS conformance suite (`thinbox::vfs::conformance`) that any
+- Public VFS conformance suite (`tinysandbox::vfs::conformance`) that any
   implementation — first-party or third-party — runs against itself.
 - Golden tests for shell parsing and builtin output, with expected values
   matching GNU/bash behavior (captured manually, committed as fixtures).
 - Property tests (proptest) for VFS operation sequences and shell lexing;
   fuzz target for the shell parser (no panics on arbitrary input).
-- End-to-end pipeline tests through the public `Machine` API.
+- End-to-end pipeline tests through the public `Sandbox` API.
 - CI gate per phase: `cargo test --all-features` green, `cargo clippy` clean.
 
 ## Phase 1: VFS trait, in-memory backend, conformance suite
@@ -118,16 +118,16 @@ Status ledger:
 | Complete | Test | fuzz/proptest no-panic | `tests/shell_proptest.rs`: metacharacter-biased no-panic + round-trip property. |
 | Complete | Gate | corpus + fuzz green | Reviewer approved after 3 rounds; local test + clippy green. |
 
-## Phase 3: Machine, executor, builtins
+## Phase 3: Sandbox, executor, builtins
 
 Goal:
-The public `Machine` API executing real pipelines over the VFS with
+The public `Sandbox` API executing real pipelines over the VFS with
 session state, limits, and GNU-faithful builtins.
 
 Scope:
 - `Command` trait (async `run(ctx)`, stream-shaped stdio handles) and
   registry; custom commands register identically to builtins.
-- `Machine` builder + session semantics: persistent cwd/env across `exec`,
+- `Sandbox` builder + session semantics: persistent cwd/env across `exec`,
   `Arc<dyn Vfs>` attachment, direct host access to the VFS.
 - Executor: sequential stages with buffered pipes, redirects, exit codes,
   `&& || ;` semantics, `$?`.
@@ -138,7 +138,7 @@ Scope:
   which; `/bin` synthesized read-only from the registry.
 - Thread dispatch policy for blocking VFS backends (`spawn_blocking` path)
   with a fast inline path for in-memory.
-- Observability: `Machine::stats()` (VFS bytes/files via optional `Vfs`
+- Observability: `Sandbox::stats()` (VFS bytes/files via optional `Vfs`
   stats method, commands run) and per-exec metrics on `ExecResult` (wall
   time per command/pipeline, pipe byte counts).
 
@@ -146,7 +146,7 @@ Out of scope:
 - JS runtime, snapshots, concurrent streaming executor.
 
 Completion gate:
-End-to-end tests through `Machine::exec` pass, including multi-command
+End-to-end tests through `Sandbox::exec` pass, including multi-command
 pipelines, session state, limit enforcement, and a custom user command; a
 slow fake VFS (sleeping impl) works correctly via the thread-dispatch path.
 
@@ -160,14 +160,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 3A: `Command` trait + registry + `/bin` synthesis | `src/machine/command.rs` + `fs.rs` facade; builder panics on reserved names (cd/export/unset). |
-| Complete | Work | 3B: `Machine` builder/session API | `src/machine/mod.rs`: persistent cwd/env, `$PWD`/`OLDPWD`, executing doc test. |
+| Complete | Work | 3A: `Command` trait + registry + `/bin` synthesis | `src/sandbox/command.rs` + `fs.rs` facade; builder panics on reserved names (cd/export/unset). |
+| Complete | Work | 3B: `Sandbox` builder/session API | `src/sandbox/mod.rs`: persistent cwd/env, `$PWD`/`OLDPWD`, executing doc test. |
 | Complete | Work | 3C: executor (pipes, redirects, lists, exit codes) | Left-to-right fd resolution (bash-correct `2>&1` ordering), preflighted redirect targets, field splitting, `$?`. |
 | Complete | Work | 3D: limits (wall clock, output caps, command count) | Timeout → 124, head+tail truncation marker, max command count → 125; all tested. |
 | Complete | Work | 3E: builtins with GNU-faithful flags | 18 builtins; grep/sed regex dialect documented as deliberate deviation; GNU exit codes (grep 0/1/2, sed 1/2). |
 | Complete | Work | 3F: blocking-VFS thread dispatch | `Vfs::is_fast()` inline path, `spawn_blocking` otherwise; 4-way concurrency test discriminates serial vs parallel. |
-| Complete | Work | 3G: `Machine::stats()` + `ExecResult` metrics | Stats (VFS bytes/files, commands run) + wall time, per-command timings, pipe bytes; tested. |
-| Complete | Test | end-to-end pipeline suite via public API | `tests/machine_e2e.rs` + `tests/fixtures/machine_builtins_golden.txt` (20+ GNU-verified cases). |
+| Complete | Work | 3G: `Sandbox::stats()` + `ExecResult` metrics | Stats (VFS bytes/files, commands run) + wall time, per-command timings, pipe bytes; tested. |
+| Complete | Test | end-to-end pipeline suite via public API | `tests/sandbox_e2e.rs` + `tests/fixtures/sandbox_builtins_golden.txt` (20+ GNU-verified cases). |
 | Complete | Gate | e2e + golden + limit tests green | Reviewer approved after 3 rounds; local test + clippy green. |
 
 ## Phase 4: JS runtime (feature `js`, default on)
@@ -186,7 +186,7 @@ Scope:
 - CommonJS `require` subset for built-in `fs` plus relative/absolute `.js`,
   `.json`, and directory `index.js` modules over the VFS.
 - Store memory limits (`ResourceLimiter`), epoch-based CPU deadline wired to
-  the machine wall-clock budget; OOM and timeout surface as script errors /
+  the sandbox wall-clock budget; OOM and timeout surface as script errors /
   exit 124.
 - Cargo feature `js` gating wasmtime and the wasm blob.
 - Peak wasm memory per execution (observed via `ResourceLimiter`) reported
@@ -279,14 +279,14 @@ Status ledger:
 ## Phase 6: Node.js bindings
 
 Goal:
-An npm package exposing `Machine` (exec, direct VFS tool calls, limits) and
+An npm package exposing `Sandbox` (exec, direct VFS tool calls, limits) and
 supporting VFS implementations written in JavaScript, validated by the same
 conformance suite.
 
 Scope:
-- Workspace split: `thinbox` (core, unchanged public API) and
-  `thinbox-node` (napi-rs cdylib) + npm package scaffolding.
-- Bindings: build machine, `exec` (async), direct VFS ops (read/write/
+- Workspace split: `tinysandbox` (core, unchanged public API) and
+  `tinysandbox-node` (napi-rs cdylib) + npm package scaffolding.
+- Bindings: build sandbox, `exec` (async), direct VFS ops (read/write/
   readdir/stat), limits config, custom JS commands.
 - `JsVfs` adapter: implements the sync `Vfs` trait by calling JS callbacks
   through napi threadsafe functions; Rust worker thread blocks on a channel
@@ -306,7 +306,7 @@ suite running against a JS-implemented VFS and an end-to-end
 `exec("cat x | js t.js")` from Node.
 
 Testing plan:
-- node:test suite: machine lifecycle, exec output/exit codes, direct VFS
+- node:test suite: sandbox lifecycle, exec output/exit codes, direct VFS
   calls, JS VFS conformance run, wall-clock/memory limit behavior.
 - Concurrency test: exec in flight + tool calls serialize correctly.
 - Rust-side integration test for `JsVfs` thread-bridge deadlock-freedom.
@@ -315,9 +315,9 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 6A: workspace split, napi-rs crate, npm scaffold | Missing: `thinbox-node/` building locally. |
-| Incomplete | Work | 6B: Machine/exec/VFS/limits bindings | Missing: binding impl + node:test coverage. |
+| Incomplete | Work | 6A: workspace split, napi-rs crate, npm scaffold | Missing: `tinysandbox-node/` building locally. |
+| Incomplete | Work | 6B: Sandbox/exec/VFS/limits bindings | Missing: binding impl + node:test coverage. |
 | Incomplete | Work | 6C: `JsVfs` threadsafe-function adapter | Missing: adapter + deadlock-freedom test. |
 | Incomplete | Work | 6D: conformance runner exported to JS | Missing: JS-VFS conformance run green. |
-| Incomplete | Test | node:test suite incl. e2e pipeline from Node | Missing: `thinbox-node/__test__/`. |
+| Incomplete | Test | node:test suite incl. e2e pipeline from Node | Missing: `tinysandbox-node/__test__/`. |
 | Incomplete | Gate | `npm test` green with JS VFS conformance | Missing: passing run. |

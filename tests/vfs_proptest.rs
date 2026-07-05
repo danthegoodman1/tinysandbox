@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
-use thinbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
+use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
 
 const MAX_BYTES: u64 = 64;
 const MAX_FILES: u64 = 8;

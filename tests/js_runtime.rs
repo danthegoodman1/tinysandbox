@@ -5,16 +5,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use thinbox::machine::{Limits, Machine};
-use thinbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
+use tinysandbox::sandbox::{Limits, Sandbox};
+use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
 
 #[tokio::test]
 async fn js_eval_console_process_and_node_verified_shape() {
     // The console/process subset used here was checked against Node:
     // multiple console args are space-joined, argv carries user args, and env
     // values are visible through process.env.
-    let machine = Machine::builder().env("TOKEN", "abc").build();
-    let result = machine
+    let sandbox = Sandbox::builder().env("TOKEN", "abc").build();
+    let result = sandbox
         .exec("js -e 'console.log(\"hello\", { token: process.env.TOKEN }); console.error(process.argv[2]); process.exit(3)' arg")
         .await;
 
@@ -26,22 +26,22 @@ async fn js_eval_console_process_and_node_verified_shape() {
 
 #[tokio::test]
 async fn js_usage_errors_report_message_and_status() {
-    // Node has no `js` wrapper, so these pin the thinbox CLI contract for the
+    // Node has no `js` wrapper, so these pin the tinysandbox CLI contract for the
     // reviewer-requested wrapper failures.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
 
-    let bare = machine.exec("js").await;
+    let bare = sandbox.exec("js").await;
     assert_eq!(bare.exit_code, 1);
     assert_eq!(bare.stderr, "js: usage: js [-e code] script.js [args...]\n");
 
-    let missing_eval_arg = machine.exec("js -e").await;
+    let missing_eval_arg = sandbox.exec("js -e").await;
     assert_eq!(missing_eval_arg.exit_code, 1);
     assert_eq!(
         missing_eval_arg.stderr,
         "js: option requires an argument -- e\n"
     );
 
-    let missing_script = machine.exec("js missing.js").await;
+    let missing_script = sandbox.exec("js missing.js").await;
     assert_eq!(missing_script.exit_code, 1);
     assert_eq!(
         missing_script.stderr,
@@ -53,8 +53,8 @@ async fn js_usage_errors_report_message_and_status() {
 async fn js_eval_commonjs_entry_matches_node() {
     // Node v24.15.0 eval entries have no require.main, keep module.id as
     // [eval], and do not bind top-level this to module.exports.
-    let machine = Machine::builder().build();
-    let result = machine
+    let sandbox = Sandbox::builder().build();
+    let result = sandbox
         .exec("js -e 'console.log(require.main === undefined, require.main === module, module.id, this === module.exports)'")
         .await;
 
@@ -65,15 +65,15 @@ async fn js_eval_commonjs_entry_matches_node() {
 #[tokio::test]
 async fn js_config_json_is_stable_across_allocator_alignment() {
     // Varies script length across and beyond a mod-16 allocator window so the
-    // QuickJS JSON parser must rely on thinbox's explicit NUL sentinel.
-    let machine = Machine::builder().env("TOKEN", "abc").build();
+    // QuickJS JSON parser must rely on tinysandbox's explicit NUL sentinel.
+    let sandbox = Sandbox::builder().env("TOKEN", "abc").build();
 
     for filler_len in 0..32 {
         let script = format!(
             "/*{}*/\nconsole.log(process.env.TOKEN)",
             "x".repeat(filler_len)
         );
-        let result = machine
+        let result = sandbox
             .exec(&format!("js -e '{}'", shell_single_quote(&script)))
             .await;
 
@@ -83,30 +83,30 @@ async fn js_config_json_is_stable_across_allocator_alignment() {
             result.stderr
         );
         assert_eq!(result.stdout, "abc\n");
-        assert!(!result.stderr.contains("<thinbox-config>"));
+        assert!(!result.stderr.contains("<tinysandbox-config>"));
     }
 }
 
 #[tokio::test]
 async fn js_uncaught_errors_print_node_shaped_stacks() {
     // Node prints a type/message header followed by stack frames for uncaught
-    // Error objects. QuickJS supplies frames separately, so thinbox composes the
+    // Error objects. QuickJS supplies frames separately, so tinysandbox composes the
     // same header shape before appending them.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
 
-    let short = machine.exec("js -e 'throw new Error(\"x\")'").await;
+    let short = sandbox.exec("js -e 'throw new Error(\"x\")'").await;
     assert_eq!(short.exit_code, 1);
     assert!(short.stderr.starts_with("Error: x\n"));
     assert!(short.stderr.contains("    at "));
 
-    let long = machine
+    let long = sandbox
         .exec("js -e 'throw new Error(\"boom boom boom boom\")'")
         .await;
     assert_eq!(long.exit_code, 1);
     assert!(long.stderr.starts_with("Error: boom boom boom boom\n"));
     assert!(long.stderr.contains("    at "));
 
-    let type_error = machine.exec("js -e 'const f = undefined; f()'").await;
+    let type_error = sandbox.exec("js -e 'const f = undefined; f()'").await;
     assert_eq!(type_error.exit_code, 1);
     assert!(type_error.stderr.starts_with("TypeError:"));
     assert!(type_error.stderr.contains("not a function"));
@@ -117,18 +117,18 @@ async fn js_uncaught_errors_print_node_shaped_stacks() {
 async fn js_recursion_uses_catchable_quickjs_stack_limit() {
     // A deep but finite call chain should run, while unbounded recursion should
     // become a JavaScript exception rather than a wasmtime stack trap.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let legal_depth = r#"
 function f(n) { return n === 0 ? 42 : f(n - 1) }
 console.log(f(2000))
 "#;
-    let legal = machine
+    let legal = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(legal_depth)))
         .await;
     assert_eq!(legal.exit_code, 0, "stderr: {}", legal.stderr);
     assert_eq!(legal.stdout, "42\n");
 
-    let unbounded = machine
+    let unbounded = sandbox
         .exec("js -e 'function f() { return f() }; f()'")
         .await;
     assert_eq!(unbounded.exit_code, 1);
@@ -140,7 +140,7 @@ console.log(f(2000))
     assert!(!unbounded.stderr.contains("wasm trap"));
     assert!(!unbounded.stderr.contains("wasm backtrace"));
 
-    let caught = machine
+    let caught = sandbox
         .exec("js -e 'function f() { return f() }; try { f() } catch (err) { console.log(\"caught\", /stack|call stack/i.test(String(err && err.message))) }'")
         .await;
     assert_eq!(caught.exit_code, 0, "stderr: {}", caught.stderr);
@@ -151,15 +151,15 @@ console.log(f(2000))
 async fn js_process_exit_is_not_catchable() {
     // Node exits immediately here with the requested status and never reaches
     // catch, finally, or later statements.
-    let machine = Machine::builder().build();
-    let result = machine
+    let sandbox = Sandbox::builder().build();
+    let result = sandbox
         .exec("js -e 'try { process.exit(5) } catch (e) {} ; console.log(\"after\")'")
         .await;
 
     assert_eq!(result.exit_code, 5);
     assert_eq!(result.stdout, "");
 
-    let finally = machine
+    let finally = sandbox
         .exec("js -e 'try { process.exit(7) } finally { console.log(\"finally ran\") }'")
         .await;
     assert_eq!(finally.exit_code, 7);
@@ -170,7 +170,7 @@ async fn js_process_exit_is_not_catchable() {
 async fn js_fs_sync_surface_round_trips_text_binary_and_offsets() {
     // Exercises whole-file APIs and descriptor-position semantics. The final
     // file shape matches the same sequence under Node on a real filesystem.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.mkdirSync('/work', { recursive: true })
@@ -193,7 +193,7 @@ console.log(stat.isFile(), stat.isDirectory(), stat.size)
 "#;
 
     assert_eq!(
-        machine
+        sandbox
             .exec(&format!("js -e '{}'", shell_single_quote(script)))
             .await
             .stdout,
@@ -204,7 +204,7 @@ console.log(stat.isFile(), stat.isDirectory(), stat.size)
 #[tokio::test]
 async fn js_fs_write_buffer_two_arg_form_writes_all_bytes() {
     // Node returns 5 and writes the full Buffer for writeSync(fd, buffer).
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.writeFileSync('/out', '')
@@ -214,7 +214,7 @@ fs.closeSync(fd)
 console.log(n, fs.readFileSync('/out').toString())
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -226,7 +226,7 @@ console.log(n, fs.readFileSync('/out').toString())
 async fn js_fs_buffer_to_string_and_is_buffer_match_node() {
     // Node returns Buffer from readFileSync without encoding, decodes UTF-8 by
     // default, and does not treat a plain Uint8Array as a Buffer.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.writeFileSync('/text', 'hello')
@@ -235,7 +235,7 @@ console.log(Buffer.from('hi').toString('utf8'))
 console.log(Buffer.isBuffer(fs.readFileSync('/text')), Buffer.isBuffer(new Uint8Array()))
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -255,8 +255,8 @@ async fn js_fs_large_binary_payloads_round_trip_under_memory_cap() {
         .collect::<Vec<_>>();
     write_vfs_file(vfs.as_ref(), "/big.bin", &input);
 
-    let machine_vfs: Arc<dyn Vfs> = vfs.clone();
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs.clone();
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
     let spot_index = 1_234_567;
     let script = format!(
         r#"
@@ -273,7 +273,7 @@ console.log(n, small.toString('utf8').slice(0, n))
 "#
     );
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(&script)))
         .await;
 
@@ -294,7 +294,7 @@ console.log(n, small.toString('utf8').slice(0, n))
 #[tokio::test]
 async fn js_fs_write_string_position_overload_matches_node() {
     // Node string overload is writeSync(fd, string[, position[, encoding]]).
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.writeFileSync('/out', 'hello world')
@@ -304,7 +304,7 @@ fs.closeSync(fd)
 console.log(n, fs.readFileSync('/out', 'utf8'))
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -316,7 +316,7 @@ console.log(n, fs.readFileSync('/out', 'utf8'))
 async fn js_console_formatting_matches_node_for_supported_shapes() {
     // Fixtures are direct Node output for arrays/objects, util.format
     // substitutions, -0, and default object depth.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 console.log(['a', 'b'])
 console.log({ s: 'x' })
@@ -328,7 +328,7 @@ circular.self = circular
 console.log(circular)
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -342,7 +342,7 @@ console.log(circular)
 #[tokio::test]
 async fn js_fs_readdir_with_file_types_returns_dirents() {
     // Node Dirents expose name plus isFile/isDirectory methods for this case.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.mkdirSync('/dir')
@@ -353,7 +353,7 @@ const entries = fs.readdirSync('/dir', { withFileTypes: true })
 for (const entry of entries) console.log(entry.name, entry.isFile(), entry.isDirectory())
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -364,7 +364,7 @@ for (const entry of entries) console.log(entry.name, entry.isFile(), entry.isDir
 #[tokio::test]
 async fn js_fs_errors_use_libuv_errno_values() {
     // Node v24.15.0 reports ENOTEMPTY as -66 through libuv, unlike Linux errno.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.mkdirSync('/dir')
@@ -372,7 +372,7 @@ fs.writeFileSync('/dir/file', 'x')
 try { fs.rmdirSync('/dir') } catch (err) { console.log(err.code, err.errno) }
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -384,17 +384,17 @@ try { fs.rmdirSync('/dir') } catch (err) { console.log(err.code, err.errno) }
 async fn js_host_read_clamps_length_before_allocation() {
     // The public fs API follows Node and validates buffer bounds first; this
     // calls the internal ABI directly to pin the malicious guest length path.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
 fs.writeFileSync('/small', 'abc')
 const fd = fs.openSync('/small', 'r')
-const response = __thinbox_host_call('read', JSON.stringify({ fd, length: 2147483647, position: 0 }))
+const response = __tinysandbox_host_call('read', JSON.stringify({ fd, length: 2147483647, position: 0 }))
 if (response.error) throw new Error(response.error.code)
 console.log(response.value.bytesRead, Buffer.from(response.value.data, 'base64').toString())
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
 
@@ -406,7 +406,7 @@ console.log(response.value.bytesRead, Buffer.from(response.value.data, 'base64')
 async fn js_fs_errors_are_node_shaped_and_quota_errors_surface() {
     // JS catches errno-shaped errors from the VFS and sees the Node-style code
     // and message fields rather than a Rust/internal failure.
-    let machine = Machine::builder()
+    let sandbox = Sandbox::builder()
         .vfs(InMemoryVfs::new(VfsQuota {
             max_bytes: 4,
             max_files: 8,
@@ -420,7 +420,7 @@ try { fs.writeFileSync('/too-big', 'abcdef') } catch (err) { console.log(err.cod
 console.log(fs.existsSync('/missing'))
 "#;
 
-    let result = machine
+    let result = sandbox
         .exec(&format!("js -e '{}'", shell_single_quote(script)))
         .await;
     assert_eq!(result.exit_code, 0);
@@ -474,21 +474,21 @@ console.log(require('./sub/main-check'))
                 "module.exports = require.main === module\n",
             ),
             ("/app/dir/index.js", "module.exports = 'indexed'\n"),
-            ("/app/data.json", r#"{"name":"thinbox","flag":true}"#),
+            ("/app/data.json", r#"{"name":"tinysandbox","flag":true}"#),
         ],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder()
-        .vfs_arc(machine_vfs)
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder()
+        .vfs_arc(sandbox_vfs)
         .cwd("/elsewhere")
         .build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
         result.stdout,
-        "help:/app:/app/helper.js\ntrue\nhelp:/app:/app/helper.js\nindexed\nthinbox true\n/app/main.js\n/app\ntrue\nfalse\n"
+        "help:/app:/app/helper.js\ntrue\nhelp:/app:/app/helper.js\nindexed\ntinysandbox true\n/app/main.js\n/app\ntrue\nfalse\n"
     );
 }
 
@@ -517,10 +517,10 @@ try { require('./x/') } catch (err) {
             ("/app/x.js", "module.exports = 'x-file'\n"),
         ],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "index\nMODULE_NOT_FOUND\ntrue\n");
@@ -548,10 +548,10 @@ console.log(require('./sub/child'))
             ("/app/sub/child.js", "module.exports = require('..')\n"),
         ],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "app-index\napp-index\n");
@@ -601,10 +601,10 @@ exports.done = true
             ),
         ],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
@@ -616,7 +616,7 @@ exports.done = true
 #[tokio::test]
 async fn js_commonjs_reports_module_not_found_and_bare_specifiers_loudly() {
     // The relative MODULE_NOT_FOUND shape follows Node's code/message/stack;
-    // bare packages add thinbox's explicit no-node_modules reason.
+    // bare packages add tinysandbox's explicit no-node_modules reason.
     let vfs = Arc::new(InMemoryVfs::default());
     seed_vfs(
         vfs.as_ref(),
@@ -631,15 +631,15 @@ try { require('./missing') } catch (err) {
 }
 try { require('left-pad') } catch (err) {
   console.log(err.code)
-  console.log(err.message.includes('no node_modules in thinbox'))
+  console.log(err.message.includes('no node_modules in tinysandbox'))
 }
 "#,
         )],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
@@ -683,10 +683,10 @@ exports.d = 5
             ("/app/bad.json", "{ nope"),
         ],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "{\"c\":4}\n7\nSyntaxError\ntrue\ntrue\n");
@@ -713,10 +713,10 @@ boom()
             ),
         ],
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let result = machine.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /app/main.js").await;
 
     assert_eq!(result.exit_code, 1);
     assert!(result.stderr.starts_with("Error: helper boom\n"));
@@ -768,14 +768,14 @@ async fn js_commonjs_deep_require_chains_are_bounded_cleanly() {
         "/cap/main.js",
         b"try { require('./m0'); console.log('unexpected') } catch (err) { console.log(err.code); console.log(err.message.includes('256')) }\n",
     );
-    let machine_vfs: Arc<dyn Vfs> = vfs;
-    let machine = Machine::builder().vfs_arc(machine_vfs).build();
+    let sandbox_vfs: Arc<dyn Vfs> = vfs;
+    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
 
-    let successful = machine.exec("js /chain/main.js").await;
+    let successful = sandbox.exec("js /chain/main.js").await;
     assert_eq!(successful.exit_code, 0, "stderr: {}", successful.stderr);
     assert_eq!(successful.stdout, "200\n");
 
-    let capped = machine.exec("js /cap/main.js").await;
+    let capped = sandbox.exec("js /cap/main.js").await;
     assert_eq!(capped.exit_code, 0, "stderr: {}", capped.stderr);
     assert_eq!(capped.stdout, "ERR_REQUIRE_DEPTH\ntrue\n");
     assert!(!capped.stderr.contains("wasm trap"));
@@ -785,33 +785,33 @@ async fn js_commonjs_deep_require_chains_are_bounded_cleanly() {
 async fn js_pipeline_and_redirects_use_command_stdio() {
     // The JS phase does not expose stdin to scripts yet, but command stdout is
     // still ordinary pipeline/redirect data handled by the shell executor.
-    let machine = Machine::builder().build();
+    let sandbox = Sandbox::builder().build();
     assert_eq!(
-        machine
+        sandbox
             .exec("js -e 'console.log(\"alpha\"); console.log(\"beta\")' | grep beta > /out")
             .await
             .exit_code,
         0
     );
-    assert_eq!(machine.exec("cat /out").await.stdout, "beta\n");
+    assert_eq!(sandbox.exec("cat /out").await.stdout, "beta\n");
 }
 
 #[tokio::test]
 async fn js_cpu_and_memory_limits_fail_cleanly() {
     // Epoch interruption should stop tight loops promptly with the same 124
-    // timeout status used by the machine wall-clock guard.
-    let machine = Machine::builder()
+    // timeout status used by the sandbox wall-clock guard.
+    let sandbox = Sandbox::builder()
         .limits(Limits {
             wall_time: Duration::from_millis(30),
             ..Limits::default()
         })
         .build();
     let start = Instant::now();
-    let result = machine.exec("js -e 'while (true) {}'").await;
+    let result = sandbox.exec("js -e 'while (true) {}'").await;
     assert_eq!(result.exit_code, 124);
     assert!(start.elapsed() < Duration::from_secs(2));
 
-    let oom = Machine::builder()
+    let oom = Sandbox::builder()
         .limits(Limits {
             wasm_memory_bytes: 4 * 1024 * 1024,
             ..Limits::default()

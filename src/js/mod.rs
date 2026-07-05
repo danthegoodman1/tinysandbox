@@ -2,11 +2,11 @@
 //!
 //! The supported Node `fs` subset intentionally omits `statSync` timestamp,
 //! inode, uid, and gid fields until the VFS exposes them. JS execution uses the
-//! machine wall-clock budget, but timeout handling returns a clean 124 result
+//! sandbox wall-clock budget, but timeout handling returns a clean 124 result
 //! and discards buffered JS stdout/stderr instead of returning partial output.
 //! Module stack traces still reflect QuickJS details: wrapper prefixes leave a
 //! line-1 column offset, method frames are named like `at boom`, and visible
-//! `<thinbox>` glue frames can appear below user frames.
+//! `<tinysandbox>` glue frames can appear below user frames.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -23,8 +23,8 @@ use wasmtime::{
     Trap,
 };
 
-use crate::machine::command::{Command, CommandContext, CommandFuture, CommandResult};
-use crate::machine::fs::{Fs, join_path};
+use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
+use crate::sandbox::fs::{Fs, join_path};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
@@ -94,7 +94,7 @@ fn run_quickjs_on_host_stack(
     wall_time: Duration,
 ) -> JsRunResult {
     match thread::Builder::new()
-        .name("thinbox-js-runtime".to_owned())
+        .name("tinysandbox-js-runtime".to_owned())
         .stack_size(QUICKJS_HOST_THREAD_STACK_BYTES)
         .spawn(move || run_quickjs(invocation, env, cwd, fs, wasm_memory_bytes, wall_time))
     {
@@ -227,12 +227,12 @@ fn run_quickjs_inner(
     let initial_memory = memory.data_size(&store);
     store.data_mut().limiter.record_peak(initial_memory);
     if initial_memory > wasm_memory_bytes {
-        return Err(wasmtime::Error::msg("thinbox wasm memory limit exceeded"));
+        return Err(wasmtime::Error::msg("tinysandbox wasm memory limit exceeded"));
     }
 
-    let alloc = instance.get_typed_func::<i32, i32>(&mut store, "thinbox_alloc")?;
-    let free = instance.get_typed_func::<i32, ()>(&mut store, "thinbox_free")?;
-    let run = instance.get_typed_func::<(i32, i32), i32>(&mut store, "thinbox_run")?;
+    let alloc = instance.get_typed_func::<i32, i32>(&mut store, "tinysandbox_alloc")?;
+    let free = instance.get_typed_func::<i32, ()>(&mut store, "tinysandbox_free")?;
+    let run = instance.get_typed_func::<(i32, i32), i32>(&mut store, "tinysandbox_run")?;
 
     let config = GuestConfig {
         code: &invocation.code,
@@ -294,7 +294,7 @@ fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
             start_epoch_thread(engine.clone());
             let module = Module::new(&engine, QUICKJS_WASM)?;
             let mut linker = Linker::new(&engine);
-            define_thinbox_imports(&mut linker)?;
+            define_tinysandbox_imports(&mut linker)?;
             define_wasi_imports(&mut linker)?;
             let pre = linker.instantiate_pre(&module)?;
             Ok(CompiledRuntime { engine, pre })
@@ -307,14 +307,14 @@ fn start_epoch_thread(engine: Engine) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         thread::Builder::new()
-            .name("thinbox-js-epoch".to_owned())
+            .name("tinysandbox-js-epoch".to_owned())
             .spawn(move || {
                 loop {
                     thread::sleep(EPOCH_TICK);
                     engine.increment_epoch();
                 }
             })
-            .expect("start thinbox js epoch thread");
+            .expect("start tinysandbox js epoch thread");
     });
 }
 
@@ -388,7 +388,7 @@ impl ResourceLimiter for WasmLimiter {
     ) -> wasmtime::Result<bool> {
         if desired > self.max_memory_bytes {
             self.limit_exceeded = true;
-            Err(wasmtime::Error::msg("thinbox wasm memory limit exceeded"))
+            Err(wasmtime::Error::msg("tinysandbox wasm memory limit exceeded"))
         } else {
             self.record_peak(desired);
             Ok(true)
@@ -409,9 +409,9 @@ impl ResourceLimiter for WasmLimiter {
     }
 }
 
-fn define_thinbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
+fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     linker.func_wrap(
-        "thinbox",
+        "tinysandbox",
         "host_call",
         |mut caller: Caller<'_, HostState>,
          op_ptr: i32,
@@ -430,14 +430,14 @@ fn define_thinbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()
         },
     )?;
     linker.func_wrap(
-        "thinbox",
+        "tinysandbox",
         "host_response_len",
         |caller: Caller<'_, HostState>| -> i32 {
             i32::try_from(caller.data().response.len()).unwrap_or(i32::MAX)
         },
     )?;
     linker.func_wrap(
-        "thinbox",
+        "tinysandbox",
         "host_response_read",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
             let memory = memory(&mut caller)?;
@@ -449,7 +449,7 @@ fn define_thinbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()
         },
     )?;
     linker.func_wrap(
-        "thinbox",
+        "tinysandbox",
         "write_stdout",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
             let memory = memory(&mut caller)?;
@@ -459,7 +459,7 @@ fn define_thinbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()
         },
     )?;
     linker.func_wrap(
-        "thinbox",
+        "tinysandbox",
         "write_stderr",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
             let memory = memory(&mut caller)?;
@@ -882,7 +882,7 @@ fn handle_host_call_result(
                 .map_err(|err| node_error(err, "copyfile", Some(dest)))?;
             Ok(Value::Null)
         }
-        _ => Err(node_error(VfsError::new(Errno::EINVAL), "thinbox", None)),
+        _ => Err(node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None)),
     }
 }
 
@@ -976,7 +976,7 @@ fn string_arg(args: &Value, name: &str) -> Result<String, NodeError> {
     args.get(name)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))
+        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))
 }
 
 fn bool_arg(args: &Value, name: &str) -> bool {
@@ -987,16 +987,16 @@ fn i32_arg(args: &Value, name: &str) -> Result<i32, NodeError> {
     let value = args
         .get(name)
         .and_then(Value::as_i64)
-        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))?;
-    i32::try_from(value).map_err(|_| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))
+        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))?;
+    i32::try_from(value).map_err(|_| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))
 }
 
 fn usize_arg(args: &Value, name: &str) -> Result<usize, NodeError> {
     let value = args
         .get(name)
         .and_then(Value::as_u64)
-        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))?;
-    usize::try_from(value).map_err(|_| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))
+        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))?;
+    usize::try_from(value).map_err(|_| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))
 }
 
 fn u64_arg(args: &Value, name: &str) -> Result<Option<u64>, NodeError> {
@@ -1005,7 +1005,7 @@ fn u64_arg(args: &Value, name: &str) -> Result<Option<u64>, NodeError> {
         Some(value) => value
             .as_u64()
             .map(Some)
-            .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "thinbox", None)),
+            .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None)),
     }
 }
 
@@ -1013,10 +1013,10 @@ fn bytes_arg(args: &Value, name: &str) -> Result<Vec<u8>, NodeError> {
     let data = args
         .get(name)
         .and_then(Value::as_str)
-        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))?;
+        .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))?;
     BASE64_STANDARD
         .decode(data)
-        .map_err(|_| node_error(VfsError::new(Errno::EINVAL), "thinbox", None))
+        .map_err(|_| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))
 }
 
 fn base64_encode(data: &[u8]) -> String {

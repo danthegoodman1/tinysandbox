@@ -13,10 +13,10 @@ use std::sync::Arc;
 use regex::{Captures, Regex, RegexBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::machine::command::{
+use crate::sandbox::command::{
     BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult,
 };
-use crate::machine::fs::{Fs, errno_message, join_path};
+use crate::sandbox::fs::{Fs, errno_message, join_path};
 use crate::vfs::{Errno, FileType, Metadata, VfsError};
 
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
@@ -704,7 +704,7 @@ fn sort(ctx: CommandContext) -> CommandFuture {
         };
         if input.len() > limits.sort_input_bytes {
             let _ = stderr
-                .write_all(b"sort: input too large for thinbox sort\n")
+                .write_all(b"sort: input too large for tinysandbox sort\n")
                 .await;
             return CommandResult::new(2);
         }
@@ -910,7 +910,7 @@ fn sed(ctx: CommandContext) -> CommandFuture {
         let script = &args[0];
         let Some(sub) = parse_sed_substitution(script) else {
             let _ = stderr
-                .write_all(b"sed: unsupported command; thinbox supports s/// with g and i flags\n")
+                .write_all(b"sed: unsupported command; tinysandbox supports s/// with g and i flags\n")
                 .await;
             return CommandResult::new(1);
         };

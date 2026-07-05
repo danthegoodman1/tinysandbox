@@ -1,4 +1,4 @@
-use thinbox::shell::{ParseErrorKind, QuoteKind, UnsupportedConstruct, parse};
+use tinysandbox::shell::{ParseErrorKind, QuoteKind, UnsupportedConstruct, parse};
 
 #[test]
 fn unsupported_constructs_report_the_construct_position() {

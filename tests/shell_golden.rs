@@ -1,4 +1,4 @@
-use thinbox::shell::{
+use tinysandbox::shell::{
     AndOr, AndOrList, AndOrOp, Assignment, Command, Pipeline, Program, Redirect, RedirectOp,
     RedirectTarget, Segment, SimpleCommand, Word, parse,
 };

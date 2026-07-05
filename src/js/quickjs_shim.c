@@ -4,26 +4,26 @@
 
 #include "quickjs.h"
 
-#define THINBOX_QUICKJS_STACK_SIZE (3 * 1024 * 1024)
+#define TINYSANDBOX_QUICKJS_STACK_SIZE (3 * 1024 * 1024)
 
-__attribute__((import_module("thinbox"), import_name("host_call")))
+__attribute__((import_module("tinysandbox"), import_name("host_call")))
 int32_t tb_host_call(const uint8_t *op, int32_t op_len, const uint8_t *json, int32_t json_len);
 
-__attribute__((import_module("thinbox"), import_name("host_response_len")))
+__attribute__((import_module("tinysandbox"), import_name("host_response_len")))
 int32_t tb_host_response_len(void);
 
-__attribute__((import_module("thinbox"), import_name("host_response_read")))
+__attribute__((import_module("tinysandbox"), import_name("host_response_read")))
 int32_t tb_host_response_read(uint8_t *ptr, int32_t len);
 
-__attribute__((import_module("thinbox"), import_name("write_stdout")))
+__attribute__((import_module("tinysandbox"), import_name("write_stdout")))
 int32_t tb_write_stdout(const uint8_t *ptr, int32_t len);
 
-__attribute__((import_module("thinbox"), import_name("write_stderr")))
+__attribute__((import_module("tinysandbox"), import_name("write_stderr")))
 int32_t tb_write_stderr(const uint8_t *ptr, int32_t len);
 
-static const char THINBOX_GLUE[] =
+static const char TINYSANDBOX_GLUE[] =
 "(() => {\n"
-"  const config = globalThis.__thinboxConfig\n"
+"  const config = globalThis.__tinysandboxConfig\n"
 "  function lower(code) { return String(code || '').toLowerCase().replace(/^e/, '') }\n"
 "  function normalizeEncoding(encoding) {\n"
 "    const enc = encoding === undefined || encoding === null ? 'utf8' : lower(encoding)\n"
@@ -40,7 +40,7 @@ static const char THINBOX_GLUE[] =
 "    return err\n"
 "  }\n"
 "  function call(op, args) {\n"
-"    const response = __thinbox_host_call(op, JSON.stringify(args === undefined ? null : args))\n"
+"    const response = __tinysandbox_host_call(op, JSON.stringify(args === undefined ? null : args))\n"
 "    if (response && response.error) throw fsError(response.error)\n"
 "    return response ? response.value : undefined\n"
 "  }\n"
@@ -236,7 +236,7 @@ static const char THINBOX_GLUE[] =
 "  function ftruncateSync(fd, len) { call('ftruncate', { fd, len: len === undefined ? 0 : len }) }\n"
 "  function closeSync(fd) { call('close', { fd }) }\n"
 "  function copyFileSync(src, dest) { call('copyFile', { src: pathValue(src), dest: pathValue(dest) }) }\n"
-"  function syncOnly(name) { return function() { throw new Error(`fs.${name} is not supported in thinbox: sync-only`) } }\n"
+"  function syncOnly(name) { return function() { throw new Error(`fs.${name} is not supported in tinysandbox: sync-only`) } }\n"
 "  const fs = { readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, rmdirSync, existsSync, openSync, readSync, writeSync, ftruncateSync, closeSync, copyFileSync,\n"
 "    readFile: syncOnly('readFile'), writeFile: syncOnly('writeFile'), appendFile: syncOnly('appendFile'), mkdir: syncOnly('mkdir'), readdir: syncOnly('readdir'), stat: syncOnly('stat'), rename: syncOnly('rename'), rm: syncOnly('rm'), unlink: syncOnly('unlink'), rmdir: syncOnly('rmdir'), open: syncOnly('open'), read: syncOnly('read'), write: syncOnly('write'), ftruncate: syncOnly('ftruncate'), close: syncOnly('close'), copyFile: syncOnly('copyFile') }\n"
 "  const moduleCache = Object.create(null)\n"
@@ -288,7 +288,7 @@ static const char THINBOX_GLUE[] =
 "  }\n"
 "  function bareSpecifierError(specifier, parent) {\n"
 "    const err = moduleNotFound(specifier, parent)\n"
-"    err.message = `Cannot find module '${specifier}': there is no node_modules in thinbox`\n"
+"    err.message = `Cannot find module '${specifier}': there is no node_modules in tinysandbox`\n"
 "    return err\n"
 "  }\n"
 "  function resolveModule(specifier, parent) {\n"
@@ -332,7 +332,7 @@ static const char THINBOX_GLUE[] =
 "  }\n"
 "  function executeJsModule(module, source, thisArg) {\n"
 "    const wrapper = `(function (exports, require, module, __filename, __dirname) {${stripBomAndShebang(source)}\\n})`\n"
-"    const compiled = __thinbox_eval_module(wrapper, module.filename)\n"
+"    const compiled = __tinysandbox_eval_module(wrapper, module.filename)\n"
 "    const thisValue = arguments.length < 3 ? module.exports : thisArg\n"
 "    return compiled.call(thisValue, module.exports, module.require, module, module.filename, module.dirname)\n"
 "  }\n"
@@ -343,7 +343,7 @@ static const char THINBOX_GLUE[] =
 "  function loadModule(path, parent) {\n"
 "    if (Object.prototype.hasOwnProperty.call(moduleCache, path)) return moduleCache[path].exports\n"
 "    if (requireDepth >= MAX_REQUIRE_DEPTH) {\n"
-"      const err = new Error(`Maximum CommonJS require depth of ${MAX_REQUIRE_DEPTH} exceeded in thinbox`)\n"
+"      const err = new Error(`Maximum CommonJS require depth of ${MAX_REQUIRE_DEPTH} exceeded in tinysandbox`)\n"
 "      err.code = 'ERR_REQUIRE_DEPTH'\n"
 "      throw err\n"
 "    }\n"
@@ -364,7 +364,7 @@ static const char THINBOX_GLUE[] =
 "      requireDepth--\n"
 "    }\n"
 "  }\n"
-"  globalThis.__thinbox_run_main = function(source, path) {\n"
+"  globalThis.__tinysandbox_run_main = function(source, path) {\n"
 "    const filename = path === '[eval]' ? path : normalizeAbsolute(path)\n"
 "    const module = createModule(filename, null)\n"
 "    const isEval = path === '[eval]'\n"
@@ -432,12 +432,12 @@ static const char THINBOX_GLUE[] =
 "  }\n"
 "  function line(args) { return format(args) + '\\n' }\n"
 "  globalThis.Buffer = Buffer\n"
-"  globalThis.console = { log: (...args) => __thinbox_stdout(line(args)), info: (...args) => __thinbox_stdout(line(args)), error: (...args) => __thinbox_stderr(line(args)), warn: (...args) => __thinbox_stderr(line(args)) }\n"
-"  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => __thinbox_exit(code === undefined ? 0 : Number(code) || 0) }\n"
+"  globalThis.console = { log: (...args) => __tinysandbox_stdout(line(args)), info: (...args) => __tinysandbox_stdout(line(args)), error: (...args) => __tinysandbox_stderr(line(args)), warn: (...args) => __tinysandbox_stderr(line(args)) }\n"
+"  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => __tinysandbox_exit(code === undefined ? 0 : Number(code) || 0) }\n"
 "})()\n";
 
-__attribute__((export_name("thinbox_alloc")))
-void *thinbox_alloc(int32_t len)
+__attribute__((export_name("tinysandbox_alloc")))
+void *tinysandbox_alloc(int32_t len)
 {
     size_t size = len > 0 ? (size_t)len : 0;
     uint8_t *ptr = malloc(size + 1);
@@ -447,8 +447,8 @@ void *thinbox_alloc(int32_t len)
     return ptr;
 }
 
-__attribute__((export_name("thinbox_free")))
-void thinbox_free(void *ptr)
+__attribute__((export_name("tinysandbox_free")))
+void tinysandbox_free(void *ptr)
 {
     free(ptr);
 }
@@ -480,7 +480,7 @@ static JSValue js_host_call(JSContext *ctx, JSValueConst this_val, int argc, JSV
 
     int32_t response_len = tb_host_response_len();
     if (response_len < 0) {
-        return JS_ThrowInternalError(ctx, "thinbox host response failed");
+        return JS_ThrowInternalError(ctx, "tinysandbox host response failed");
     }
 
     char *response = js_malloc(ctx, (size_t)response_len + 1);
@@ -489,11 +489,11 @@ static JSValue js_host_call(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     if (tb_host_response_read((uint8_t *)response, response_len) != response_len) {
         js_free(ctx, response);
-        return JS_ThrowInternalError(ctx, "thinbox host response read failed");
+        return JS_ThrowInternalError(ctx, "tinysandbox host response read failed");
     }
     response[response_len] = '\0';
 
-    JSValue parsed = JS_ParseJSON(ctx, response, (size_t)response_len, "<thinbox-response>");
+    JSValue parsed = JS_ParseJSON(ctx, response, (size_t)response_len, "<tinysandbox-response>");
     js_free(ctx, response);
     return parsed;
 }
@@ -538,7 +538,7 @@ static JSValue js_process_exit(JSContext *ctx, JSValueConst this_val, int argc, 
         JS_ToInt32(ctx, &code, argv[0]);
     }
     JSValue exit = JS_NewError(ctx);
-    JS_SetPropertyStr(ctx, exit, "__thinboxExit", JS_NewBool(ctx, 1));
+    JS_SetPropertyStr(ctx, exit, "__tinysandboxExit", JS_NewBool(ctx, 1));
     JS_SetPropertyStr(ctx, exit, "code", JS_NewInt32(ctx, code));
     JS_SetUncatchableError(ctx, exit);
     return JS_Throw(ctx, exit);
@@ -579,7 +579,7 @@ static void set_function(JSContext *ctx, const char *name, JSCFunction *func, in
 
 static int32_t exit_code_from_exception(JSContext *ctx, JSValueConst exception, int *is_exit)
 {
-    JSValue marker = JS_GetPropertyStr(ctx, exception, "__thinboxExit");
+    JSValue marker = JS_GetPropertyStr(ctx, exception, "__tinysandboxExit");
     *is_exit = JS_ToBool(ctx, marker);
     JS_FreeValue(ctx, marker);
     if (!*is_exit) {
@@ -661,15 +661,15 @@ static int32_t handle_eval_result(JSContext *ctx, JSValue value)
     return code;
 }
 
-__attribute__((export_name("thinbox_run")))
-int32_t thinbox_run(const uint8_t *input, int32_t input_len)
+__attribute__((export_name("tinysandbox_run")))
+int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
 {
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) {
         tb_write_stderr((const uint8_t *)"quickjs: failed to create runtime\n", 34);
         return 1;
     }
-    JS_SetMaxStackSize(rt, THINBOX_QUICKJS_STACK_SIZE);
+    JS_SetMaxStackSize(rt, TINYSANDBOX_QUICKJS_STACK_SIZE);
     JS_UpdateStackTop(rt);
 
     JSContext *ctx = JS_NewContext(rt);
@@ -679,13 +679,13 @@ int32_t thinbox_run(const uint8_t *input, int32_t input_len)
         return 1;
     }
 
-    set_function(ctx, "__thinbox_host_call", js_host_call, 2);
-    set_function(ctx, "__thinbox_stdout", js_write_stdout, 1);
-    set_function(ctx, "__thinbox_stderr", js_write_stderr, 1);
-    set_function(ctx, "__thinbox_exit", js_process_exit, 1);
-    set_function(ctx, "__thinbox_eval_module", js_eval_module, 2);
+    set_function(ctx, "__tinysandbox_host_call", js_host_call, 2);
+    set_function(ctx, "__tinysandbox_stdout", js_write_stdout, 1);
+    set_function(ctx, "__tinysandbox_stderr", js_write_stderr, 1);
+    set_function(ctx, "__tinysandbox_exit", js_process_exit, 1);
+    set_function(ctx, "__tinysandbox_eval_module", js_eval_module, 2);
 
-    JSValue config = JS_ParseJSON(ctx, (const char *)input, (size_t)input_len, "<thinbox-config>");
+    JSValue config = JS_ParseJSON(ctx, (const char *)input, (size_t)input_len, "<tinysandbox-config>");
     if (JS_IsException(config)) {
         int32_t code = handle_eval_result(ctx, config);
         JS_FreeContext(ctx);
@@ -694,10 +694,10 @@ int32_t thinbox_run(const uint8_t *input, int32_t input_len)
     }
 
     JSValue global = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, global, "__thinboxConfig", JS_DupValue(ctx, config));
+    JS_SetPropertyStr(ctx, global, "__tinysandboxConfig", JS_DupValue(ctx, config));
     JS_FreeValue(ctx, global);
 
-    int32_t code = handle_eval_result(ctx, JS_Eval(ctx, THINBOX_GLUE, strlen(THINBOX_GLUE), "<thinbox>", JS_EVAL_TYPE_GLOBAL));
+    int32_t code = handle_eval_result(ctx, JS_Eval(ctx, TINYSANDBOX_GLUE, strlen(TINYSANDBOX_GLUE), "<tinysandbox>", JS_EVAL_TYPE_GLOBAL));
     if (code != 0) {
         JS_FreeValue(ctx, config);
         JS_FreeContext(ctx);
@@ -727,7 +727,7 @@ int32_t thinbox_run(const uint8_t *input, int32_t input_len)
     }
 
     global = JS_GetGlobalObject(ctx);
-    JSValue run_main = JS_GetPropertyStr(ctx, global, "__thinbox_run_main");
+    JSValue run_main = JS_GetPropertyStr(ctx, global, "__tinysandbox_run_main");
     JS_FreeValue(ctx, global);
     JSValue run_args[2] = {
         JS_NewStringLen(ctx, source, source_len),

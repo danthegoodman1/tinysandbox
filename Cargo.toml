@@ -1,7 +1,14 @@
 [package]
-name = "thinbox"
+name = "tinysandbox"
 version = "0.1.0"
 edition = "2024"
+description = "Ultra-minimal Linux-like sandbox for AI agents: shell, coreutils, VFS, and a Wasmtime-hosted JS runtime in one crate"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danthegoodman1/tinysandbox"
+readme = "README.md"
+keywords = ["sandbox", "agent", "shell", "vfs", "quickjs"]
+categories = ["virtualization", "filesystem", "development-tools"]
+exclude = ["PLAN.md", "original-plan.md", ".github/", ".vscode/"]
 
 [dependencies]
 base64 = { version = "0.22.1", optional = true }
