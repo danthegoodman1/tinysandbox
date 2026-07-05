@@ -4,9 +4,13 @@
 //! instead of GNU BRE/ERE syntax so matching remains linear-time. Unsupported
 //! GNU regex syntax therefore fails at compile time instead of being
 //! interpreted differently.
+//!
+//! Line-oriented streaming commands cap any single buffered line at 1 MiB and
+//! report `line too long`; plain `cat` and `wc` remain byte-streaming commands.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -14,10 +18,13 @@ use regex::{Captures, Regex, RegexBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::sandbox::command::{
-    BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult,
+    BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult,
 };
 use crate::sandbox::fs::{Fs, errno_message, join_path};
 use crate::vfs::{Errno, FileType, Metadata, VfsError};
+
+const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
+const LINE_TOO_LONG: &str = "line too long";
 
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     insert(commands, "cat", cat);
@@ -163,36 +170,63 @@ fn cat(ctx: CommandContext) -> CommandFuture {
         let mut state = CatState::default();
         let mut exit = 0;
         for path in paths {
-            let data = if path == "-" {
-                let mut data = Vec::new();
-                if stdin.read_to_end(&mut data).await.is_err() {
+            if path == "-" {
+                if let Err(err) = cat_stream(&mut stdin, &mut stdout, &flags, &mut state).await {
+                    if report_stream_error(&mut stderr, "cat", &path, err).await {
+                        exit = 1;
+                        continue;
+                    }
                     return CommandResult::failure();
                 }
-                Ok(data)
             } else {
-                fs.read_file(&path).await
-            };
-            match data {
-                Ok(data) => {
-                    let output = if flags.plain() {
-                        data
-                    } else {
-                        let mut out = Vec::with_capacity(data.len());
-                        cat_transform(&data, &flags, &mut state, &mut out);
-                        out
-                    };
-                    if stdout.write_all(&output).await.is_err() {
-                        return CommandResult::failure();
+                match fs.stream_reader(&path).await {
+                    Ok(mut reader) => {
+                        if let Err(err) =
+                            cat_stream(&mut reader, &mut stdout, &flags, &mut state).await
+                        {
+                            if report_stream_error(&mut stderr, "cat", &path, err).await {
+                                exit = 1;
+                                continue;
+                            }
+                            return CommandResult::failure();
+                        }
                     }
-                }
-                Err(err) => {
-                    exit = 1;
-                    write_vfs_error(&mut stderr, "cat", &path, err).await;
+                    Err(err) => {
+                        exit = 1;
+                        write_vfs_error(&mut stderr, "cat", &path, err).await;
+                    }
                 }
             }
         }
         CommandResult::new(exit)
     })
+}
+
+async fn cat_stream(
+    reader: &mut BoxAsyncRead,
+    stdout: &mut BoxAsyncWrite,
+    flags: &CatFlags,
+    state: &mut CatState,
+) -> io::Result<()> {
+    let mut buf = vec![0; 64 * 1024];
+    if flags.plain() {
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            stdout.write_all(&buf[..n]).await?;
+        }
+    }
+
+    let mut pending = Vec::new();
+    let mut eof = false;
+    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+        let mut out = Vec::new();
+        cat_transform(&line, flags, state, &mut out);
+        stdout.write_all(&out).await?;
+    }
+    Ok(())
 }
 
 fn echo(ctx: CommandContext) -> CommandFuture {
@@ -612,31 +646,46 @@ fn grep(ctx: CommandContext) -> CommandFuture {
         let show_path = flags.recursive || files.len() > 1 || positional.len() > 1;
         let mut matched_any = false;
         if positional.is_empty() {
-            let mut data = Vec::new();
-            let _ = stdin.read_to_end(&mut data).await;
-            matched_any |= grep_bytes(&mut stdout, "", &data, &regex, flags, false).await;
+            match grep_reader(&mut stdout, &mut stdin, "", &regex, flags, false).await {
+                Ok(matched) => matched_any |= matched,
+                Err(err) => {
+                    if report_stream_error(&mut stderr, "grep", "-", err).await {
+                        return CommandResult::new(2);
+                    }
+                    return CommandResult::failure();
+                }
+            }
         } else {
             for path in files {
-                let data = if path == "-" {
-                    let mut data = Vec::new();
-                    match stdin.read_to_end(&mut data).await {
-                        Ok(_) => Ok(data),
-                        Err(_) => Err(VfsError::new(Errno::EINVAL)),
-                    }
+                let label = if path == "-" {
+                    "(standard input)"
                 } else {
-                    fs.read_file(&path).await
+                    &path
                 };
-                match data {
-                    Ok(data) => {
-                        let label = if path == "-" {
-                            "(standard input)"
-                        } else {
-                            &path
-                        };
-                        matched_any |=
-                            grep_bytes(&mut stdout, label, &data, &regex, flags, show_path).await;
+                let result = if path == "-" {
+                    grep_reader(&mut stdout, &mut stdin, label, &regex, flags, show_path)
+                        .await
+                        .map_err(Ok)
+                } else {
+                    match fs.stream_reader(&path).await {
+                        Ok(mut reader) => {
+                            grep_reader(&mut stdout, &mut reader, label, &regex, flags, show_path)
+                                .await
+                                .map_err(Ok)
+                        }
+                        Err(err) => Err(Err(err)),
                     }
-                    Err(err) => {
+                };
+                match result {
+                    Ok(matched) => matched_any |= matched,
+                    Err(Ok(err)) => {
+                        if report_stream_error(&mut stderr, "grep", &path, err).await {
+                            had_error = true;
+                            continue;
+                        }
+                        return CommandResult::failure();
+                    }
+                    Err(Err(err)) => {
                         had_error = true;
                         write_vfs_error(&mut stderr, "grep", &path, err).await;
                     }
@@ -698,6 +747,8 @@ fn sort(ctx: CommandContext) -> CommandFuture {
                 files.push(arg);
             }
         }
+        // Sorting is the one text builtin that must see the full input before
+        // it can produce GNU-compatible ordering.
         let input = match read_inputs(&fs, &files, &mut stdin, "sort", &mut stderr).await {
             Ok(input) => input,
             Err(()) => return CommandResult::new(2),
@@ -765,24 +816,31 @@ fn uniq(ctx: CommandContext) -> CommandFuture {
             let _ = stderr.write_all(b"uniq: extra operand\n").await;
             return CommandResult::new(1);
         }
-        let input = match read_inputs(&fs, &files, &mut stdin, "uniq", &mut stderr).await {
-            Ok(input) => input,
-            Err(()) => return CommandResult::new(1),
+        let result = if files.is_empty() || files[0] == "-" {
+            uniq_reader(&mut stdin, &mut stdout, count, repeated, unique_only)
+                .await
+                .map_err(Ok)
+        } else {
+            match fs.stream_reader(&files[0]).await {
+                Ok(mut reader) => {
+                    uniq_reader(&mut reader, &mut stdout, count, repeated, unique_only)
+                        .await
+                        .map_err(Ok)
+                }
+                Err(err) => Err(Err(err)),
+            }
         };
-        for (line, n) in adjacent_counts(text_lines_lossy(&input)) {
-            if repeated && n == 1 {
-                continue;
+        if let Err(err) = result {
+            let path = files.first().map_or("-", String::as_str);
+            match err {
+                Ok(err) => {
+                    if !report_stream_error(&mut stderr, "uniq", path, err).await {
+                        return CommandResult::failure();
+                    }
+                }
+                Err(err) => write_vfs_error(&mut stderr, "uniq", path, err).await,
             }
-            if unique_only && n != 1 {
-                continue;
-            }
-            if count {
-                let _ = stdout
-                    .write_all(format!("{n:>7} {line}\n").as_bytes())
-                    .await;
-            } else {
-                let _ = stdout.write_all(format!("{line}\n").as_bytes()).await;
-            }
+            return CommandResult::new(1);
         }
         CommandResult::success()
     })
@@ -823,9 +881,15 @@ fn wc(ctx: CommandContext) -> CommandFuture {
         }
         let mut total = Counts::default();
         if files.is_empty() {
-            let mut input = Vec::new();
-            let _ = stdin.read_to_end(&mut input).await;
-            let counts = counts_for(&input);
+            let counts = match counts_reader(&mut stdin).await {
+                Ok(counts) => counts,
+                Err(err) => {
+                    if report_stream_error(&mut stderr, "wc", "-", err).await {
+                        return CommandResult::new(1);
+                    }
+                    return CommandResult::failure();
+                }
+            };
             write_counts(
                 &mut stdout,
                 counts,
@@ -840,22 +904,27 @@ fn wc(ctx: CommandContext) -> CommandFuture {
             let mut rows = Vec::new();
             let mut exit = 0;
             for path in &files {
-                let data = if path == "-" {
-                    let mut data = Vec::new();
-                    match stdin.read_to_end(&mut data).await {
-                        Ok(_) => Ok(data),
-                        Err(_) => Err(VfsError::new(Errno::EINVAL)),
-                    }
+                let counts = if path == "-" {
+                    counts_reader(&mut stdin).await.map_err(Ok)
                 } else {
-                    fs.read_file(path).await
+                    match fs.stream_reader(path).await {
+                        Ok(mut reader) => counts_reader(&mut reader).await.map_err(Ok),
+                        Err(err) => Err(Err(err)),
+                    }
                 };
-                match data {
-                    Ok(data) => {
-                        let counts = counts_for(&data);
+                match counts {
+                    Ok(counts) => {
                         total += counts;
                         rows.push((counts, path.as_str()));
                     }
-                    Err(err) => {
+                    Err(Ok(err)) => {
+                        if report_stream_error(&mut stderr, "wc", path, err).await {
+                            exit = 1;
+                        } else {
+                            return CommandResult::failure();
+                        }
+                    }
+                    Err(Err(err)) => {
                         exit = 1;
                         write_vfs_error(&mut stderr, "wc", path, err).await;
                     }
@@ -910,7 +979,9 @@ fn sed(ctx: CommandContext) -> CommandFuture {
         let script = &args[0];
         let Some(sub) = parse_sed_substitution(script) else {
             let _ = stderr
-                .write_all(b"sed: unsupported command; tinysandbox supports s/// with g and i flags\n")
+                .write_all(
+                    b"sed: unsupported command; tinysandbox supports s/// with g and i flags\n",
+                )
                 .await;
             return CommandResult::new(1);
         };
@@ -933,12 +1004,40 @@ fn sed(ctx: CommandContext) -> CommandFuture {
             return CommandResult::new(1);
         }
         let files = args[1..].to_vec();
-        let input = match read_inputs(&fs, &files, &mut stdin, "sed", &mut stderr).await {
-            Ok(input) => input,
-            Err(()) => return CommandResult::new(2),
-        };
-        let out = apply_sed_substitution(&input, &regex, &sub);
-        let _ = stdout.write_all(out.as_bytes()).await;
+        if files.is_empty() {
+            if let Err(err) = sed_reader(&mut stdin, &mut stdout, &regex, &sub).await {
+                if report_stream_error(&mut stderr, "sed", "-", err).await {
+                    return CommandResult::new(2);
+                }
+                return CommandResult::failure();
+            }
+        } else {
+            for file in files {
+                let result = if file == "-" {
+                    sed_reader(&mut stdin, &mut stdout, &regex, &sub)
+                        .await
+                        .map_err(Ok)
+                } else {
+                    match fs.stream_reader(&file).await {
+                        Ok(mut reader) => sed_reader(&mut reader, &mut stdout, &regex, &sub)
+                            .await
+                            .map_err(Ok),
+                        Err(err) => Err(Err(err)),
+                    }
+                };
+                if let Err(err) = result {
+                    match err {
+                        Ok(err) => {
+                            if !report_stream_error(&mut stderr, "sed", &file, err).await {
+                                return CommandResult::failure();
+                            }
+                        }
+                        Err(err) => write_vfs_error(&mut stderr, "sed", &file, err).await,
+                    }
+                    return CommandResult::new(2);
+                }
+            }
+        }
         CommandResult::success()
     })
 }
@@ -1028,65 +1127,122 @@ async fn head_tail(ctx: CommandContext, head_mode: bool) -> CommandResult {
         }
         i += 1;
     }
-    let inputs = if files.is_empty() {
-        let mut input = Vec::new();
-        if stdin.read_to_end(&mut input).await.is_err() {
-            return CommandResult::new(1);
+    let show_headers = verbose || files.len() > 1;
+    if files.is_empty() {
+        if let Err(err) = head_tail_reader(
+            &mut stdin,
+            &mut stdout,
+            "standard input",
+            false,
+            n,
+            head_mode,
+            0,
+        )
+        .await
+        {
+            if report_stream_error(&mut stderr, cmd, "-", err).await {
+                return CommandResult::new(1);
+            }
+            return CommandResult::failure();
         }
-        vec![("standard input".to_owned(), input)]
     } else {
-        let mut inputs = Vec::new();
-        for file in &files {
-            let data = if file == "-" {
-                let mut data = Vec::new();
-                match stdin.read_to_end(&mut data).await {
-                    Ok(_) => Ok(data),
-                    Err(_) => Err(VfsError::new(Errno::EINVAL)),
-                }
+        for (index, file) in files.iter().enumerate() {
+            let result = if file == "-" {
+                head_tail_reader(
+                    &mut stdin,
+                    &mut stdout,
+                    file,
+                    show_headers,
+                    n,
+                    head_mode,
+                    index,
+                )
+                .await
             } else {
-                fs.read_file(file).await
+                match fs.stream_reader(file).await {
+                    Ok(mut reader) => {
+                        head_tail_reader(
+                            &mut reader,
+                            &mut stdout,
+                            file,
+                            show_headers,
+                            n,
+                            head_mode,
+                            index,
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        write_vfs_error(&mut stderr, cmd, file, err).await;
+                        return CommandResult::new(1);
+                    }
+                }
             };
-            match data {
-                Ok(data) => inputs.push((file.clone(), data)),
-                Err(err) => {
-                    write_vfs_error(&mut stderr, cmd, file, err).await;
+            if let Err(err) = result {
+                if report_stream_error(&mut stderr, cmd, file, err).await {
                     return CommandResult::new(1);
                 }
+                return CommandResult::failure();
             }
-        }
-        inputs
-    };
-    let show_headers = verbose || inputs.len() > 1;
-    for (index, (label, input)) in inputs.iter().enumerate() {
-        if show_headers {
-            if index > 0 {
-                let _ = stdout.write_all(b"\n").await;
-            }
-            let _ = stdout
-                .write_all(format!("==> {label} <==\n").as_bytes())
-                .await;
-        }
-        let mut lines = lines_with_endings(input);
-        match n {
-            TailCount::Last(count) if head_mode => lines.truncate(count),
-            TailCount::Last(count) if lines.len() > count => {
-                lines = lines[lines.len() - count..].to_vec();
-            }
-            TailCount::From(start) => {
-                let skip = start.saturating_sub(1);
-                lines = if skip < lines.len() {
-                    lines[skip..].to_vec()
-                } else {
-                    Vec::new()
-                };
-            }
-            TailCount::Last(_) => {}
-        }
-        for line in lines {
-            let _ = stdout.write_all(&line).await;
         }
     }
     CommandResult::success()
+}
+
+async fn head_tail_reader(
+    reader: &mut BoxAsyncRead,
+    stdout: &mut BoxAsyncWrite,
+    label: &str,
+    show_header: bool,
+    count: TailCount,
+    head_mode: bool,
+    index: usize,
+) -> io::Result<()> {
+    if show_header {
+        if index > 0 {
+            stdout.write_all(b"\n").await?;
+        }
+        stdout
+            .write_all(format!("==> {label} <==\n").as_bytes())
+            .await?;
+    }
+
+    let mut pending = Vec::new();
+    let mut eof = false;
+    match count {
+        TailCount::Last(limit) if head_mode => {
+            for _ in 0..limit {
+                let Some(line) = read_line(reader, &mut pending, &mut eof).await? else {
+                    break;
+                };
+                stdout.write_all(&line).await?;
+            }
+        }
+        TailCount::Last(limit) => {
+            let mut lines = VecDeque::new();
+            while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+                if limit > 0 {
+                    lines.push_back(line);
+                    while lines.len() > limit {
+                        lines.pop_front();
+                    }
+                }
+            }
+            for line in lines {
+                stdout.write_all(&line).await?;
+            }
+        }
+        TailCount::From(start) => {
+            let mut line_no = 1_usize;
+            while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+                if line_no >= start {
+                    stdout.write_all(&line).await?;
+                }
+                line_no += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn unsupported(cmd: &str, flag: &str, stderr: &mut BoxAsyncWrite) -> CommandResult {
@@ -1115,6 +1271,57 @@ async fn write_vfs_error(stderr: &mut BoxAsyncWrite, cmd: &str, path: &str, err:
     let _ = stderr
         .write_all(format!("{cmd}: {path}: {}\n", errno_message(err.errno())).as_bytes())
         .await;
+}
+
+async fn write_line_too_long(stderr: &mut BoxAsyncWrite, cmd: &str, path: &str) {
+    let _ = stderr
+        .write_all(format!("{cmd}: {path}: {LINE_TOO_LONG}\n").as_bytes())
+        .await;
+}
+
+async fn report_stream_error(
+    stderr: &mut BoxAsyncWrite,
+    cmd: &str,
+    path: &str,
+    err: io::Error,
+) -> bool {
+    if is_broken_pipe(&err) {
+        return false;
+    }
+    if is_line_too_long(&err) {
+        write_line_too_long(stderr, cmd, path).await;
+        return true;
+    }
+    if let Some(err) = io_error_to_vfs(err) {
+        write_vfs_error(stderr, cmd, path, err).await;
+        return true;
+    }
+    false
+}
+
+fn io_error_to_vfs(err: io::Error) -> Option<VfsError> {
+    if is_broken_pipe(&err) {
+        None
+    } else {
+        Some(
+            err.get_ref()
+                .and_then(|source| source.downcast_ref::<VfsError>())
+                .copied()
+                .unwrap_or_else(|| VfsError::new(Errno::EINVAL)),
+        )
+    }
+}
+
+fn is_broken_pipe(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::BrokenPipe
+}
+
+fn line_too_long_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, LINE_TOO_LONG)
+}
+
+fn is_line_too_long(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::InvalidData && err.to_string() == LINE_TOO_LONG
 }
 
 async fn write_ls_entry(stdout: &mut BoxAsyncWrite, name: &str, metadata: Metadata, long: bool) {
@@ -1291,18 +1498,22 @@ async fn collect_files_recursive(fs: &Fs, path: &str, out: &mut Vec<String>) {
     }
 }
 
-async fn grep_bytes(
+async fn grep_reader(
     stdout: &mut BoxAsyncWrite,
+    reader: &mut BoxAsyncRead,
     path: &str,
-    data: &[u8],
     regex: &Regex,
     flags: GrepFlags,
     show_path: bool,
-) -> bool {
-    let text = String::from_utf8_lossy(data);
+) -> io::Result<bool> {
+    let mut pending = Vec::new();
+    let mut eof = false;
     let mut matched = 0_usize;
-    for (index, line) in text.lines().enumerate() {
-        let is_match = regex.is_match(line) ^ flags.invert;
+    let mut line_no = 0_usize;
+    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+        line_no += 1;
+        let line = line_text_lossy(&line);
+        let is_match = regex.is_match(&line) ^ flags.invert;
         if !is_match {
             continue;
         }
@@ -1311,20 +1522,20 @@ async fn grep_bytes(
             continue;
         }
         if show_path {
-            let _ = stdout.write_all(format!("{path}:").as_bytes()).await;
+            stdout.write_all(format!("{path}:").as_bytes()).await?;
         }
         if flags.line_numbers {
-            let _ = stdout.write_all(format!("{}:", index + 1).as_bytes()).await;
+            stdout.write_all(format!("{line_no}:").as_bytes()).await?;
         }
-        let _ = stdout.write_all(format!("{line}\n").as_bytes()).await;
+        stdout.write_all(format!("{line}\n").as_bytes()).await?;
     }
     if flags.count {
         if show_path {
-            let _ = stdout.write_all(format!("{path}:").as_bytes()).await;
+            stdout.write_all(format!("{path}:").as_bytes()).await?;
         }
-        let _ = stdout.write_all(format!("{matched}\n").as_bytes()).await;
+        stdout.write_all(format!("{matched}\n").as_bytes()).await?;
     }
-    matched > 0
+    Ok(matched > 0)
 }
 
 async fn read_inputs(
@@ -1360,6 +1571,143 @@ async fn read_inputs(
     Ok(input)
 }
 
+async fn read_line(
+    reader: &mut BoxAsyncRead,
+    pending: &mut Vec<u8>,
+    eof: &mut bool,
+) -> io::Result<Option<Vec<u8>>> {
+    loop {
+        if let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+            if pos + 1 > MAX_STREAM_LINE_BYTES {
+                return Err(line_too_long_error());
+            }
+            return Ok(Some(pending.drain(..=pos).collect()));
+        }
+        if pending.len() > MAX_STREAM_LINE_BYTES {
+            return Err(line_too_long_error());
+        }
+        if *eof {
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(std::mem::take(pending)));
+        }
+
+        let mut buf = [0_u8; 8192];
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            *eof = true;
+        } else {
+            if let Some(pos) = buf[..n].iter().position(|byte| *byte == b'\n') {
+                if pending.len() + pos + 1 > MAX_STREAM_LINE_BYTES {
+                    return Err(line_too_long_error());
+                }
+            } else if pending.len() + n > MAX_STREAM_LINE_BYTES {
+                return Err(line_too_long_error());
+            }
+            pending.extend_from_slice(&buf[..n]);
+        }
+    }
+}
+
+fn line_text_lossy(line: &[u8]) -> String {
+    let text = String::from_utf8_lossy(line);
+    let body = text.strip_suffix('\n').unwrap_or(&text);
+    body.strip_suffix('\r').unwrap_or(body).to_owned()
+}
+
+async fn counts_reader(reader: &mut BoxAsyncRead) -> io::Result<Counts> {
+    let mut counts = Counts::default();
+    let mut in_word = false;
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(counts);
+        }
+        counts.bytes += n;
+        for &byte in &buf[..n] {
+            if byte == b'\n' {
+                counts.lines += 1;
+            }
+            // GNU wc in the C locale treats word separators as ASCII whitespace.
+            if byte.is_ascii_whitespace() {
+                in_word = false;
+            } else if !in_word {
+                counts.words += 1;
+                in_word = true;
+            }
+        }
+    }
+}
+
+async fn sed_reader(
+    reader: &mut BoxAsyncRead,
+    stdout: &mut BoxAsyncWrite,
+    regex: &Regex,
+    sub: &SedSubstitution,
+) -> io::Result<()> {
+    let mut pending = Vec::new();
+    let mut eof = false;
+    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+        let out = apply_sed_substitution(&line, regex, sub);
+        stdout.write_all(out.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+async fn uniq_reader(
+    reader: &mut BoxAsyncRead,
+    stdout: &mut BoxAsyncWrite,
+    count: bool,
+    repeated: bool,
+    unique_only: bool,
+) -> io::Result<()> {
+    let mut pending = Vec::new();
+    let mut eof = false;
+    let mut current: Option<(String, usize)> = None;
+    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+        let line = line_text_lossy(&line);
+        if let Some((last, n)) = &mut current
+            && *last == line
+        {
+            *n += 1;
+            continue;
+        }
+        if let Some((line, n)) = current.take() {
+            write_uniq_line(stdout, &line, n, count, repeated, unique_only).await?;
+        }
+        current = Some((line, 1));
+    }
+    if let Some((line, n)) = current {
+        write_uniq_line(stdout, &line, n, count, repeated, unique_only).await?;
+    }
+    Ok(())
+}
+
+async fn write_uniq_line(
+    stdout: &mut BoxAsyncWrite,
+    line: &str,
+    n: usize,
+    count: bool,
+    repeated: bool,
+    unique_only: bool,
+) -> io::Result<()> {
+    if repeated && n == 1 {
+        return Ok(());
+    }
+    if unique_only && n != 1 {
+        return Ok(());
+    }
+    if count {
+        stdout
+            .write_all(format!("{n:>7} {line}\n").as_bytes())
+            .await
+    } else {
+        stdout.write_all(format!("{line}\n").as_bytes()).await
+    }
+}
+
 fn lines_with_endings(input: &[u8]) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
     let mut start = 0;
@@ -1380,28 +1728,6 @@ fn text_lines_lossy(input: &[u8]) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
-}
-
-fn adjacent_counts(lines: Vec<String>) -> Vec<(String, usize)> {
-    let mut out = Vec::new();
-    for line in lines {
-        if let Some((last, n)) = out.last_mut()
-            && *last == line
-        {
-            *n += 1;
-            continue;
-        }
-        out.push((line, 1));
-    }
-    out
-}
-
-fn counts_for(input: &[u8]) -> Counts {
-    Counts {
-        lines: input.iter().filter(|byte| **byte == b'\n').count(),
-        words: String::from_utf8_lossy(input).split_whitespace().count(),
-        bytes: input.len(),
-    }
 }
 
 async fn write_counts(

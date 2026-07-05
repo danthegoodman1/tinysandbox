@@ -1,11 +1,19 @@
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::task;
 
+use super::command::BoxAsyncRead;
 use crate::vfs::{
     DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsResult,
 };
+
+pub(crate) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct Fs {
@@ -100,6 +108,11 @@ impl Fs {
         self.dispatch(move |vfs| read_file_sync(vfs, &path)).await
     }
 
+    pub(crate) async fn stream_reader(&self, path: &str) -> VfsResult<BoxAsyncRead> {
+        let handle = self.open(path, OpenMode::read_only()).await?;
+        Ok(self.stream_reader_from_handle(handle))
+    }
+
     pub async fn write_file(&self, path: &str, data: &[u8], append: bool) -> VfsResult<()> {
         let path = self.resolve(path);
         let data = data.to_vec();
@@ -170,6 +183,10 @@ impl Fs {
         self.dispatch(move |vfs| vfs.close(handle)).await
     }
 
+    pub(crate) fn stream_reader_from_handle(&self, handle: FileHandle) -> BoxAsyncRead {
+        Box::pin(FsStreamReader::new(self.clone(), handle))
+    }
+
     async fn dispatch<R, F>(&self, op: F) -> VfsResult<R>
     where
         R: Send + 'static,
@@ -212,6 +229,113 @@ impl Fs {
         } else {
             format!("{}/{path}", self.cwd)
         })
+    }
+}
+
+type ReadAtFuture = Pin<Box<dyn Future<Output = VfsResult<(Vec<u8>, usize)>> + Send>>;
+
+struct FsStreamReader {
+    fs: Fs,
+    handle: Option<FileHandle>,
+    offset: u64,
+    pending: Vec<u8>,
+    in_flight: Option<ReadAtFuture>,
+}
+
+impl FsStreamReader {
+    fn new(fs: Fs, handle: FileHandle) -> Self {
+        Self {
+            fs,
+            handle: Some(handle),
+            offset: 0,
+            pending: Vec::new(),
+            in_flight: None,
+        }
+    }
+
+    fn close_handle(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let fs = self.fs.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = fs.close(handle).await;
+            });
+        }
+    }
+
+    fn copy_pending(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        if self.pending.is_empty() || buf.remaining() == 0 {
+            return false;
+        }
+        let n = self.pending.len().min(buf.remaining());
+        buf.put_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        true
+    }
+}
+
+impl Drop for FsStreamReader {
+    fn drop(&mut self) {
+        self.close_handle();
+    }
+}
+
+impl AsyncRead for FsStreamReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.copy_pending(buf) {
+            return Poll::Ready(Ok(()));
+        }
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if this.in_flight.is_none() {
+                let Some(handle) = this.handle else {
+                    return Poll::Ready(Ok(()));
+                };
+                let fs = this.fs.clone();
+                let offset = this.offset;
+                this.in_flight = Some(Box::pin(async move {
+                    fs.read_at(handle, offset, vec![0; STREAM_CHUNK_BYTES])
+                        .await
+                }));
+            }
+
+            let result = {
+                let future = this.in_flight.as_mut().expect("future was just installed");
+                match future.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                }
+            };
+            this.in_flight = None;
+
+            let (mut bytes, n) = match result {
+                Ok(result) => result,
+                Err(err) => {
+                    this.close_handle();
+                    return Poll::Ready(Err(io::Error::other(err)));
+                }
+            };
+            if n == 0 {
+                this.close_handle();
+                return Poll::Ready(Ok(()));
+            }
+            bytes.truncate(n);
+            this.offset = this.offset.saturating_add(n as u64);
+            this.pending = bytes;
+            if this.copy_pending(buf) {
+                return Poll::Ready(Ok(()));
+            }
+        }
     }
 }
 

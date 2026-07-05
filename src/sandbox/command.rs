@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -88,51 +86,5 @@ impl Default for Limits {
             sort_input_bytes: 8 * 1024 * 1024,
             wasm_memory_bytes: 64 * 1024 * 1024,
         }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct SharedWriter {
-    inner: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub(crate) fn boxed(&self) -> BoxAsyncWrite {
-        Box::pin(self.clone())
-    }
-
-    pub(crate) fn bytes(&self) -> Vec<u8> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-}
-
-impl AsyncWrite for SharedWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 }

@@ -9,9 +9,6 @@ An ultra-minimal, Linux-like sandbox for AI agents — a shell, coreutils, a
 filesystem, and a JavaScript runtime in a single Rust crate, with no
 containers, no VMs, and no access to the host.
 
-- **Docs:** [docs.rs/tinysandbox](https://docs.rs/tinysandbox)
-- **Crate:** [crates.io/crates/tinysandbox](https://crates.io/crates/tinysandbox)
-
 ```rust
 let sandbox = Sandbox::builder().build();
 

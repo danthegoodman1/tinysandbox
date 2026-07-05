@@ -321,3 +321,89 @@ Status ledger:
 | Incomplete | Work | 6D: conformance runner exported to JS | Missing: JS-VFS conformance run green. |
 | Incomplete | Test | node:test suite incl. e2e pipeline from Node | Missing: `tinysandbox-node/__test__/`. |
 | Incomplete | Gate | `npm test` green with JS VFS conformance | Missing: passing run. |
+
+## Phase 7: Streaming pipeline and redirect I/O
+
+Prioritized ahead of Phases 5 and 6: the README advertises bounded-memory
+operation over huge files, and this phase makes that true end to end.
+
+Goal:
+Pipelines, redirects, and builtins operate in fixed-size chunks with
+backpressure, so `cat huge | grep x > out` holds O(chunk) memory per stage
+regardless of file size, and early-exiting readers (`head`) stop upstream
+producers promptly.
+
+Scope:
+- Executor: pipeline stages run as concurrent tasks connected by bounded
+  in-memory byte pipes (backpressure via the bounded buffer). `CommandContext`
+  keeps its existing `BoxAsyncRead`/`BoxAsyncWrite` shape; only the wiring
+  behind it changes.
+- Redirects: `< file` streams from the VFS via chunked `read_at`; `>` and
+  `>>` stream to the VFS via chunked `write_at` as output is produced
+  (preflight create/truncate behavior preserved).
+- Closed-pipe semantics: when a downstream stage exits early and closes its
+  read end, upstream writes fail and the stage terminates promptly with
+  exit 141 (SIGPIPE convention); the pipeline status remains the last
+  stage's status. No deadlocks, no stray error output.
+- Builtins stream where semantics allow: `cat`/`grep`/`head`/`wc`/`sed`/
+  `uniq` process input incrementally (line- or chunk-at-a-time); `tail`
+  keeps only its window; `sort` necessarily buffers its full input
+  (documented exception).
+- Captured stdout/stderr respect `Limits::stdout_bytes`/`stderr_bytes`
+  while streaming: accumulation stops at the cap (truncated flag set),
+  excess is drained and counted, never buffered.
+- Metrics keep working: `pipe_bytes` counts bytes through each pipe;
+  per-command timings may now overlap (documented).
+- Shell builtins that mutate session state (`cd`, `export`, `unset`) match
+  bash: standalone (single-stage) invocations mutate the session inline;
+  inside a multi-stage pipeline they behave like bash subshell members (no
+  session mutation), locked in by tests. Assignment-only pipeline stages
+  likewise don't persist, but must still consume their stdin and close
+  their stdout so pipe topology is preserved.
+- `js` keeps its semantics; its stdout hostcalls flow through the streaming
+  writer.
+
+Out of scope:
+- Changing the `Vfs` trait or the public `Command` trait.
+- Concurrent execution across `&&`/`||`/`;` list items.
+- bash `pipefail` or job control.
+
+Correctness invariants:
+- All existing e2e/golden/conformance tests pass unchanged (tests asserting
+  internal buffering details may be updated with justification).
+- Every pipe writer is closed when its stage finishes; every reader is
+  drained or closed: no deadlock for any pipeline shape times limit
+  combination.
+- Bounded memory: bytes buffered per pipe never exceed the fixed pipe
+  capacity; builtin working memory is O(chunk) or O(window), except sort.
+
+Completion gate:
+A counting/generating VFS test proves streaming: a virtual multi-GiB file
+(content generated in `read_at`, never stored) piped through
+`cat huge | head -n 1` completes with the VFS serving only a small prefix
+(assert bytes-served counter), and `wc -c < huge > out`-style full scans
+complete with bounded pipe capacity. Full suite + clippy green.
+
+Testing plan:
+- Generating-VFS tests: early-exit byte-count assertion (`head` stops
+  `cat`); full-scan correctness (`wc -c`, `grep -c`) over data far larger
+  than any buffer; streamed redirect write producing correct file content.
+- Deadlock regressions under a test timeout: slow consumer + fast producer,
+  producer exceeding pipe capacity, stage failing mid-stream, limit_hit
+  mid-pipeline.
+- Closed-pipe: exit-141 stage status, pipeline status from last stage,
+  clean stderr.
+- Output-cap streaming: stdout beyond `stdout_bytes` sets truncated without
+  unbounded buffering.
+- Existing suites re-run green (behavioral compatibility).
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 7A: concurrent pipeline stages over bounded pipes | 64 KiB duplex pipes, JoinSet abort-on-drop for wall-time teardown. |
+| Complete | Work | 7B: chunked streaming redirects (read + write) | Custom `AsyncRead` over `read_at` (surfaces mid-stream errors); chunked `write_at` sinks. |
+| Complete | Work | 7C: incremental builtins + closed-pipe semantics | cat/grep/head/tail/wc/sed/uniq stream (bounded line cap, documented); sort documented exception; exit 141 with clean stderr. |
+| Complete | Work | 7D: streaming-aware output caps + metrics | `CappedOutput` byte-identical to old truncation; pipe_bytes via pipe counters. |
+| Complete | Test | generating-VFS byte-count + deadlock + 141 suites | `tests/streaming.rs`: 14 tests incl. 4 GiB virtual file served <= 2 MiB for `head -n 1`, timeout-abort, mid-stream read errors, pipeline-subshell semantics. |
+| Complete | Gate | full suite + clippy green with streaming proofs | 84 tests green all-features + no-default-features, clippy `-D warnings` clean. Reviewer approved after 1 fix round (1 blocker + 7 majors fixed); minor follow-ups noted: error-path handle leaks, duplicated shell-builtin fn. |

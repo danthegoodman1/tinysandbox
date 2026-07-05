@@ -227,7 +227,9 @@ fn run_quickjs_inner(
     let initial_memory = memory.data_size(&store);
     store.data_mut().limiter.record_peak(initial_memory);
     if initial_memory > wasm_memory_bytes {
-        return Err(wasmtime::Error::msg("tinysandbox wasm memory limit exceeded"));
+        return Err(wasmtime::Error::msg(
+            "tinysandbox wasm memory limit exceeded",
+        ));
     }
 
     let alloc = instance.get_typed_func::<i32, i32>(&mut store, "tinysandbox_alloc")?;
@@ -388,7 +390,9 @@ impl ResourceLimiter for WasmLimiter {
     ) -> wasmtime::Result<bool> {
         if desired > self.max_memory_bytes {
             self.limit_exceeded = true;
-            Err(wasmtime::Error::msg("tinysandbox wasm memory limit exceeded"))
+            Err(wasmtime::Error::msg(
+                "tinysandbox wasm memory limit exceeded",
+            ))
         } else {
             self.record_peak(desired);
             Ok(true)
@@ -882,7 +886,11 @@ fn handle_host_call_result(
                 .map_err(|err| node_error(err, "copyfile", Some(dest)))?;
             Ok(Value::Null)
         }
-        _ => Err(node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None)),
+        _ => Err(node_error(
+            VfsError::new(Errno::EINVAL),
+            "tinysandbox",
+            None,
+        )),
     }
 }
 
@@ -996,7 +1004,8 @@ fn usize_arg(args: &Value, name: &str) -> Result<usize, NodeError> {
         .get(name)
         .and_then(Value::as_u64)
         .ok_or_else(|| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))?;
-    usize::try_from(value).map_err(|_| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))
+    usize::try_from(value)
+        .map_err(|_| node_error(VfsError::new(Errno::EINVAL), "tinysandbox", None))
 }
 
 fn u64_arg(args: &Value, name: &str) -> Result<Option<u64>, NodeError> {
