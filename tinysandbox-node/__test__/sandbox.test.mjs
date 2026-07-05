@@ -40,6 +40,7 @@ test('numeric validation rejects unsafe byte counts and VFS lengths', async () =
   // Oversized lengths must fail before native code allocates a Vec for the read.
   const unsafeInteger = Number.MAX_SAFE_INTEGER + 1
   assert.throws(() => new Sandbox({ limits: { stdoutBytes: unsafeInteger } }), /EINVAL/)
+  assert.throws(() => new Sandbox({ limits: { jqInputBytes: unsafeInteger } }), /EINVAL/)
 
   const sandbox = new Sandbox()
   await sandbox.fs.writeFile('/x', Buffer.from('abc'))
@@ -55,6 +56,44 @@ test('numeric validation rejects unsafe byte counts and VFS lengths', async () =
   } finally {
     await sandbox.fs.close(handle)
   }
+})
+
+test('jq builtin and jqInputBytes limit are available through Node options', async () => {
+  const sandbox = new Sandbox()
+  const result = await sandbox.exec(`echo '{"items":[{"name":"Ada"},{"name":"Grace"}]}' | jq -r '.items[].name'`)
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(result.stdout, 'Ada\nGrace\n')
+
+  const limited = new Sandbox({ limits: { jqInputBytes: 3 } })
+  const overLimit = await limited.exec("echo 1234 | jq '.'")
+  assert.equal(overLimit.exitCode, 2)
+  assert.match(overLimit.stderr, /input too large/)
+
+  const recursiveFilter = await sandbox.exec("jq -n 'def f: f + 1; f'")
+  assert.equal(recursiveFilter.exitCode, 3)
+  assert.match(recursiveFilter.stderr, /user-defined jq functions are not supported/)
+
+  const deepFilter = await sandbox.exec(`jq -n '${'['.repeat(3500)}0${']'.repeat(3500)}'`)
+  assert.equal(deepFilter.exitCode, 3)
+  assert.match(deepFilter.stderr, /jq filter nesting exceeds/)
+
+  for (const [name, filter] of [
+    ['unary minus', `${'-'.repeat(1100)}0`],
+    ['try', `${'try '.repeat(1100)}0`],
+    ['alt', `1${'//1'.repeat(1100)}`],
+    ['pipe', Array(1100).fill('.').join('|')]
+  ]) {
+    // These filters previously overflowed jaq parser recursion and aborted Node.
+    const rejected = await sandbox.exec(`jq -n -- '${filter}'`)
+    assert.equal(rejected.exitCode, 3, `${name}: ${rejected.stderr}`)
+    assert.match(rejected.stderr, /jq filter complexity exceeds/, name)
+  }
+
+  const deepJson = `${'['.repeat(1100)}0${']'.repeat(1100)}`
+  await sandbox.fs.writeFile('/deep.json', Buffer.from(deepJson))
+  const deepInput = await sandbox.exec("jq -c '.' /deep.json")
+  assert.equal(deepInput.exitCode, 2)
+  assert.match(deepInput.stderr, /JSON nesting exceeds/)
 })
 
 test('direct VFS calls read, write, stat, readdir, and unlink', async () => {

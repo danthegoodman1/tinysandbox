@@ -22,6 +22,7 @@
 mod builtins;
 pub mod command;
 pub mod fs;
+mod jq;
 #[cfg(feature = "js")]
 pub mod syscall;
 

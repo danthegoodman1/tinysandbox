@@ -19,10 +19,14 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex, RegexBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
+use super::jq::{self, JqError};
 use crate::sandbox::command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult,
 };
@@ -31,6 +35,7 @@ use crate::vfs::{Errno, FileType, Metadata, VfsError};
 
 const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
 const LINE_TOO_LONG: &str = "line too long";
+const MAX_JQ_JSON_NESTING: usize = 1024;
 
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     insert(commands, "cat", cat);
@@ -39,6 +44,7 @@ pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     insert(commands, "false", false_cmd);
     insert(commands, "grep", grep);
     insert(commands, "head", head);
+    insert(commands, "jq", jq_cmd);
     insert(commands, "ls", ls);
     insert(commands, "mkdir", mkdir);
     insert(commands, "mv", mv);
@@ -87,6 +93,71 @@ impl CatFlags {
 struct CatState {
     line: u64,
     prev_blank: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JqOptions {
+    filter: String,
+    files: Vec<String>,
+    raw_output: bool,
+    join_output: bool,
+    compact_output: bool,
+    exit_status: bool,
+    null_input: bool,
+    slurp: bool,
+    sort_keys: bool,
+    indent: String,
+    vars: Vec<JqVariable>,
+}
+
+#[derive(Debug, Clone)]
+struct JqVariable {
+    name: String,
+    value: jaq_json::Val,
+}
+
+#[derive(Debug)]
+struct JqInputSource {
+    path: String,
+    data: Vec<u8>,
+}
+
+struct JqRunDone {
+    exit_code: i32,
+    stderr: Vec<u8>,
+}
+
+enum JqStreamMessage {
+    Stdout(Vec<u8>),
+    Done(JqRunDone),
+}
+
+struct JqCancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for JqCancelOnDrop {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+enum JqInputError {
+    Vfs { path: String, err: VfsError },
+    Read { path: String, err: io::Error },
+    JsonDepth { path: String, err: JqJsonDepthError },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JqJsonDepthError {
+    max: usize,
+}
+
+impl std::fmt::Display for JqJsonDepthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JSON nesting exceeds maximum depth {}", self.max)
+    }
 }
 
 fn cat_transform(data: &[u8], flags: &CatFlags, state: &mut CatState, out: &mut Vec<u8>) {
@@ -336,6 +407,75 @@ fn which(ctx: CommandContext) -> CommandFuture {
             }
         }
         CommandResult::new(exit)
+    })
+}
+
+fn jq_cmd(ctx: CommandContext) -> CommandFuture {
+    boxed(async move {
+        let CommandContext {
+            args,
+            fs,
+            limits,
+            mut stdin,
+            mut stdout,
+            mut stderr,
+            ..
+        } = ctx;
+        let options = match parse_jq_args(args) {
+            Ok(options) => options,
+            Err(message) => {
+                let _ = stderr.write_all(message.as_bytes()).await;
+                return CommandResult::new(2);
+            }
+        };
+
+        let inputs = if options.null_input {
+            Vec::new()
+        } else {
+            match read_jq_inputs(&fs, &options.files, &mut stdin, limits.jq_input_bytes).await {
+                Ok(inputs) => inputs,
+                Err(err) => {
+                    write_jq_input_error(&mut stderr, err).await;
+                    return CommandResult::new(2);
+                }
+            }
+        };
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = JqCancelOnDrop {
+            cancelled: Arc::clone(&cancelled),
+        };
+        let deadline =
+            Instant::now().checked_add(limits.wall_time.saturating_add(Duration::from_secs(1)));
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::task::spawn_blocking(move || {
+            run_jq_program(options, inputs, tx, deadline, cancelled);
+        });
+
+        while let Some(message) = rx.recv().await {
+            match message {
+                JqStreamMessage::Stdout(chunk) => {
+                    if let Err(err) = stdout.write_all(&chunk).await {
+                        return if is_broken_pipe(&err) {
+                            CommandResult::failure()
+                        } else {
+                            let _ = stderr
+                                .write_all(format!("jq: output error: {err}\n").as_bytes())
+                                .await;
+                            CommandResult::new(5)
+                        };
+                    }
+                }
+                JqStreamMessage::Done(done) => {
+                    if !done.stderr.is_empty() {
+                        let _ = stderr.write_all(&done.stderr).await;
+                    }
+                    return CommandResult::new(done.exit_code);
+                }
+            }
+        }
+
+        CommandResult::failure()
     })
 }
 
@@ -1328,6 +1468,474 @@ fn line_too_long_error() -> io::Error {
 
 fn is_line_too_long(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::InvalidData && err.to_string() == LINE_TOO_LONG
+}
+
+fn parse_jq_args(args: Vec<String>) -> Result<JqOptions, String> {
+    let mut raw_output = false;
+    let mut join_output = false;
+    let mut compact_output = false;
+    let mut exit_status = false;
+    let mut null_input = false;
+    let mut slurp = false;
+    let mut sort_keys = false;
+    let mut indent = "  ".to_owned();
+    let mut vars = Vec::new();
+    let mut filter = None;
+    let mut files = Vec::new();
+    let mut options_done = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+        if filter.is_some() {
+            files.extend(args[i..].iter().cloned());
+            break;
+        }
+
+        if options_done || !arg.starts_with('-') || arg == "-" {
+            filter = Some(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        match arg.as_str() {
+            "--" => {
+                options_done = true;
+                i += 1;
+            }
+            "--tab" => {
+                indent = "\t".to_owned();
+                i += 1;
+            }
+            "--indent" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    return Err("jq: option --indent requires an argument\n".to_owned());
+                };
+                indent = parse_jq_indent(value)?;
+                i += 1;
+            }
+            "--arg" => {
+                let (name, value) = parse_jq_arg_pair(&args, i, "--arg")?;
+                vars.push(JqVariable {
+                    name: format!("${name}"),
+                    value: jaq_json::Val::utf8_str(value.to_owned()),
+                });
+                i += 3;
+            }
+            "--argjson" => {
+                let (name, value) = parse_jq_arg_pair(&args, i, "--argjson")?;
+                validate_jq_json_nesting(value.as_bytes())
+                    .map_err(|err| format!("jq: invalid JSON for --argjson {name}: {err}\n"))?;
+                let value = jaq_json::read::parse_single(value.as_bytes())
+                    .map_err(|err| format!("jq: invalid JSON for --argjson {name}: {err}\n"))?;
+                vars.push(JqVariable {
+                    name: format!("${name}"),
+                    value,
+                });
+                i += 3;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(format!("jq: unsupported option '{flag}'\n"));
+            }
+            flags => {
+                for flag in flags.chars().skip(1) {
+                    match flag {
+                        'r' => raw_output = true,
+                        'j' => {
+                            raw_output = true;
+                            join_output = true;
+                        }
+                        'c' => compact_output = true,
+                        'e' => exit_status = true,
+                        'n' => null_input = true,
+                        's' => slurp = true,
+                        'S' => sort_keys = true,
+                        _ => return Err(format!("jq: unsupported option '-{flag}'\n")),
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let Some(filter) = filter else {
+        return Err("jq: missing filter\n".to_owned());
+    };
+
+    if indent.is_empty() {
+        compact_output = true;
+    }
+
+    Ok(JqOptions {
+        filter,
+        files,
+        raw_output,
+        join_output,
+        compact_output,
+        exit_status,
+        null_input,
+        slurp,
+        sort_keys,
+        indent,
+        vars,
+    })
+}
+
+fn parse_jq_arg_pair<'a>(
+    args: &'a [String],
+    option_index: usize,
+    option: &str,
+) -> Result<(&'a str, &'a str), String> {
+    let Some(name) = args.get(option_index + 1) else {
+        return Err(format!("jq: option {option} requires a name\n"));
+    };
+    let Some(value) = args.get(option_index + 2) else {
+        return Err(format!("jq: option {option} requires a value\n"));
+    };
+    if !is_jq_var_name(name) {
+        return Err(format!("jq: invalid variable name '{name}'\n"));
+    }
+    Ok((name, value))
+}
+
+fn is_jq_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn parse_jq_indent(value: &str) -> Result<String, String> {
+    let n = value
+        .parse::<usize>()
+        .map_err(|_| format!("jq: invalid indent '{value}'\n"))?;
+    if n > 8 {
+        return Err(format!("jq: invalid indent '{value}'\n"));
+    }
+    Ok(" ".repeat(n))
+}
+
+async fn read_jq_inputs(
+    fs: &Fs,
+    files: &[String],
+    stdin: &mut BoxAsyncRead,
+    limit: usize,
+) -> Result<Vec<JqInputSource>, JqInputError> {
+    let mut inputs = Vec::new();
+    let mut total = 0;
+    if files.is_empty() {
+        let mut data = Vec::new();
+        read_jq_reader(stdin, limit, &mut total, &mut data)
+            .await
+            .map_err(|err| JqInputError::Read {
+                path: "-".to_owned(),
+                err,
+            })?;
+        push_jq_input(&mut inputs, "-".to_owned(), data)?;
+        return Ok(inputs);
+    }
+
+    for file in files {
+        if file == "-" {
+            let mut data = Vec::new();
+            read_jq_reader(stdin, limit, &mut total, &mut data)
+                .await
+                .map_err(|err| JqInputError::Read {
+                    path: file.clone(),
+                    err,
+                })?;
+            push_jq_input(&mut inputs, file.clone(), data)?;
+        } else {
+            let mut reader = fs
+                .stream_reader(file)
+                .await
+                .map_err(|err| JqInputError::Vfs {
+                    path: file.clone(),
+                    err,
+                })?;
+            let mut data = Vec::new();
+            read_jq_reader(&mut reader, limit, &mut total, &mut data)
+                .await
+                .map_err(|err| JqInputError::Read {
+                    path: file.clone(),
+                    err,
+                })?;
+            push_jq_input(&mut inputs, file.clone(), data)?;
+        }
+    }
+
+    Ok(inputs)
+}
+
+fn push_jq_input(
+    inputs: &mut Vec<JqInputSource>,
+    path: String,
+    data: Vec<u8>,
+) -> Result<(), JqInputError> {
+    validate_jq_json_nesting(&data).map_err(|err| JqInputError::JsonDepth {
+        path: path.clone(),
+        err,
+    })?;
+    inputs.push(JqInputSource { path, data });
+    Ok(())
+}
+
+fn validate_jq_json_nesting(data: &[u8]) -> Result<(), JqJsonDepthError> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+
+    for &byte in data {
+        if in_comment {
+            if byte == b'\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'#' => in_comment = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_JQ_JSON_NESTING {
+                    return Err(JqJsonDepthError {
+                        max: MAX_JQ_JSON_NESTING,
+                    });
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_jq_reader(
+    reader: &mut BoxAsyncRead,
+    limit: usize,
+    total: &mut usize,
+    input: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        if total.saturating_add(n) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "input too large for tinysandbox jq",
+            ));
+        }
+        *total += n;
+        input.extend_from_slice(&buf[..n]);
+    }
+}
+
+async fn write_jq_input_error(stderr: &mut BoxAsyncWrite, err: JqInputError) {
+    match err {
+        JqInputError::Vfs { path, err } => write_vfs_error(stderr, "jq", &path, err).await,
+        JqInputError::JsonDepth { path, err } => {
+            let _ = stderr
+                .write_all(format!("jq: {path}: {err}\n").as_bytes())
+                .await;
+        }
+        JqInputError::Read { path, err } if err.kind() == io::ErrorKind::InvalidData => {
+            let _ = stderr
+                .write_all(format!("jq: {path}: {}\n", err).as_bytes())
+                .await;
+        }
+        JqInputError::Read { path, err } => {
+            if !report_stream_error(stderr, "jq", &path, err).await {
+                let _ = stderr.write_all(b"jq: read error\n").await;
+            }
+        }
+    }
+}
+
+fn run_jq_program(
+    options: JqOptions,
+    inputs: Vec<JqInputSource>,
+    tx: mpsc::Sender<JqStreamMessage>,
+    deadline: Option<Instant>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let _guard = jq::set_control(deadline, cancelled);
+    let done = run_jq_program_inner(&options, inputs, &tx);
+    let _ = tx.blocking_send(JqStreamMessage::Done(done));
+}
+
+fn run_jq_program_inner(
+    options: &JqOptions,
+    inputs: Vec<JqInputSource>,
+    tx: &mpsc::Sender<JqStreamMessage>,
+) -> JqRunDone {
+    let global_vars: Vec<_> = options.vars.iter().map(|var| var.name.clone()).collect();
+    let program = match jq::compile_with_vars(&options.filter, &global_vars) {
+        Ok(program) => program,
+        Err(err) => return jq_error_outcome(err),
+    };
+
+    let vars: Vec<_> = options.vars.iter().map(|var| var.value.clone()).collect();
+    let mut last_output = None;
+
+    if options.null_input {
+        if let Err(done) = run_jq_input_value(
+            &program,
+            jaq_json::Val::Null,
+            &vars,
+            options,
+            tx,
+            &mut last_output,
+        ) {
+            return done;
+        }
+    } else {
+        if options.slurp {
+            let mut values = Vec::new();
+            for source in inputs {
+                for value in jaq_json::read::parse_many(&source.data) {
+                    match value {
+                        Ok(value) => values.push(value),
+                        Err(err) => return jq_parse_error_outcome(&source.path, err),
+                    }
+                }
+            }
+            if let Err(done) = run_jq_input_value(
+                &program,
+                jaq_json::Val::Arr(values.into()),
+                &vars,
+                options,
+                tx,
+                &mut last_output,
+            ) {
+                return done;
+            }
+        } else {
+            for source in inputs {
+                for value in jaq_json::read::parse_many(&source.data) {
+                    let value = match value {
+                        Ok(value) => value,
+                        Err(err) => return jq_parse_error_outcome(&source.path, err),
+                    };
+                    if let Err(done) =
+                        run_jq_input_value(&program, value, &vars, options, tx, &mut last_output)
+                    {
+                        return done;
+                    }
+                }
+            }
+        }
+    }
+
+    JqRunDone {
+        exit_code: jq_exit_code(options.exit_status, last_output),
+        stderr: Vec::new(),
+    }
+}
+
+fn run_jq_input_value(
+    program: &jq::JqProgram,
+    input: jaq_json::Val,
+    vars: &[jaq_json::Val],
+    options: &JqOptions,
+    tx: &mpsc::Sender<JqStreamMessage>,
+    last_output: &mut Option<bool>,
+) -> Result<(), JqRunDone> {
+    for value in program.output_iter(input, vars) {
+        let value = value.map_err(jq_error_outcome)?;
+        *last_output = Some(jq_truthy(&value));
+        let mut chunk = Vec::new();
+        write_jq_value(&mut chunk, &value, options).map_err(|err| JqRunDone {
+            exit_code: 5,
+            stderr: format!("jq: output error: {err}\n").into_bytes(),
+        })?;
+        tx.blocking_send(JqStreamMessage::Stdout(chunk))
+            .map_err(|_| JqRunDone {
+                exit_code: 1,
+                stderr: Vec::new(),
+            })?;
+    }
+    Ok(())
+}
+
+fn jq_exit_code(exit_status: bool, last_output: Option<bool>) -> i32 {
+    if exit_status {
+        match last_output {
+            Some(true) => 0,
+            Some(false) => 1,
+            None => 4,
+        }
+    } else {
+        0
+    }
+}
+
+fn write_jq_value(out: &mut Vec<u8>, value: &jaq_json::Val, options: &JqOptions) -> io::Result<()> {
+    if options.raw_output {
+        match value {
+            jaq_json::Val::TStr(bytes) | jaq_json::Val::BStr(bytes) => {
+                out.extend_from_slice(bytes);
+            }
+            _ => write_jq_json(out, value, options)?,
+        }
+    } else {
+        write_jq_json(out, value, options)?;
+    }
+    if !options.join_output {
+        out.push(b'\n');
+    }
+    Ok(())
+}
+
+fn write_jq_json(out: &mut Vec<u8>, value: &jaq_json::Val, options: &JqOptions) -> io::Result<()> {
+    let pp = jaq_json::write::Pp {
+        indent: (!options.compact_output).then(|| options.indent.clone()),
+        sort_keys: options.sort_keys,
+        sep_space: !options.compact_output,
+        ..Default::default()
+    };
+    jaq_json::write::write(out, &pp, 0, value)
+}
+
+fn jq_truthy(value: &jaq_json::Val) -> bool {
+    !matches!(value, jaq_json::Val::Null | jaq_json::Val::Bool(false))
+}
+
+fn jq_parse_error_outcome(path: &str, err: jaq_json::read::Error) -> JqRunDone {
+    JqRunDone {
+        exit_code: 5,
+        stderr: format!("jq: {path}: parse error: {err}\n").into_bytes(),
+    }
+}
+
+fn jq_error_outcome(err: JqError) -> JqRunDone {
+    let exit_code = match err {
+        JqError::Compile(_) => 3,
+        JqError::Runtime(_) => 5,
+        JqError::Halt(code) => code,
+    };
+    JqRunDone {
+        exit_code,
+        stderr: format!("jq: {err}\n").into_bytes(),
+    }
 }
 
 async fn write_ls_entry(stdout: &mut BoxAsyncWrite, name: &str, metadata: Metadata, long: bool) {

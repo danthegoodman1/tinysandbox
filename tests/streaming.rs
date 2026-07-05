@@ -322,6 +322,64 @@ async fn grep_closed_pipe_stops_without_stderr() {
 }
 
 #[tokio::test]
+async fn jq_closed_pipe_stops_without_buffering_all_outputs() {
+    // jq should hand off each formatted value promptly so an early downstream
+    // consumer can close the pipe before the full range is produced.
+    let sandbox = Sandbox::builder().build();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        sandbox.exec("jq -n 'range(0;1000000)' | head -n 1"),
+    )
+    .await
+    .expect("jq-to-head pipeline should not wait for the full range");
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stdout, "0\n");
+    assert!(result.stderr.is_empty());
+    assert!(
+        result
+            .metrics
+            .commands
+            .iter()
+            .any(|timing| timing.name == "jq" && timing.exit_code == 141)
+    );
+}
+
+#[test]
+fn jq_timeout_cancels_no_output_range_reduction() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .max_blocking_threads(1)
+        .build()
+        .expect("build single-blocking-thread runtime");
+
+    rt.block_on(async {
+        // This filter does substantial work before producing any output. With a
+        // single blocking thread, the following jq proves the timed-out worker
+        // released its blocking slot instead of continuing in the background.
+        let timed_out_sandbox = Sandbox::builder()
+            .limits(Limits {
+                wall_time: Duration::from_millis(25),
+                ..Limits::default()
+            })
+            .build();
+
+        let timed_out = timed_out_sandbox
+            .exec("jq -n 'reduce range(0;1000000000) as $i (0; .)'")
+            .await;
+        assert_eq!(timed_out.exit_code, 124);
+
+        let after_sandbox = Sandbox::builder().build();
+        let after = tokio::time::timeout(Duration::from_secs(1), after_sandbox.exec("jq -n '1'"))
+            .await
+            .expect("subsequent jq should acquire the only blocking thread");
+        assert_eq!(after.exit_code, 0, "{}", after.stderr);
+        assert_eq!(after.stdout, "1\n");
+    });
+}
+
+#[tokio::test]
 async fn long_no_newline_streams_are_bounded() {
     // Plain cat can stream an over-limit line in chunks, while line-oriented
     // commands reject the same input before buffering it all.

@@ -1069,6 +1069,9 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
     if let Some(bytes) = get_optional::<f64>(&limits, "sortInputBytes")? {
         parsed.sort_input_bytes = usize_from_number(bytes)?;
     }
+    if let Some(bytes) = get_optional::<f64>(&limits, "jqInputBytes")? {
+        parsed.jq_input_bytes = usize_from_number(bytes)?;
+    }
     if let Some(bytes) = get_optional::<f64>(&limits, "wasmMemoryBytes")? {
         parsed.wasm_memory_bytes = usize_from_number(bytes)?;
     }

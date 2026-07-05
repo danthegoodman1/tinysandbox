@@ -21,10 +21,10 @@ console.log(result.stdout)
 ## What It Provides
 
 - A bash-like shell subset with pipelines, redirects, variables, and session state.
-- Built-in commands such as `cat`, `grep`, `head`, `tail`, `sort`, `uniq`, `wc`, `sed`, `ls`, `cp`, `mv`, `rm`, and `mkdir`.
+- Built-in commands such as `cat`, `grep`, `head`, `tail`, `sort`, `uniq`, `wc`, `sed`, `jq`, `ls`, `cp`, `mv`, `rm`, and `mkdir`.
 - A quota-enforced virtual filesystem with direct host APIs and JavaScript-backed VFS adapters.
 - A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`.
-- Limits and metrics for wall time, output size, command timings, pipe bytes, and wasm memory.
+- Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes, JSON nesting, and jq filter source size, nesting, and syntax complexity are capped before evaluation; jq filter evaluation has the limitations documented in the repository README.
 
 ## Platform Support
 

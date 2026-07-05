@@ -129,6 +129,158 @@ async fn builtin_text_tools_match_supported_gnu_shapes() {
     assert_eq!(sandbox.exec("sort -z").await.exit_code, 2);
 }
 
+#[tokio::test]
+async fn jq_builtin_matches_supported_cli_surface() {
+    // Runs jq through shell pipes, files, and flags so the command registration
+    // path is covered in addition to the jaq engine wrapper.
+    let sandbox = Sandbox::builder().build();
+
+    let pretty = sandbox.exec(r#"echo '{"b":2,"a":1}' | jq '.'"#).await;
+    assert_eq!(pretty.exit_code, 0, "{}", pretty.stderr);
+    assert_eq!(pretty.stdout, "{\n  \"b\": 2,\n  \"a\": 1\n}\n");
+
+    assert_eq!(
+        sandbox
+            .exec(r#"echo '{"b":2,"a":1}' | jq -S --indent 0 '.'"#)
+            .await
+            .stdout,
+        "{\"a\":1,\"b\":2}\n"
+    );
+    assert_eq!(
+        sandbox
+            .exec(r#"echo '{"items":[{"name":"Ada"},{"name":"Grace"}]}' | jq -r '.items[].name'"#)
+            .await
+            .stdout,
+        "Ada\nGrace\n"
+    );
+    assert_eq!(
+        sandbox
+            .exec(r#"echo '{"items":[{"name":"Ada"},{"name":"Grace"}]}' | jq -j '.items[].name'"#)
+            .await
+            .stdout,
+        "AdaGrace"
+    );
+    assert_eq!(
+        sandbox
+            .exec(r#"echo -e '{"x":1}\n{"x":2}' | jq -c -s 'map(.x)'"#)
+            .await
+            .stdout,
+        "[1,2]\n"
+    );
+    assert_eq!(
+        sandbox
+            .exec(r#"jq -c -n --arg name Ada --argjson count 2 '{name: $name, count: $count + 1}'"#)
+            .await
+            .stdout,
+        "{\"name\":\"Ada\",\"count\":3}\n"
+    );
+
+    assert_eq!(
+        sandbox
+            .exec(r#"echo '{"x":1}' > /a; echo '{"x":2}' > /b; jq -r '.x' /a /b"#)
+            .await
+            .stdout,
+        "1\n2\n"
+    );
+
+    let fs = sandbox.fs();
+    fs.write_file("/jq-one", b"1", false)
+        .await
+        .expect("write jq-one");
+    fs.write_file("/jq-three", b"3", false)
+        .await
+        .expect("write jq-three");
+    assert_eq!(
+        sandbox.exec("jq -r '.' /jq-one /jq-three").await.stdout,
+        "1\n3\n"
+    );
+    assert_eq!(
+        sandbox
+            .exec("echo -n 2 | jq -r '.' /jq-one - /jq-three")
+            .await
+            .stdout,
+        "1\n2\n3\n"
+    );
+}
+
+#[tokio::test]
+async fn jq_builtin_reports_status_errors_and_limits() {
+    let sandbox = Sandbox::builder().build();
+
+    assert_eq!(sandbox.exec("echo true | jq -e '.'").await.exit_code, 0);
+    assert_eq!(sandbox.exec("echo false | jq -e '.'").await.exit_code, 1);
+    assert_eq!(sandbox.exec("echo '[]' | jq -e '.[]'").await.exit_code, 4);
+
+    let unsupported = sandbox.exec("jq --color-output '.'").await;
+    assert_eq!(unsupported.exit_code, 2);
+    assert!(unsupported.stderr.contains("unsupported option"));
+
+    let parse_error = sandbox.exec("echo '{' | jq '.'").await;
+    assert_eq!(parse_error.exit_code, 5);
+    assert!(parse_error.stderr.contains("parse error"));
+
+    let limited = Sandbox::builder()
+        .limits(Limits {
+            jq_input_bytes: 3,
+            ..Limits::default()
+        })
+        .build();
+    let over_limit = limited.exec("echo 1234 | jq '.'").await;
+    assert_eq!(over_limit.exit_code, 2);
+    assert!(over_limit.stderr.contains("input too large"));
+
+    let recursive_filter = sandbox.exec("jq -n 'def f: f + 1; f'").await;
+    assert_eq!(recursive_filter.exit_code, 3);
+    assert!(
+        recursive_filter
+            .stderr
+            .contains("user-defined jq functions are not supported")
+    );
+
+    let deep_filter = format!("jq -n '{}0{}'", "[".repeat(3500), "]".repeat(3500));
+    let deep_filter = sandbox.exec(&deep_filter).await;
+    assert_eq!(deep_filter.exit_code, 3);
+    assert!(deep_filter.stderr.contains("jq filter nesting exceeds"));
+
+    for (name, filter) in [
+        ("unary minus", format!("{}0", "-".repeat(1100))),
+        ("try", format!("{}0", "try ".repeat(1100))),
+        ("alt", format!("1{}", "//1".repeat(1100))),
+        ("pipe", vec!["."; 1100].join("|")),
+    ] {
+        // These sources drive recursive jaq parse paths without deep delimiter
+        // nesting, so they must fail during tinysandbox's source preflight.
+        let command = format!("jq -n -- '{}'", shell_single_quote(&filter));
+        let result = sandbox.exec(&command).await;
+        assert_eq!(result.exit_code, 3, "{name}: {}", result.stderr);
+        assert!(
+            result.stderr.contains("jq filter complexity exceeds"),
+            "{name}: {}",
+            result.stderr
+        );
+    }
+
+    let deep_json = format!("{}0{}", "[".repeat(1100), "]".repeat(1100));
+    sandbox
+        .fs()
+        .write_file("/deep.json", deep_json.as_bytes(), false)
+        .await
+        .expect("write deep jq input");
+    let deep_input = sandbox.exec("jq -c '.' /deep.json").await;
+    assert_eq!(deep_input.exit_code, 2);
+    assert!(deep_input.stderr.contains("JSON nesting exceeds"));
+
+    let deep_argjson = sandbox
+        .exec(&format!("jq -n --argjson x '{}' '$x'", deep_json))
+        .await;
+    assert_eq!(deep_argjson.exit_code, 2);
+    assert!(deep_argjson.stderr.contains("JSON nesting exceeds"));
+}
+
+fn shell_single_quote(input: &str) -> String {
+    input.replace('\'', "'\\''")
+}
+
 #[test]
 fn reserved_shell_builtins_cannot_be_shadowed() {
     for name in ["cd", "export", "unset"] {

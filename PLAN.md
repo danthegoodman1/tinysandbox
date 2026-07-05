@@ -164,10 +164,10 @@ Status ledger:
 | Complete | Work | 3B: `Sandbox` builder/session API | `src/sandbox/mod.rs`: persistent cwd/env, `$PWD`/`OLDPWD`, executing doc test. |
 | Complete | Work | 3C: executor (pipes, redirects, lists, exit codes) | Left-to-right fd resolution (bash-correct `2>&1` ordering), preflighted redirect targets, field splitting, `$?`. |
 | Complete | Work | 3D: limits (wall clock, output caps, command count) | Timeout → 124, head+tail truncation marker, max command count → 125; all tested. |
-| Complete | Work | 3E: builtins with GNU-faithful flags | 18 builtins; grep/sed regex dialect documented as deliberate deviation; GNU exit codes (grep 0/1/2, sed 1/2). |
+| Complete | Work | 3E: builtins with GNU-faithful flags | 19 builtins including jaq-powered `jq`; grep/sed regex dialect documented as deliberate deviation; GNU exit codes (grep 0/1/2, sed 1/2, jq 0/2/3/4/5 plus `-e`). |
 | Complete | Work | 3F: blocking-VFS thread dispatch | `Vfs::is_fast()` inline path, `spawn_blocking` otherwise; 4-way concurrency test discriminates serial vs parallel. |
 | Complete | Work | 3G: `Sandbox::stats()` + `ExecResult` metrics | Stats (VFS bytes/files, commands run) + wall time, per-command timings, pipe bytes; tested. |
-| Complete | Test | end-to-end pipeline suite via public API | `tests/sandbox_e2e.rs` + `tests/fixtures/sandbox_builtins_golden.txt` (20+ GNU-verified cases). |
+| Complete | Test | end-to-end pipeline suite via public API | `tests/sandbox_e2e.rs` + `tests/fixtures/sandbox_builtins_golden.txt` (20+ GNU/jq-verified cases). |
 | Complete | Gate | e2e + golden + limit tests green | Reviewer approved after 3 rounds; local test + clippy green. |
 
 ## Phase 4: JS runtime (feature `js`, default on)

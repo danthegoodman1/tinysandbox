@@ -114,6 +114,8 @@ pub struct Limits {
     pub max_commands: usize,
     /// Maximum bytes accepted by `sort` before it fails.
     pub sort_input_bytes: usize,
+    /// Maximum bytes accepted by `jq` before it fails.
+    pub jq_input_bytes: usize,
     /// Maximum WebAssembly memory for JS commands.
     pub wasm_memory_bytes: usize,
     /// Maximum bytes accepted from a JavaScript fetch response body.
@@ -128,6 +130,7 @@ impl Default for Limits {
             stderr_bytes: 1024 * 1024,
             max_commands: 1024,
             sort_input_bytes: 8 * 1024 * 1024,
+            jq_input_bytes: 8 * 1024 * 1024,
             wasm_memory_bytes: 64 * 1024 * 1024,
             fetch_response_bytes: 32 * 1024 * 1024,
         }

@@ -72,31 +72,32 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
         };
         let syscall_runtime = tokio::runtime::Handle::current();
 
-        let result = match tokio::task::spawn_blocking(move || {
-            run_quickjs_on_host_stack(
-                invocation,
-                env,
-                cwd,
-                fs,
-                js_syscalls,
-                js_fetch,
-                js_prelude,
-                limits.wasm_memory_bytes,
-                limits.fetch_response_bytes,
-                limits.wall_time,
-                syscall_runtime,
-            )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => JsRunResult {
-                exit_code: 1,
-                stdout: Vec::new(),
-                stderr: format!("js: runtime task failed: {err}\n").into_bytes(),
-                peak_wasm_memory_bytes: 0,
+        let config = JsRunConfig {
+            invocation,
+            env,
+            cwd,
+            fs,
+            js_syscalls,
+            js_fetch,
+            js_prelude,
+            limits: JsRuntimeLimits {
+                wasm_memory_bytes: limits.wasm_memory_bytes,
+                fetch_response_bytes: limits.fetch_response_bytes,
+                wall_time: limits.wall_time,
             },
+            syscall_runtime,
         };
+
+        let result =
+            match tokio::task::spawn_blocking(move || run_quickjs_on_host_stack(config)).await {
+                Ok(result) => result,
+                Err(err) => JsRunResult {
+                    exit_code: 1,
+                    stdout: Vec::new(),
+                    stderr: format!("js: runtime task failed: {err}\n").into_bytes(),
+                    peak_wasm_memory_bytes: 0,
+                },
+            };
 
         let _ = stdout.write_all(&result.stdout).await;
         let _ = stderr.write_all(&result.stderr).await;
@@ -104,37 +105,31 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
     })
 }
 
-fn run_quickjs_on_host_stack(
+struct JsRunConfig {
     invocation: Invocation,
     env: BTreeMap<String, String>,
     cwd: String,
     fs: Fs,
-    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
-    fetch: Option<Arc<dyn Fetch>>,
+    js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_fetch: Option<Arc<dyn Fetch>>,
     js_prelude: Arc<str>,
+    limits: JsRuntimeLimits,
+    syscall_runtime: tokio::runtime::Handle,
+}
+
+#[derive(Clone, Copy)]
+struct JsRuntimeLimits {
     wasm_memory_bytes: usize,
     fetch_response_bytes: usize,
     wall_time: Duration,
-    syscall_runtime: tokio::runtime::Handle,
-) -> JsRunResult {
+}
+
+fn run_quickjs_on_host_stack(config: JsRunConfig) -> JsRunResult {
     match thread::Builder::new()
         .name("tinysandbox-js-runtime".to_owned())
         .stack_size(QUICKJS_HOST_THREAD_STACK_BYTES)
-        .spawn(move || {
-            run_quickjs(
-                invocation,
-                env,
-                cwd,
-                fs,
-                syscalls,
-                fetch,
-                js_prelude,
-                wasm_memory_bytes,
-                fetch_response_bytes,
-                wall_time,
-                syscall_runtime,
-            )
-        }) {
+        .spawn(move || run_quickjs(config))
+    {
         Ok(handle) => match handle.join() {
             Ok(result) => result,
             Err(_) => JsRunResult {
@@ -214,32 +209,8 @@ struct JsRunResult {
     peak_wasm_memory_bytes: usize,
 }
 
-fn run_quickjs(
-    invocation: Invocation,
-    env: BTreeMap<String, String>,
-    cwd: String,
-    fs: Fs,
-    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
-    fetch: Option<Arc<dyn Fetch>>,
-    js_prelude: Arc<str>,
-    wasm_memory_bytes: usize,
-    fetch_response_bytes: usize,
-    wall_time: Duration,
-    syscall_runtime: tokio::runtime::Handle,
-) -> JsRunResult {
-    match run_quickjs_inner(
-        invocation,
-        env,
-        cwd,
-        fs,
-        syscalls,
-        fetch,
-        js_prelude,
-        wasm_memory_bytes,
-        fetch_response_bytes,
-        wall_time,
-        syscall_runtime,
-    ) {
+fn run_quickjs(config: JsRunConfig) -> JsRunResult {
+    match run_quickjs_inner(config) {
         Ok(result) => result,
         Err(err) if is_epoch_timeout(&err) => JsRunResult {
             exit_code: 124,
@@ -256,38 +227,35 @@ fn run_quickjs(
     }
 }
 
-fn run_quickjs_inner(
-    invocation: Invocation,
-    env: BTreeMap<String, String>,
-    cwd: String,
-    fs: Fs,
-    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
-    fetch: Option<Arc<dyn Fetch>>,
-    js_prelude: Arc<str>,
-    wasm_memory_bytes: usize,
-    fetch_response_bytes: usize,
-    wall_time: Duration,
-    syscall_runtime: tokio::runtime::Handle,
-) -> wasmtime::Result<JsRunResult> {
+fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
+    let JsRunConfig {
+        invocation,
+        env,
+        cwd,
+        fs,
+        js_syscalls,
+        js_fetch,
+        js_prelude,
+        limits,
+        syscall_runtime,
+    } = config;
     let compiled = compiled_runtime()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .map_err(wasmtime::Error::new)?;
     let mut store = Store::new(
         &compiled.engine,
-        HostState::new(
+        HostState::new(HostStateConfig {
             fs,
             runtime,
             syscall_runtime,
-            syscalls,
-            fetch,
-            wasm_memory_bytes,
-            fetch_response_bytes,
-            wall_time,
-        ),
+            syscalls: js_syscalls,
+            fetch: js_fetch,
+            limits,
+        }),
     );
     store.limiter(|state| &mut state.limiter);
-    store.set_epoch_deadline(epoch_ticks(wall_time));
+    store.set_epoch_deadline(epoch_ticks(limits.wall_time));
     store.epoch_deadline_trap();
 
     let instance = compiled.pre.instantiate(&mut store)?;
@@ -296,7 +264,7 @@ fn run_quickjs_inner(
         .ok_or_else(|| wasmtime::Error::msg("quickjs wasm did not export memory"))?;
     let initial_memory = memory.data_size(&store);
     store.data_mut().limiter.record_peak(initial_memory);
-    if initial_memory > wasm_memory_bytes {
+    if initial_memory > limits.wasm_memory_bytes {
         return Err(wasmtime::Error::msg(
             "tinysandbox wasm memory limit exceeded",
         ));
@@ -411,17 +379,25 @@ struct HostState {
     wall_time: Duration,
 }
 
+struct HostStateConfig {
+    fs: Fs,
+    runtime: tokio::runtime::Runtime,
+    syscall_runtime: tokio::runtime::Handle,
+    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    fetch: Option<Arc<dyn Fetch>>,
+    limits: JsRuntimeLimits,
+}
+
 impl HostState {
-    fn new(
-        fs: Fs,
-        runtime: tokio::runtime::Runtime,
-        syscall_runtime: tokio::runtime::Handle,
-        syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
-        fetch: Option<Arc<dyn Fetch>>,
-        memory_limit: usize,
-        fetch_response_bytes: usize,
-        wall_time: Duration,
-    ) -> Self {
+    fn new(config: HostStateConfig) -> Self {
+        let HostStateConfig {
+            fs,
+            runtime,
+            syscall_runtime,
+            syscalls,
+            fetch,
+            limits,
+        } = config;
         Self {
             fs,
             runtime,
@@ -433,11 +409,11 @@ impl HostState {
             response: Vec::new(),
             fds: BTreeMap::new(),
             next_fd: 3,
-            limiter: WasmLimiter::new(memory_limit),
-            fetch_response_bytes,
+            limiter: WasmLimiter::new(limits.wasm_memory_bytes),
+            fetch_response_bytes: limits.fetch_response_bytes,
             rng: 0x7468_696e_626f_7821,
             started: Instant::now(),
-            wall_time,
+            wall_time: limits.wall_time,
         }
     }
 

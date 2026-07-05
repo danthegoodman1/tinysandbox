@@ -226,13 +226,48 @@ exit codes; golden tests pin the output shapes against the real tools.
 ```text
 files:  cat ls cp mv rm mkdir touch stat which pwd cd
 text:   grep head tail sort uniq wc sed echo
-other:  true false export unset js
+other:  true false export unset jq js
 ```
 
 `/bin` is synthesized from the command registry, so `ls /bin` and
 `which cat` work and writes to `/bin` fail with `EACCES`. One documented
 deviation: `grep` and `sed` use Rust regex syntax (linear-time matching, so
 hostile patterns can't burn CPU) rather than POSIX BRE.
+
+#### jq
+
+`jq filter [files...]` is powered by [jaq](https://github.com/01mf02/jaq)
+and runs as a native builtin over the same VFS and pipes as the rest of the
+sandbox. The supported CLI surface is intentionally small: `-r`, `-j`, `-c`,
+`-e`, `-n`, `-s`, `-S`, `--tab`, `--indent N`, `--arg name value`,
+`--argjson name json`, `--`, file operands, and `-` for stdin. Unsupported
+options fail loudly.
+
+Input comes from stdin when no files are passed, or from each file operand in
+order; `-` reads stdin at that point in the file list. Newline-delimited JSON
+is accepted by default as a stream of JSON values. With `-s`, all JSON values
+from stdin and files are parsed first and passed to the filter as one array.
+`Limits::jq_input_bytes` / `limits.jqInputBytes` caps the total bytes accepted
+across stdin and files before evaluation starts. JSON input and `--argjson`
+values are also rejected when nesting exceeds 1024 arrays/objects, before bytes
+are handed to jaq's recursive JSON parser. jq filter source is rejected before
+jaq parses it when source exceeds 256 KiB, grouped/interpolation nesting exceeds
+512 levels, or significant syntax exceeds 1024 tokens.
+
+`jq` checks the sandbox wall-clock limit between output values and in the
+tinysandbox-provided `range` implementation, and it stops promptly when a
+downstream pipe closes, so `jq -n 'range(0;1000000000)' | head` does not buffer
+unbounded output. jaq does not expose a fully preemptive evaluator or an
+allocator limit for every filter path: some non-output-producing filters can
+time out at the command boundary while a blocking worker continues until the
+jaq iterator yields again, and evaluation memory is bounded by wall time plus
+host memory rather than a jq-specific heap cap. Hosts running untrusted filters
+should set `wall_time` conservatively.
+
+This is not a full jq distribution: user-defined jq functions (`def ...`) are
+not supported, external module loading, color output, and CLI flags outside the
+listed subset are not exposed, and diagnostics use tinysandbox/jaq-shaped
+wording.
 
 ### JavaScript runtime
 

@@ -48,6 +48,8 @@ export interface LimitsOptions {
   stderrBytes?: number
   maxCommands?: number
   sortInputBytes?: number
+  /** Maximum total bytes accepted by jq across stdin and file operands. */
+  jqInputBytes?: number
   wasmMemoryBytes?: number
   fetchResponseBytes?: number
 }

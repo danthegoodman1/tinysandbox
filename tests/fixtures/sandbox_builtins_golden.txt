@@ -316,6 +316,45 @@ sed: unsupported command; tinysandbox supports s/// with g and i flags
 END_STDERR
 END
 
+CASE jq compact sorted stdin
+COMMAND
+echo '{"b":2,"a":1}' | jq -c -S '.'
+END_COMMAND
+EXIT 0
+STDOUT
+{"a":1,"b":2}
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE jq raw output files and dash
+COMMAND
+echo '{"x":1}' > /a; echo '{"x":3}' > /c; echo '{"x":2}' | jq -r '.x' /a - /c
+END_COMMAND
+EXIT 0
+STDOUT
+1
+2
+3
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE jq slurp variables and null input
+COMMAND
+echo -e '{"x":1}\n{"x":2}' | jq -c -s --arg label total '{label:$label, xs: map(.x)}'; jq -c -n --argjson count 2 '$count + 1'
+END_COMMAND
+EXIT 0
+STDOUT
+{"label":"total","xs":[1,2]}
+3
+END_STDOUT
+STDERR
+END_STDERR
+END
+
 CASE which and stat
 COMMAND
 which cat; stat /bin/cat
