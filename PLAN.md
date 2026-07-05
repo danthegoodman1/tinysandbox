@@ -273,7 +273,7 @@ Status ledger:
 | Incomplete | Work | 5B: conformance suite snapshot extension | Missing: suite section + green run. |
 | Incomplete | Work | 5C: comprehensive edge-case coverage sweep | Missing: llvm-cov audit, gap list, new cases + fixes. |
 | Incomplete | Work | 5D: fuzz targets + findings fixed | Missing: fuzz run logs. |
-| Incomplete | Work | 5E: rustdoc, README, examples, publish dry-run | Missing: docs + dry-run output. |
+| Incomplete | Work | 5E: rustdoc, README, examples, publish dry-run | README + examples/ landed early; missing: rustdoc pass, semver review, dry-run output. |
 | Incomplete | Gate | coverage sweep + fuzz clean + dry-run + docs green | Missing: passing CI run. |
 
 ## Phase 6: Node.js bindings

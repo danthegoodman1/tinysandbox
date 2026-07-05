@@ -18,3 +18,7 @@ tokio = { version = "1.52.3", default-features = false, features = ["macros", "r
 [features]
 default = ["js"]
 js = ["dep:base64", "dep:serde", "dep:serde_json", "dep:wasmtime"]
+
+[[example]]
+name = "js_scripts"
+required-features = ["js"]
