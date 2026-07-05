@@ -236,6 +236,62 @@ STDERR
 END_STDERR
 END
 
+CASE cat numbering squeeze and marks
+COMMAND
+echo -e 'a\tx\n\n\n\nb' > /f; cat -n /f; cat -b /f; cat -sn /f; cat -ET /f
+END_COMMAND
+EXIT 0
+STDOUT
+     1	a	x
+     2	
+     3	
+     4	
+     5	b
+     1	a	x
+
+
+
+     2	b
+     1	a	x
+     2	
+     3	b
+a^Ix$
+$
+$
+$
+b$
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE cat numbering continues across files
+COMMAND
+echo -e 'p\nq' > /g; cat -n /g /g
+END_COMMAND
+EXIT 0
+STDOUT
+     1	p
+     2	q
+     3	p
+     4	q
+END_STDOUT
+STDERR
+END_STDERR
+END
+
+CASE cat unsupported flag
+COMMAND
+cat -z /g
+END_COMMAND
+EXIT 1
+STDOUT
+END_STDOUT
+STDERR
+cat: unsupported option '-z'
+END_STDERR
+END
+
 CASE sed invalid replacement reference
 COMMAND
 echo x | sed 's/x/\1/'

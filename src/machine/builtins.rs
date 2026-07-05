@@ -53,6 +53,81 @@ fn boxed(fut: impl Future<Output = CommandResult> + Send + 'static) -> CommandFu
     Box::pin(fut)
 }
 
+#[derive(Default)]
+struct CatFlags {
+    number: bool,
+    number_nonblank: bool,
+    squeeze: bool,
+    show_ends: bool,
+    show_tabs: bool,
+}
+
+impl CatFlags {
+    fn plain(&self) -> bool {
+        !(self.number || self.number_nonblank || self.squeeze || self.show_ends || self.show_tabs)
+    }
+}
+
+// Line number and blank-run state persist across input files, matching GNU cat
+// (numbering continues into the next file; -s squeezes across file boundaries).
+#[derive(Default)]
+struct CatState {
+    line: u64,
+    prev_blank: bool,
+}
+
+fn cat_transform(data: &[u8], flags: &CatFlags, state: &mut CatState, out: &mut Vec<u8>) {
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (content, had_newline) = match rest.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let line = &rest[..pos];
+                rest = &rest[pos + 1..];
+                (line, true)
+            }
+            None => {
+                let line = rest;
+                rest = &[];
+                (line, false)
+            }
+        };
+        let blank = content.is_empty() && had_newline;
+        if flags.squeeze && blank && state.prev_blank {
+            continue;
+        }
+        state.prev_blank = blank;
+        // GNU: -b numbers only non-blank lines and overrides -n.
+        let numbered = if flags.number_nonblank {
+            !blank
+        } else {
+            flags.number
+        };
+        if numbered {
+            state.line += 1;
+            out.extend_from_slice(format!("{:>6}\t", state.line).as_bytes());
+        }
+        if flags.show_tabs {
+            for &b in content {
+                if b == b'\t' {
+                    out.extend_from_slice(b"^I");
+                } else {
+                    out.push(b);
+                }
+            }
+        } else {
+            out.extend_from_slice(content);
+        }
+        if had_newline {
+            // -E marks the newline position, so a final line without a
+            // trailing newline gets no '$'.
+            if flags.show_ends {
+                out.push(b'$');
+            }
+            out.push(b'\n');
+        }
+    }
+}
+
 fn cat(ctx: CommandContext) -> CommandFuture {
     boxed(async move {
         let CommandContext {
@@ -63,22 +138,31 @@ fn cat(ctx: CommandContext) -> CommandFuture {
             mut stderr,
             ..
         } = ctx;
-        if let Some(flag) = unsupported_flag(&args) {
-            return unsupported("cat", flag, &mut stderr).await;
-        }
-
-        if args.is_empty() {
-            let mut input = Vec::new();
-            if stdin.read_to_end(&mut input).await.is_err()
-                || stdout.write_all(&input).await.is_err()
-            {
-                return CommandResult::failure();
+        let mut flags = CatFlags::default();
+        let mut paths = Vec::new();
+        for arg in args {
+            if arg.starts_with('-') && arg != "-" {
+                for flag in arg.chars().skip(1) {
+                    match flag {
+                        'n' => flags.number = true,
+                        'b' => flags.number_nonblank = true,
+                        's' => flags.squeeze = true,
+                        'E' => flags.show_ends = true,
+                        'T' => flags.show_tabs = true,
+                        _ => return unsupported("cat", &format!("-{flag}"), &mut stderr).await,
+                    }
+                }
+            } else {
+                paths.push(arg);
             }
-            return CommandResult::success();
+        }
+        if paths.is_empty() {
+            paths.push("-".to_string());
         }
 
+        let mut state = CatState::default();
         let mut exit = 0;
-        for path in args {
+        for path in paths {
             let data = if path == "-" {
                 let mut data = Vec::new();
                 if stdin.read_to_end(&mut data).await.is_err() {
@@ -90,7 +174,14 @@ fn cat(ctx: CommandContext) -> CommandFuture {
             };
             match data {
                 Ok(data) => {
-                    if stdout.write_all(&data).await.is_err() {
+                    let output = if flags.plain() {
+                        data
+                    } else {
+                        let mut out = Vec::with_capacity(data.len());
+                        cat_transform(&data, &flags, &mut state, &mut out);
+                        out
+                    };
+                    if stdout.write_all(&output).await.is_err() {
                         return CommandResult::failure();
                     }
                 }
