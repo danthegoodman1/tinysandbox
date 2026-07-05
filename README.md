@@ -238,36 +238,42 @@ hostile patterns can't burn CPU) rather than POSIX BRE.
 
 `jq filter [files...]` is powered by [jaq](https://github.com/01mf02/jaq)
 and runs as a native builtin over the same VFS and pipes as the rest of the
-sandbox. The supported CLI surface is intentionally small: `-r`, `-j`, `-c`,
-`-e`, `-n`, `-s`, `-S`, `--tab`, `--indent N`, `--arg name value`,
-`--argjson name json`, `--`, file operands, and `-` for stdin. Unsupported
-options fail loudly.
+sandbox.
 
-Input comes from stdin when no files are passed, or from each file operand in
-order; `-` reads stdin at that point in the file list. Newline-delimited JSON
-is accepted by default as a stream of JSON values. With `-s`, all JSON values
-from stdin and files are parsed first and passed to the filter as one array.
-`Limits::jq_input_bytes` / `limits.jqInputBytes` caps the total bytes accepted
-across stdin and files before evaluation starts. JSON input and `--argjson`
-values are also rejected when nesting exceeds 1024 arrays/objects, before bytes
-are handed to jaq's recursive JSON parser. jq filter source is rejected before
-jaq parses it when source exceeds 256 KiB, grouped/interpolation nesting exceeds
-512 levels, or significant syntax exceeds 1024 tokens.
+**Flags.** The CLI surface is intentionally small: `-r`, `-j`, `-c`, `-e`,
+`-n`, `-s`, `-S`, `--tab`, `--indent N`, `--arg name value`,
+`--argjson name json`, and `--`, plus file operands and `-` for stdin.
+Unsupported options fail loudly.
 
-`jq` checks the sandbox wall-clock limit between output values and in the
-tinysandbox-provided `range` implementation, and it stops promptly when a
-downstream pipe closes, so `jq -n 'range(0;1000000000)' | head` does not buffer
-unbounded output. jaq does not expose a fully preemptive evaluator or an
-allocator limit for every filter path: some non-output-producing filters can
-time out at the command boundary while a blocking worker continues until the
-jaq iterator yields again, and evaluation memory is bounded by wall time plus
-host memory rather than a jq-specific heap cap. Hosts running untrusted filters
-should set `wall_time` conservatively.
+**Input.** Stdin when no files are passed, otherwise each file operand in
+order (`-` reads stdin at that point in the list). Newline-delimited JSON is
+accepted by default as a stream of JSON values; with `-s`, all values from
+stdin and files are parsed first and passed to the filter as one array.
 
-This is not a full jq distribution: user-defined jq functions (`def ...`) are
-not supported, external module loading, color output, and CLI flags outside the
-listed subset are not exposed, and diagnostics use tinysandbox/jaq-shaped
-wording.
+**Limits.** All enforced before evaluation starts:
+
+- `Limits::jq_input_bytes` / `limits.jqInputBytes` caps the total bytes read
+  across stdin and files (default 8 MiB).
+- JSON input and `--argjson` values are rejected past 1024 levels of
+  array/object nesting, before bytes reach jaq's recursive JSON parser.
+- The filter program text (the expression argument, not input data) is
+  rejected past 256 KiB of source, 512 levels of grouped/interpolation
+  nesting, or 1024 significant syntax tokens — far beyond any hand-written
+  filter, but enough to keep hostile programs out of jaq's recursive parser.
+
+**Resource behavior.** Output is streamed: `jq` checks the sandbox wall-clock
+limit between output values and inside the tinysandbox-provided `range`, and
+stops promptly when a downstream pipe closes, so
+`jq -n 'range(0;1000000000)' | head` does not buffer unbounded output. jaq
+does not expose a fully preemptive evaluator or an allocator limit, so some
+non-output-producing filters only time out at the command boundary while the
+blocking worker runs until jaq yields again, and evaluation memory is bounded
+by wall time plus host memory rather than a jq-specific heap cap. Hosts
+running untrusted filters should set `wall_time` conservatively.
+
+**Not included.** User-defined jq functions (`def ...`), external module
+loading, color output, and CLI flags outside the listed subset. Diagnostics
+use tinysandbox/jaq-shaped wording.
 
 ### JavaScript runtime
 

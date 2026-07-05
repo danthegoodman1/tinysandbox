@@ -24,7 +24,7 @@ console.log(result.stdout)
 - Built-in commands such as `cat`, `grep`, `head`, `tail`, `sort`, `uniq`, `wc`, `sed`, `jq`, `ls`, `cp`, `mv`, `rm`, and `mkdir`.
 - A quota-enforced virtual filesystem with direct host APIs and JavaScript-backed VFS adapters.
 - A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`.
-- Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes, JSON nesting, and jq filter source size, nesting, and syntax complexity are capped before evaluation; jq filter evaluation has the limitations documented in the repository README.
+- Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes and JSON nesting are capped before evaluation, and the jq filter program text (not input data) is capped on size, nesting, and syntax complexity; jq filter evaluation has the limitations documented in the repository README.
 
 ## Platform Support
 
