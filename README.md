@@ -805,27 +805,25 @@ mkdir -p /bench && echo bench-payload > /bench/echo.txt && cat /bench/echo.txt
 ```
 
 Measured on macOS 26.5.1 arm64 with `rustc 1.96.0` and Node.js `v24.15.0`.
-RSS includes runtime and allocator overhead for that process. `VFS bytes /
-sandbox` is logical file payload retained by the in-memory filesystem after
-the workload, not total allocator overhead.
+RSS includes runtime and allocator overhead for that process.
 
 #### Rust
 
-| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | VFS bytes / sandbox | task time |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1,000 | 8.84 MiB | 6.51 KiB | 49 ms | 1,000 | 12.08 MiB | 12.08 MiB | 14.0 B | 60 ms |
-| 10,000 | 60.78 MiB | 5.97 KiB | 75 ms | 1,000 | 64.09 MiB | 93.91 MiB | 14.0 B | 55 ms |
-| 100,000 | 580.58 MiB | 5.92 KiB | 312 ms | 1,000 | 583.86 MiB | 908.70 MiB | 14.0 B | 55 ms |
-| 1,000,000 | 5.64 GiB | 5.92 KiB | 2.56 s | 1,000 | 5.65 GiB | 8.92 GiB | 14.0 B | 44 ms |
+| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | task time |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 8.84 MiB | 6.51 KiB | 49 ms | 1,000 | 12.08 MiB | 12.08 MiB | 60 ms |
+| 10,000 | 60.78 MiB | 5.97 KiB | 75 ms | 1,000 | 64.09 MiB | 93.91 MiB | 55 ms |
+| 100,000 | 580.58 MiB | 5.92 KiB | 312 ms | 1,000 | 583.86 MiB | 908.70 MiB | 55 ms |
+| 1,000,000 | 5.64 GiB | 5.92 KiB | 2.56 s | 1,000 | 5.65 GiB | 8.92 GiB | 44 ms |
 
 #### TypeScript
 
-| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | VFS bytes / sandbox | task time |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1,000 | 85.02 MiB | 6.61 KiB | 3 ms | 1,000 | 88.83 MiB | 88.83 MiB | 14.0 B | 33 ms |
-| 10,000 | 126.55 MiB | 6.43 KiB | 30 ms | 1,000 | 130.55 MiB | 166.55 MiB | 14.0 B | 37 ms |
-| 100,000 | 680.95 MiB | 6.32 KiB | 315 ms | 1,000 | 685.83 MiB | 1.14 GiB | 14.0 B | 38 ms |
-| 1,000,000 | 6.16 GiB | 6.38 KiB | 3.04 s | 1,000 | 6.16 GiB | 9.03 GiB | 14.0 B | 29 ms |
+| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | task time |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 85.02 MiB | 6.61 KiB | 3 ms | 1,000 | 88.83 MiB | 88.83 MiB | 33 ms |
+| 10,000 | 126.55 MiB | 6.43 KiB | 30 ms | 1,000 | 130.55 MiB | 166.55 MiB | 37 ms |
+| 100,000 | 680.95 MiB | 6.32 KiB | 315 ms | 1,000 | 685.83 MiB | 1.14 GiB | 38 ms |
+| 1,000,000 | 6.16 GiB | 6.38 KiB | 3.04 s | 1,000 | 6.16 GiB | 9.03 GiB | 29 ms |
 
 ## Feature flags
 

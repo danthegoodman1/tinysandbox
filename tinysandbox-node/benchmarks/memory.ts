@@ -27,9 +27,6 @@ interface Row {
   taskBytesPerSandbox: number
   taskExtrapolatedPeakRssBytes: number
   taskMs: number
-  taskVfsUsedBytesPerSandbox: number
-  taskVfsExtrapolatedUsedBytes: number
-  taskVfsFilesPerSandbox: number
 }
 
 async function main() {
@@ -115,17 +112,6 @@ async function runChild(count: number, taskSampleLimit: number): Promise<Row> {
   const taskExtrapolatedPeakRssBytes = activeRssBytes + Math.round(taskBytesPerSandbox * count)
   const taskMs = performance.now() - taskStarted
 
-  let taskVfsUsedBytes = 0
-  let taskVfsFiles = 0
-  for (let index = 0; index < taskSample; index += 1) {
-    const stats = await sandboxes[index].stats()
-    taskVfsUsedBytes += stats.vfs?.usedBytes ?? 0
-    taskVfsFiles += stats.vfs?.fileCount ?? 0
-  }
-  const taskVfsUsedBytesPerSandbox = perSandbox(taskVfsUsedBytes, taskSample)
-  const taskVfsFilesPerSandbox = perSandbox(taskVfsFiles, taskSample)
-  const taskVfsExtrapolatedUsedBytes = Math.round(taskVfsUsedBytesPerSandbox * count)
-
   return {
     count,
     baselineRssBytes,
@@ -139,10 +125,7 @@ async function runChild(count: number, taskSampleLimit: number): Promise<Row> {
     taskDeltaBytes,
     taskBytesPerSandbox,
     taskExtrapolatedPeakRssBytes,
-    taskMs,
-    taskVfsUsedBytesPerSandbox,
-    taskVfsExtrapolatedUsedBytes,
-    taskVfsFilesPerSandbox
+    taskMs
   }
 }
 
@@ -218,10 +201,10 @@ function perSandbox(bytes: number, count: number) {
 }
 
 function printTable(rows: Row[]) {
-  console.log('| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | VFS bytes / sandbox | task time |')
-  console.log('|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+  console.log('| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | task time |')
+  console.log('|---:|---:|---:|---:|---:|---:|---:|---:|')
   for (const row of rows) {
-    console.log(`| ${formatCount(row.count)} | ${formatBytes(row.activePeakRssBytes)} | ${formatBytes(Math.round(row.activeBytesPerSandbox))} | ${formatDurationMs(row.createMs)} | ${formatCount(row.taskSample)} | ${formatBytes(row.taskPeakRssBytes)} | ${formatBytes(row.taskExtrapolatedPeakRssBytes)} | ${row.taskVfsUsedBytesPerSandbox.toFixed(1)} B | ${formatDurationMs(row.taskMs)} |`)
+    console.log(`| ${formatCount(row.count)} | ${formatBytes(row.activePeakRssBytes)} | ${formatBytes(Math.round(row.activeBytesPerSandbox))} | ${formatDurationMs(row.createMs)} | ${formatCount(row.taskSample)} | ${formatBytes(row.taskPeakRssBytes)} | ${formatBytes(row.taskExtrapolatedPeakRssBytes)} | ${formatDurationMs(row.taskMs)} |`)
   }
 }
 

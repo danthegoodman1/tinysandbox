@@ -33,9 +33,6 @@ struct Row {
     task_bytes_per_sandbox: f64,
     task_extrapolated_peak_rss_bytes: u64,
     task_ms: u128,
-    task_vfs_used_bytes_per_sandbox: f64,
-    task_vfs_extrapolated_used_bytes: u64,
-    task_vfs_files_per_sandbox: f64,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -166,19 +163,6 @@ async fn run_child(count: usize, task_sample_limit: usize) -> Result<Row, String
         active_rss_bytes.saturating_add((task_bytes_per_sandbox * count as f64).round() as u64);
     let task_ms = task_started.elapsed().as_millis();
 
-    let mut task_vfs_used_bytes = 0_u64;
-    let mut task_vfs_files = 0_u64;
-    for sandbox in sandboxes.iter().take(task_sample) {
-        if let Some(stats) = sandbox.stats().vfs {
-            task_vfs_used_bytes = task_vfs_used_bytes.saturating_add(stats.used_bytes);
-            task_vfs_files = task_vfs_files.saturating_add(stats.file_count);
-        }
-    }
-    let task_vfs_used_bytes_per_sandbox = per_sandbox(task_vfs_used_bytes, task_sample);
-    let task_vfs_files_per_sandbox = per_sandbox(task_vfs_files, task_sample);
-    let task_vfs_extrapolated_used_bytes =
-        (task_vfs_used_bytes_per_sandbox * count as f64).round() as u64;
-
     Ok(Row {
         count,
         baseline_rss_bytes,
@@ -193,9 +177,6 @@ async fn run_child(count: usize, task_sample_limit: usize) -> Result<Row, String
         task_bytes_per_sandbox,
         task_extrapolated_peak_rss_bytes,
         task_ms,
-        task_vfs_used_bytes_per_sandbox,
-        task_vfs_extrapolated_used_bytes,
-        task_vfs_files_per_sandbox,
     })
 }
 
@@ -319,12 +300,12 @@ fn per_sandbox(bytes: u64, count: usize) -> f64 {
 
 fn print_table(rows: &[Row]) {
     println!(
-        "| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | VFS bytes / sandbox | task time |"
+        "| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | task time |"
     );
-    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|");
     for row in rows {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {:.1} B | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
             format_count(row.count),
             format_bytes(row.active_peak_rss_bytes),
             format_bytes(row.active_bytes_per_sandbox.round() as u64),
@@ -332,7 +313,6 @@ fn print_table(rows: &[Row]) {
             format_count(row.task_sample),
             format_bytes(row.task_peak_rss_bytes),
             format_bytes(row.task_extrapolated_peak_rss_bytes),
-            row.task_vfs_used_bytes_per_sandbox,
             format_duration_ms(row.task_ms),
         );
     }
