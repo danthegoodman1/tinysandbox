@@ -34,6 +34,7 @@ assert_eq!(result.stdout, "1\n");
 - [Bring your own VFS](#bring-your-own-vfs)
 - [Limits and observability](#limits-and-observability)
 - [Security model](#security-model)
+- [Comparison with just-bash](#comparison-with-just-bash)
 - [Feature flags](#feature-flags)
 - [Examples](#examples)
 - [Roadmap](#roadmap)
@@ -277,6 +278,32 @@ reports VFS usage and total commands run.
 tinysandbox is one layer, not the whole story: for hostile multi-tenant
 workloads you should still run your process under OS-level defense in depth
 (non-root, seccomp/cgroups, or a microVM) appropriate to your threat model.
+
+## Comparison with just-bash
+
+[just-bash](https://github.com/vercel-labs/just-bash) is the closest
+neighbor: a TypeScript simulated bash with a virtual filesystem, also built
+for agents. Both give an agent a familiar shell without a container or VM,
+but the designs differ in ways that matter:
+
+- **Random file reads and writes.** The tinysandbox VFS is handle-and-offset
+  based (`open`, `read_at`, `write_at`), and the JS runtime exposes the
+  matching fd APIs (`fs.openSync` / `readSync` / `writeSync` with explicit
+  positions). just-bash's filesystem interface is whole-file: reading one
+  byte means materializing the entire file in memory, and a command's output
+  is fully buffered before it can be written back. In tinysandbox, a VFS
+  backed by object storage or a database can serve TB-scale files while the
+  sandbox only touches the KBs actually read.
+- **Agent code always runs in WebAssembly.** In tinysandbox, the only thing
+  that executes agent-authored code is the capability-free QuickJS wasm
+  guest, with hard memory and CPU limits enforced by Wasmtime. just-bash
+  interprets the shell and its commands in the host JavaScript engine and
+  relies on language-level hardening against engine breakouts.
+- **Host language.** tinysandbox is a Rust crate (Node.js bindings are on
+  the roadmap); just-bash is TypeScript and runs in Node or the browser. If
+  your stack is JS-only today, just-bash is the natural pick; if you want
+  native performance, a typed VFS trait, or to embed in a Rust service,
+  that's tinysandbox.
 
 ## Feature flags
 
