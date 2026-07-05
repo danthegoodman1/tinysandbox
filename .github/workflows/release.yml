@@ -101,6 +101,7 @@ jobs:
       - name: Commit and push release version
         if: steps.eligibility.outputs.release == 'true'
         run: |
+          set -euo pipefail
           git diff --check
           if git diff --quiet; then
             echo "No release version changes to commit"
@@ -108,6 +109,14 @@ jobs:
           fi
           git add Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json
           git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip release]"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main advanced before the release commit could be pushed; rebasing release commit (attempt ${attempt})"
+            git fetch origin main
+            git rebase origin/main
+          done
           git push origin HEAD:main
 
       - name: Record release source
