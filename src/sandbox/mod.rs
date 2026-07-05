@@ -49,10 +49,14 @@ pub use command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult, Limits,
 };
 #[cfg(feature = "js")]
-pub use syscall::{Syscall, SyscallError, SyscallFuture};
+pub use syscall::{
+    Fetch, FetchFuture, FetchRequest, FetchResponse, Syscall, SyscallError, SyscallFuture,
+};
 
 const PIPE_CAPACITY_BYTES: usize = STREAM_CHUNK_BYTES;
 const TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
+#[cfg(feature = "js")]
+const RESERVED_FETCH_SYSCALL: &str = "fetch";
 
 /// Result of a sandbox `exec` call.
 #[derive(Debug, Clone)]
@@ -113,6 +117,8 @@ pub struct Sandbox {
     #[cfg(feature = "js")]
     syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
     #[cfg(feature = "js")]
+    fetch: Option<Arc<dyn Fetch>>,
+    #[cfg(feature = "js")]
     js_prelude: Arc<str>,
     limits: Limits,
     session: Mutex<Session>,
@@ -126,6 +132,8 @@ pub struct SandboxBuilder {
     commands: BTreeMap<String, Arc<dyn Command>>,
     #[cfg(feature = "js")]
     syscalls: Vec<(String, Arc<dyn Syscall>)>,
+    #[cfg(feature = "js")]
+    fetch: Option<Arc<dyn Fetch>>,
     #[cfg(feature = "js")]
     js_prelude: Option<String>,
     limits: Limits,
@@ -460,6 +468,8 @@ impl Sandbox {
                 #[cfg(feature = "js")]
                 js_syscalls: Arc::clone(&self.syscalls),
                 #[cfg(feature = "js")]
+                js_fetch: self.fetch.clone(),
+                #[cfg(feature = "js")]
                 js_prelude: Arc::clone(&self.js_prelude),
                 counts_command: true,
                 kind: StageKind::Command,
@@ -530,6 +540,8 @@ impl Sandbox {
                     #[cfg(feature = "js")]
                     js_syscalls: Arc::clone(&self.syscalls),
                     #[cfg(feature = "js")]
+                    js_fetch: self.fetch.clone(),
+                    #[cfg(feature = "js")]
                     js_prelude: Arc::clone(&self.js_prelude),
                     counts_command: !words.is_empty(),
                     kind: StageKind::Failed {
@@ -563,6 +575,8 @@ impl Sandbox {
             commands: Arc::clone(&self.command_names),
             #[cfg(feature = "js")]
             js_syscalls: Arc::clone(&self.syscalls),
+            #[cfg(feature = "js")]
+            js_fetch: self.fetch.clone(),
             #[cfg(feature = "js")]
             js_prelude: Arc::clone(&self.js_prelude),
             counts_command: matches!(kind, StageKind::Command),
@@ -780,6 +794,8 @@ impl SandboxBuilder {
             #[cfg(feature = "js")]
             syscalls: Vec::new(),
             #[cfg(feature = "js")]
+            fetch: None,
+            #[cfg(feature = "js")]
             js_prelude: None,
             limits: Limits::default(),
             cwd: "/".to_owned(),
@@ -828,6 +844,17 @@ impl SandboxBuilder {
         Fut: Future<Output = Result<serde_json::Value, SyscallError>> + Send + 'static,
     {
         self.syscalls.push((name.into(), Arc::new(syscall)));
+        self
+    }
+
+    /// Registers the host transport backing sandboxed JavaScript `fetch`.
+    #[cfg(feature = "js")]
+    pub fn fetch<F, Fut>(mut self, fetch: F) -> Self
+    where
+        F: Fn(FetchRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<FetchResponse, SyscallError>> + Send + 'static,
+    {
+        self.fetch = Some(Arc::new(fetch));
         self
     }
 
@@ -881,6 +908,8 @@ impl SandboxBuilder {
             command_names,
             #[cfg(feature = "js")]
             syscalls,
+            #[cfg(feature = "js")]
+            fetch: self.fetch,
             #[cfg(feature = "js")]
             js_prelude,
             limits: self.limits,
@@ -1216,6 +1245,8 @@ struct PreparedStage {
     #[cfg(feature = "js")]
     js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
     #[cfg(feature = "js")]
+    js_fetch: Option<Arc<dyn Fetch>>,
+    #[cfg(feature = "js")]
     js_prelude: Arc<str>,
     counts_command: bool,
     kind: StageKind,
@@ -1548,6 +1579,8 @@ async fn run_registered_stage(
             commands: stage.commands,
             #[cfg(feature = "js")]
             js_syscalls: stage.js_syscalls,
+            #[cfg(feature = "js")]
+            js_fetch: stage.js_fetch,
             #[cfg(feature = "js")]
             js_prelude: stage.js_prelude,
         };
@@ -1885,6 +1918,11 @@ fn build_syscall_registry(
         if !is_js_syscall_name(&name) {
             panic!(
                 "SandboxBuilder::syscall cannot register invalid name '{name}'; names must match [A-Za-z_][A-Za-z0-9_]*"
+            );
+        }
+        if name == RESERVED_FETCH_SYSCALL {
+            panic!(
+                "SandboxBuilder::syscall cannot register reserved name 'fetch'; use SandboxBuilder::fetch to provide globalThis.fetch"
             );
         }
         if syscalls.insert(name.clone(), syscall).is_some() {

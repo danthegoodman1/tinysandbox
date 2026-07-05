@@ -1,12 +1,20 @@
 //! Wasmtime-hosted QuickJS command.
 //!
 //! The supported Node `fs` subset intentionally omits `statSync` timestamp,
-//! inode, uid, and gid fields until the VFS exposes them. JS execution uses the
-//! sandbox wall-clock budget, but timeout handling returns a clean 124 result
-//! and discards buffered JS stdout/stderr instead of returning partial output.
-//! Module stack traces still reflect QuickJS details: wrapper prefixes leave a
-//! line-1 column offset, method frames are named like `at boom`, and visible
-//! `<tinysandbox>` glue frames can appear below user frames.
+//! inode, uid, and gid fields until the VFS exposes them. Scripts still execute
+//! as CommonJS wrappers, so top-level `await` is a syntax error; already-settled
+//! promise chains and `await` inside async functions are drained before exit.
+//! The guest also receives `fetch`, `Headers`, and `Response` globals backed by
+//! an embedder-provided fetch handler. This is a WHATWG subset: there is no
+//! `Request` class, streams, `AbortController`, redirects, or full header
+//! mutator/iterator surface; header names are normalized without validation;
+//! direct `Response` construction synthesizes a default reason phrase for
+//! `statusText`; and tinysandbox accepts a non-standard `Response` `url` init.
+//! JS execution uses the sandbox wall-clock budget, but timeout handling returns
+//! a clean 124 result and discards buffered JS stdout/stderr instead of returning
+//! partial output. Module stack traces still reflect QuickJS details: wrapper
+//! prefixes leave a line-1 column offset, method frames are named like `at boom`,
+//! and visible `<tinysandbox>` glue frames can appear below user frames.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -15,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use wasmtime::{
@@ -25,7 +33,7 @@ use wasmtime::{
 
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
 use crate::sandbox::fs::{Fs, join_path};
-use crate::sandbox::syscall::{Syscall, SyscallError};
+use crate::sandbox::syscall::{Fetch, FetchRequest, FetchResponse, Syscall, SyscallError};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
@@ -50,6 +58,7 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
             fs,
             limits,
             js_syscalls,
+            js_fetch,
             js_prelude,
             ..
         } = ctx;
@@ -70,8 +79,10 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
                 cwd,
                 fs,
                 js_syscalls,
+                js_fetch,
                 js_prelude,
                 limits.wasm_memory_bytes,
+                limits.fetch_response_bytes,
                 limits.wall_time,
                 syscall_runtime,
             )
@@ -99,8 +110,10 @@ fn run_quickjs_on_host_stack(
     cwd: String,
     fs: Fs,
     syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    fetch: Option<Arc<dyn Fetch>>,
     js_prelude: Arc<str>,
     wasm_memory_bytes: usize,
+    fetch_response_bytes: usize,
     wall_time: Duration,
     syscall_runtime: tokio::runtime::Handle,
 ) -> JsRunResult {
@@ -114,8 +127,10 @@ fn run_quickjs_on_host_stack(
                 cwd,
                 fs,
                 syscalls,
+                fetch,
                 js_prelude,
                 wasm_memory_bytes,
+                fetch_response_bytes,
                 wall_time,
                 syscall_runtime,
             )
@@ -205,8 +220,10 @@ fn run_quickjs(
     cwd: String,
     fs: Fs,
     syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    fetch: Option<Arc<dyn Fetch>>,
     js_prelude: Arc<str>,
     wasm_memory_bytes: usize,
+    fetch_response_bytes: usize,
     wall_time: Duration,
     syscall_runtime: tokio::runtime::Handle,
 ) -> JsRunResult {
@@ -216,8 +233,10 @@ fn run_quickjs(
         cwd,
         fs,
         syscalls,
+        fetch,
         js_prelude,
         wasm_memory_bytes,
+        fetch_response_bytes,
         wall_time,
         syscall_runtime,
     ) {
@@ -243,8 +262,10 @@ fn run_quickjs_inner(
     cwd: String,
     fs: Fs,
     syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    fetch: Option<Arc<dyn Fetch>>,
     js_prelude: Arc<str>,
     wasm_memory_bytes: usize,
+    fetch_response_bytes: usize,
     wall_time: Duration,
     syscall_runtime: tokio::runtime::Handle,
 ) -> wasmtime::Result<JsRunResult> {
@@ -259,7 +280,9 @@ fn run_quickjs_inner(
             runtime,
             syscall_runtime,
             syscalls,
+            fetch,
             wasm_memory_bytes,
+            fetch_response_bytes,
             wall_time,
         ),
     );
@@ -375,12 +398,14 @@ struct HostState {
     runtime: tokio::runtime::Runtime,
     syscall_runtime: tokio::runtime::Handle,
     syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    fetch: Option<Arc<dyn Fetch>>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     response: Vec<u8>,
     fds: BTreeMap<i32, OpenFile>,
     next_fd: i32,
     limiter: WasmLimiter,
+    fetch_response_bytes: usize,
     rng: u64,
     started: Instant,
     wall_time: Duration,
@@ -392,7 +417,9 @@ impl HostState {
         runtime: tokio::runtime::Runtime,
         syscall_runtime: tokio::runtime::Handle,
         syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+        fetch: Option<Arc<dyn Fetch>>,
         memory_limit: usize,
+        fetch_response_bytes: usize,
         wall_time: Duration,
     ) -> Self {
         Self {
@@ -400,12 +427,14 @@ impl HostState {
             runtime,
             syscall_runtime,
             syscalls,
+            fetch,
             stdout: Vec::new(),
             stderr: Vec::new(),
             response: Vec::new(),
             fds: BTreeMap::new(),
             next_fd: 3,
             limiter: WasmLimiter::new(memory_limit),
+            fetch_response_bytes,
             rng: 0x7468_696e_626f_7821,
             started: Instant::now(),
             wall_time,
@@ -419,6 +448,20 @@ impl HostState {
     fn remaining_wall_time(&self) -> Duration {
         self.wall_time.saturating_sub(self.started.elapsed())
     }
+}
+
+fn block_on_host_timeout<F, T>(
+    state: &HostState,
+    future: F,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    // Fire before the outer command deadline so the guest can observe the host-call error.
+    let remaining = state.remaining_wall_time().saturating_sub(EPOCH_TICK * 2);
+    state
+        .syscall_runtime
+        .block_on(async move { tokio::time::timeout(remaining, future).await })
 }
 
 #[derive(Clone)]
@@ -780,12 +823,74 @@ fn handle_host_call(state: &mut HostState, op: &str, args: Value) -> HostRespons
             Ok(value) => HostResponse::value(value),
             Err(err) => HostResponse::error(SyscallHostError::from(err)),
         }
+    } else if op == "fetch" {
+        match handle_fetch(state, &args) {
+            Ok(value) => HostResponse::value(value),
+            Err(err) => HostResponse::error(SyscallHostError::from(err)),
+        }
     } else {
         match handle_host_call_result(state, op, &args) {
             Ok(value) => HostResponse::value(value),
             Err(err) => HostResponse::error(err),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct FetchHostRequest {
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FetchHostResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+fn handle_fetch(state: &mut HostState, args: &Value) -> Result<Value, SyscallError> {
+    let fetch = state.fetch.clone().ok_or_else(|| {
+        SyscallError::new("network is not available in this sandbox: no fetch handler registered")
+    })?;
+    let payload: FetchHostRequest = serde_json::from_value(args.clone())
+        .map_err(|err| SyscallError::new(format!("invalid fetch request: {err}")))?;
+    let body = payload
+        .body
+        .as_deref()
+        .map(|body| {
+            BASE64_STANDARD
+                .decode(body)
+                .map_err(|_| SyscallError::new("invalid fetch request body encoding"))
+        })
+        .transpose()?;
+    let request = FetchRequest {
+        url: payload.url,
+        method: payload.method,
+        headers: payload.headers,
+        body,
+    };
+    let response = match block_on_host_timeout(state, fetch.fetch(request)) {
+        Ok(result) => result?,
+        Err(_) => return Err(SyscallError::new("fetch timed out")),
+    };
+    if response.body.len() > state.fetch_response_bytes {
+        return Err(SyscallError::new(format!(
+            "fetch response body exceeded limit of {} bytes",
+            state.fetch_response_bytes
+        )));
+    }
+    fetch_response_json(response).map_err(|err| SyscallError::new(err.to_string()))
+}
+
+fn fetch_response_json(response: FetchResponse) -> serde_json::Result<Value> {
+    serde_json::to_value(FetchHostResponse {
+        status: response.status,
+        headers: response.headers,
+        body: base64_encode(&response.body),
+    })
 }
 
 fn handle_syscall(state: &mut HostState, args: &Value) -> Result<Value, SyscallError> {
@@ -799,13 +904,7 @@ fn handle_syscall(state: &mut HostState, args: &Value) -> Result<Value, SyscallE
         .cloned()
         .ok_or_else(|| SyscallError::new(format!("unknown syscall '{name}'")))?;
     let payload = args.get("args").cloned().unwrap_or(Value::Null);
-    // Fire before the outer command deadline so the guest can observe the syscall error.
-    let remaining = state.remaining_wall_time().saturating_sub(EPOCH_TICK * 2);
-    let future = syscall.call(payload);
-    match state
-        .syscall_runtime
-        .block_on(async move { tokio::time::timeout(remaining, future).await })
-    {
+    match block_on_host_timeout(state, syscall.call(payload)) {
         Ok(result) => result,
         Err(_) => Err(SyscallError::new(format!("syscall '{name}' timed out"))),
     }

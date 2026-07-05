@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::fs::Fs;
 #[cfg(feature = "js")]
-use super::syscall::Syscall;
+use super::syscall::{Fetch, Syscall};
 
 /// Future returned by sandbox commands.
 pub type CommandFuture = Pin<Box<dyn Future<Output = CommandResult> + Send>>;
@@ -58,6 +58,9 @@ pub struct CommandContext {
     /// JavaScript syscalls registered on the sandbox.
     #[cfg(feature = "js")]
     pub js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    /// JavaScript fetch handler registered on the sandbox.
+    #[cfg(feature = "js")]
+    pub js_fetch: Option<Arc<dyn Fetch>>,
     /// JavaScript prelude evaluated before each user script.
     #[cfg(feature = "js")]
     pub js_prelude: Arc<str>,
@@ -113,6 +116,8 @@ pub struct Limits {
     pub sort_input_bytes: usize,
     /// Maximum WebAssembly memory for JS commands.
     pub wasm_memory_bytes: usize,
+    /// Maximum bytes accepted from a JavaScript fetch response body.
+    pub fetch_response_bytes: usize,
 }
 
 impl Default for Limits {
@@ -124,6 +129,7 @@ impl Default for Limits {
             max_commands: 1024,
             sort_input_bytes: 8 * 1024 * 1024,
             wasm_memory_bytes: 64 * 1024 * 1024,
+            fetch_response_bytes: 32 * 1024 * 1024,
         }
     }
 }

@@ -7,6 +7,32 @@ use serde_json::Value;
 
 /// Future returned by sandbox syscalls.
 pub type SyscallFuture = Pin<Box<dyn Future<Output = Result<Value, SyscallError>> + Send>>;
+/// Future returned by sandbox fetch handlers.
+pub type FetchFuture = Pin<Box<dyn Future<Output = Result<FetchResponse, SyscallError>> + Send>>;
+
+/// Request passed to an embedder-provided JavaScript `fetch` handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchRequest {
+    /// Absolute or relative URL string supplied by the guest.
+    pub url: String,
+    /// HTTP method normalized by the guest fetch glue.
+    pub method: String,
+    /// Request headers as normalized `(name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// Optional request body bytes.
+    pub body: Option<Vec<u8>>,
+}
+
+/// Response returned by an embedder-provided JavaScript `fetch` handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response headers as `(name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// Response body bytes.
+    pub body: Vec<u8>,
+}
 
 /// Host syscall implementation callable from sandboxed JavaScript.
 pub trait Syscall: Send + Sync {
@@ -21,6 +47,22 @@ where
 {
     fn call(&self, args: Value) -> SyscallFuture {
         Box::pin(self(args))
+    }
+}
+
+/// Host transport implementation backing sandboxed JavaScript `fetch`.
+pub trait Fetch: Send + Sync {
+    /// Runs the fetch handler with the guest-provided request.
+    fn fetch(&self, request: FetchRequest) -> FetchFuture;
+}
+
+impl<F, Fut> Fetch for F
+where
+    F: Fn(FetchRequest) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<FetchResponse, SyscallError>> + Send + 'static,
+{
+    fn fetch(&self, request: FetchRequest) -> FetchFuture {
+        Box::pin(self(request))
     }
 }
 

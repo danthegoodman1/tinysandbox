@@ -185,6 +185,158 @@ static const char TINYSANDBOX_GLUE[] =
 "    if (enc !== 'utf8') throw new TypeError(`Unsupported encoding: ${encoding}`)\n"
 "    return utf8Encode(value)\n"
 "  }\n"
+"  function headerName(name) { return String(name).toLowerCase() }\n"
+"  function headerValue(value) { return String(value).trim() }\n"
+"  class Headers {\n"
+"    constructor(init) {\n"
+"      this._values = Object.create(null)\n"
+"      this._names = []\n"
+"      if (init === undefined || init === null) return\n"
+"      if (init instanceof Headers) {\n"
+"        init.forEach((value, name) => this.append(name, value))\n"
+"      } else if (Array.isArray(init)) {\n"
+"        for (const pair of init) {\n"
+"          if (!pair || pair.length < 2) throw new TypeError('Headers constructor: expected name/value pairs')\n"
+"          this.append(pair[0], pair[1])\n"
+"        }\n"
+"      } else if (typeof init === 'object') {\n"
+"        for (const name of Object.keys(init)) this.append(name, init[name])\n"
+"      } else {\n"
+"        throw new TypeError('Headers constructor: unsupported initializer')\n"
+"      }\n"
+"    }\n"
+"    append(name, value) {\n"
+"      const key = headerName(name)\n"
+"      const text = headerValue(value)\n"
+"      if (Object.prototype.hasOwnProperty.call(this._values, key)) this._values[key] += `, ${text}`\n"
+"      else { this._values[key] = text; this._names.push(key); this._names.sort() }\n"
+"    }\n"
+"    get(name) {\n"
+"      const key = headerName(name)\n"
+"      return Object.prototype.hasOwnProperty.call(this._values, key) ? this._values[key] : null\n"
+"    }\n"
+"    has(name) { return Object.prototype.hasOwnProperty.call(this._values, headerName(name)) }\n"
+"    forEach(callback, thisArg) {\n"
+"      for (const name of this._names) callback.call(thisArg, this._values[name], name, this)\n"
+"    }\n"
+"    entries() { return this._names.map(name => [name, this._values[name]])[Symbol.iterator]() }\n"
+"    [Symbol.iterator]() { return this.entries() }\n"
+"  }\n"
+"  function headersToPairs(headers) {\n"
+"    const out = []\n"
+"    headers.forEach((value, name) => out.push([name, value]))\n"
+"    return out\n"
+"  }\n"
+"  function normalizeFetchBody(body) {\n"
+"    if (body === undefined || body === null) return null\n"
+"    if (typeof body === 'string') return bytesFrom(body, 'utf8')\n"
+"    if (body instanceof Uint8Array || body instanceof ArrayBuffer) return bytesFrom(body)\n"
+"    throw new TypeError('fetch body must be a string, Uint8Array, or ArrayBuffer in tinysandbox')\n"
+"  }\n"
+"  function normalizeFetchRequest(input, init) {\n"
+"    init = init === undefined || init === null ? {} : Object(init)\n"
+"    if (init.signal !== undefined && init.signal !== null) throw new TypeError('AbortSignal is not supported in tinysandbox fetch')\n"
+"    const method = init.method === undefined ? 'GET' : String(init.method).toUpperCase()\n"
+"    const body = normalizeFetchBody(init.body)\n"
+"    if ((method === 'GET' || method === 'HEAD') && body !== null) throw new TypeError('Request with GET/HEAD method cannot have body.')\n"
+"    return { url: String(input), method, headers: headersToPairs(new Headers(init.headers)), body: body === null ? null : base64Encode(body) }\n"
+"  }\n"
+"  function fetchFailed(error) {\n"
+"    const err = new TypeError('fetch failed')\n"
+"    const cause = new Error(error && error.message ? error.message : 'fetch failed')\n"
+"    if (error && error.code !== undefined) cause.code = error.code\n"
+"    err.cause = cause\n"
+"    return err\n"
+"  }\n"
+"  function callFetch(request) {\n"
+"    const response = hostCall('fetch', JSON.stringify(request))\n"
+"    if (response && response.error) throw fetchFailed(response.error)\n"
+"    return response ? response.value : undefined\n"
+"  }\n"
+"  function reasonPhrase(status) {\n"
+"    switch (Number(status)) {\n"
+"      case 100: return 'Continue'\n"
+"      case 101: return 'Switching Protocols'\n"
+"      case 102: return 'Processing'\n"
+"      case 200: return 'OK'\n"
+"      case 201: return 'Created'\n"
+"      case 202: return 'Accepted'\n"
+"      case 203: return 'Non-Authoritative Information'\n"
+"      case 204: return 'No Content'\n"
+"      case 205: return 'Reset Content'\n"
+"      case 206: return 'Partial Content'\n"
+"      case 300: return 'Multiple Choices'\n"
+"      case 301: return 'Moved Permanently'\n"
+"      case 302: return 'Found'\n"
+"      case 303: return 'See Other'\n"
+"      case 304: return 'Not Modified'\n"
+"      case 307: return 'Temporary Redirect'\n"
+"      case 308: return 'Permanent Redirect'\n"
+"      case 400: return 'Bad Request'\n"
+"      case 401: return 'Unauthorized'\n"
+"      case 403: return 'Forbidden'\n"
+"      case 404: return 'Not Found'\n"
+"      case 405: return 'Method Not Allowed'\n"
+"      case 408: return 'Request Timeout'\n"
+"      case 409: return 'Conflict'\n"
+"      case 410: return 'Gone'\n"
+"      case 418: return \"I'm a Teapot\"\n"
+"      case 429: return 'Too Many Requests'\n"
+"      case 500: return 'Internal Server Error'\n"
+"      case 501: return 'Not Implemented'\n"
+"      case 502: return 'Bad Gateway'\n"
+"      case 503: return 'Service Unavailable'\n"
+"      case 504: return 'Gateway Timeout'\n"
+"      default: return ''\n"
+"    }\n"
+"  }\n"
+"  function bodyUnusableError() { return new TypeError('Body is unusable: Body has already been read') }\n"
+"  function bytesToArrayBuffer(bytes) {\n"
+"    const out = new ArrayBuffer(bytes.length)\n"
+"    new Uint8Array(out).set(bytes)\n"
+"    return out\n"
+"  }\n"
+"  class Response {\n"
+"    constructor(body, init) {\n"
+"      init = init || {}\n"
+"      const status = init.status === undefined ? 200 : Number(init.status)\n"
+"      this.status = status\n"
+"      this.statusText = init.statusText === undefined ? reasonPhrase(status) : String(init.statusText)\n"
+"      this.ok = status >= 200 && status <= 299\n"
+"      this.url = init.url === undefined ? '' : String(init.url)\n"
+"      this.headers = new Headers(init.headers)\n"
+"      this.redirected = false\n"
+"      this._body = normalizeFetchBody(body) || new Uint8Array()\n"
+"      this._bodyUsed = false\n"
+"    }\n"
+"    get bodyUsed() { return this._bodyUsed }\n"
+"    _consume() {\n"
+"      if (this._bodyUsed) throw bodyUnusableError()\n"
+"      this._bodyUsed = true\n"
+"      return this._body\n"
+"    }\n"
+"    text() {\n"
+"      try { return Promise.resolve(utf8Decode(this._consume())) }\n"
+"      catch (err) { return Promise.reject(err) }\n"
+"    }\n"
+"    json() {\n"
+"      try { return Promise.resolve(JSON.parse(utf8Decode(this._consume()))) }\n"
+"      catch (err) { return Promise.reject(err) }\n"
+"    }\n"
+"    arrayBuffer() {\n"
+"      try { return Promise.resolve(bytesToArrayBuffer(this._consume())) }\n"
+"      catch (err) { return Promise.reject(err) }\n"
+"    }\n"
+"  }\n"
+"  function fetch(input, init) {\n"
+"    try {\n"
+"      const request = normalizeFetchRequest(input, init)\n"
+"      const value = callFetch(request)\n"
+"      return Promise.resolve(new Response(base64Decode(value.body || ''), { status: value.status, headers: value.headers, url: request.url }))\n"
+"    } catch (err) {\n"
+"      return Promise.reject(err)\n"
+"    }\n"
+"  }\n"
 "  function encodingFrom(options) {\n"
 "    if (typeof options === 'string') return normalizeEncoding(options)\n"
 "    if (options && typeof options.encoding === 'string') return normalizeEncoding(options.encoding)\n"
@@ -462,6 +614,9 @@ static const char TINYSANDBOX_GLUE[] =
 "  }\n"
 "  function line(args) { return format(args) + '\\n' }\n"
 "  globalThis.Buffer = Buffer\n"
+"  globalThis.Headers = Headers\n"
+"  globalThis.Response = Response\n"
+"  globalThis.fetch = fetch\n"
 "  globalThis.console = { log: (...args) => writeStdout(line(args)), info: (...args) => writeStdout(line(args)), error: (...args) => writeStderr(line(args)), warn: (...args) => writeStderr(line(args)) }\n"
 "  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => exit(code === undefined ? 0 : Number(code) || 0) }\n"
 "  return runMain\n"
@@ -608,6 +763,75 @@ static void set_function(JSContext *ctx, const char *name, JSCFunction *func, in
     JS_FreeValue(ctx, global);
 }
 
+typedef struct UnhandledRejection {
+    JSValue promise;
+    JSValue reason;
+    struct UnhandledRejection *next;
+} UnhandledRejection;
+
+typedef struct {
+    UnhandledRejection *head;
+    UnhandledRejection *tail;
+} UnhandledRejectionState;
+
+static void free_unhandled_rejection(JSContext *ctx, UnhandledRejection *entry)
+{
+    JS_FreeValue(ctx, entry->promise);
+    JS_FreeValue(ctx, entry->reason);
+    free(entry);
+}
+
+static void clear_unhandled_rejections(JSContext *ctx, UnhandledRejectionState *state)
+{
+    UnhandledRejection *entry = state->head;
+    while (entry) {
+        UnhandledRejection *next = entry->next;
+        free_unhandled_rejection(ctx, entry);
+        entry = next;
+    }
+    state->head = NULL;
+    state->tail = NULL;
+}
+
+static void promise_rejection_tracker(JSContext *ctx, JSValueConst promise, JSValueConst reason, bool is_handled, void *opaque)
+{
+    UnhandledRejectionState *state = (UnhandledRejectionState *)opaque;
+    if (is_handled) {
+        UnhandledRejection *previous = NULL;
+        UnhandledRejection *entry = state->head;
+        while (entry) {
+            if (JS_VALUE_GET_PTR(entry->promise) == JS_VALUE_GET_PTR(promise)) {
+                if (previous) {
+                    previous->next = entry->next;
+                } else {
+                    state->head = entry->next;
+                }
+                if (state->tail == entry) {
+                    state->tail = previous;
+                }
+                free_unhandled_rejection(ctx, entry);
+                break;
+            }
+            previous = entry;
+            entry = entry->next;
+        }
+        return;
+    }
+    UnhandledRejection *entry = malloc(sizeof(*entry));
+    if (!entry) {
+        return;
+    }
+    entry->promise = JS_DupValue(ctx, promise);
+    entry->reason = JS_DupValue(ctx, reason);
+    entry->next = NULL;
+    if (state->tail) {
+        state->tail->next = entry;
+    } else {
+        state->head = entry;
+    }
+    state->tail = entry;
+}
+
 static int32_t exit_code_from_exception(JSContext *ctx, JSValueConst exception, int *is_exit)
 {
     JSValue marker = JS_GetPropertyStr(ctx, exception, "__tinysandboxExit");
@@ -674,6 +898,16 @@ static void write_exception(JSContext *ctx, JSValueConst exception)
     }
 }
 
+static int32_t handle_exception(JSContext *ctx, JSValueConst exception)
+{
+    int is_exit = 0;
+    int32_t code = exit_code_from_exception(ctx, exception, &is_exit);
+    if (!is_exit) {
+        write_exception(ctx, exception);
+    }
+    return code;
+}
+
 static int32_t handle_eval_result(JSContext *ctx, JSValue value)
 {
     if (!JS_IsException(value)) {
@@ -682,14 +916,32 @@ static int32_t handle_eval_result(JSContext *ctx, JSValue value)
     }
 
     JSValue exception = JS_GetException(ctx);
-    int is_exit = 0;
-    int32_t code = exit_code_from_exception(ctx, exception, &is_exit);
-    if (!is_exit) {
-        write_exception(ctx, exception);
-    }
+    int32_t code = handle_exception(ctx, exception);
     JS_FreeValue(ctx, exception);
     JS_FreeValue(ctx, value);
     return code;
+}
+
+static int32_t drain_pending_jobs(JSRuntime *rt, JSContext *ctx, UnhandledRejectionState *rejections)
+{
+    JSContext *job_ctx = NULL;
+    int err = 0;
+    while ((err = JS_ExecutePendingJob(rt, &job_ctx)) > 0) {
+    }
+    if (err < 0) {
+        JSContext *exception_ctx = job_ctx ? job_ctx : ctx;
+        JSValue exception = JS_GetException(exception_ctx);
+        int32_t code = handle_exception(exception_ctx, exception);
+        JS_FreeValue(exception_ctx, exception);
+        clear_unhandled_rejections(ctx, rejections);
+        return code;
+    }
+    if (rejections->head) {
+        write_exception(ctx, rejections->head->reason);
+        clear_unhandled_rejections(ctx, rejections);
+        return 1;
+    }
+    return 0;
 }
 
 __attribute__((export_name("tinysandbox_run")))
@@ -702,6 +954,8 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
     }
     JS_SetMaxStackSize(rt, TINYSANDBOX_QUICKJS_STACK_SIZE);
     JS_UpdateStackTop(rt);
+    UnhandledRejectionState rejections = { NULL, NULL };
+    JS_SetHostPromiseRejectionTracker(rt, promise_rejection_tracker, &rejections);
 
     JSContext *ctx = JS_NewContext(rt);
     if (!ctx) {
@@ -719,6 +973,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
     JSValue config = JS_ParseJSON(ctx, (const char *)input, (size_t)input_len, "<tinysandbox-config>");
     if (JS_IsException(config)) {
         int32_t code = handle_eval_result(ctx, config);
+        clear_unhandled_rejections(ctx, &rejections);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
         return code;
@@ -731,6 +986,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
     JSValue run_main = JS_Eval(ctx, TINYSANDBOX_GLUE, strlen(TINYSANDBOX_GLUE), "<tinysandbox>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(run_main)) {
         int32_t code = handle_eval_result(ctx, run_main);
+        clear_unhandled_rejections(ctx, &rejections);
         JS_FreeValue(ctx, config);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
@@ -744,6 +1000,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
         JS_FreeValue(ctx, prelude_value);
         JS_FreeValue(ctx, run_main);
         JS_FreeValue(ctx, config);
+        clear_unhandled_rejections(ctx, &rejections);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
         tb_write_stderr((const uint8_t *)"quickjs: invalid prelude config\n", 32);
@@ -751,11 +1008,15 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
     }
     if (prelude_len > 0) {
         int32_t code = handle_eval_result(ctx, JS_Eval(ctx, prelude, prelude_len, "<prelude>", JS_EVAL_TYPE_GLOBAL));
+        if (code == 0) {
+            code = drain_pending_jobs(rt, ctx, &rejections);
+        }
         if (code != 0) {
             JS_FreeCString(ctx, prelude);
             JS_FreeValue(ctx, prelude_value);
             JS_FreeValue(ctx, run_main);
             JS_FreeValue(ctx, config);
+            clear_unhandled_rejections(ctx, &rejections);
             JS_FreeContext(ctx);
             JS_FreeRuntime(rt);
             return code;
@@ -780,6 +1041,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
         JS_FreeValue(ctx, path_value);
         JS_FreeValue(ctx, run_main);
         JS_FreeValue(ctx, config);
+        clear_unhandled_rejections(ctx, &rejections);
         JS_FreeContext(ctx);
         JS_FreeRuntime(rt);
         tb_write_stderr((const uint8_t *)"quickjs: invalid script config\n", 31);
@@ -791,6 +1053,9 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
         JS_NewString(ctx, script_path),
     };
     int32_t code = handle_eval_result(ctx, JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args));
+    if (code == 0) {
+        code = drain_pending_jobs(rt, ctx, &rejections);
+    }
     JS_FreeValue(ctx, run_args[0]);
     JS_FreeValue(ctx, run_args[1]);
     JS_FreeValue(ctx, run_main);
@@ -799,6 +1064,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
     JS_FreeValue(ctx, source_value);
     JS_FreeValue(ctx, path_value);
     JS_FreeValue(ctx, config);
+    clear_unhandled_rejections(ctx, &rejections);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return code;

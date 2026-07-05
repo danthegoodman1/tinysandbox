@@ -2,11 +2,11 @@
 
 // Node compatibility expectations in this file were regenerated with Node v24.15.0.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tinysandbox::sandbox::{Limits, Sandbox, SyscallError};
+use tinysandbox::sandbox::{FetchRequest, FetchResponse, Limits, Sandbox, SyscallError};
 use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
 
 #[tokio::test]
@@ -181,7 +181,7 @@ async fn js_syscall_handlers_use_embedder_runtime_and_wall_timeout() {
 
     let sandbox = Sandbox::builder()
         .limits(Limits {
-            wall_time: Duration::from_millis(50),
+            wall_time: Duration::from_millis(500),
             ..Limits::default()
         })
         .syscall("hang", |_args| async {
@@ -196,6 +196,464 @@ async fn js_syscall_handlers_use_embedder_runtime_and_wall_timeout() {
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(result.stdout, "syscall 'hang' timed out\n");
+}
+
+#[tokio::test]
+async fn js_fetch_get_json_happy_path() {
+    // Verifies the global fetch binding calls the host transport and exposes
+    // status, status text, headers, and JSON body helpers.
+    let seen = Arc::new(Mutex::new(Vec::<FetchRequest>::new()));
+    let handler_seen = Arc::clone(&seen);
+    let sandbox = Sandbox::builder()
+        .fetch(move |request| {
+            let handler_seen = Arc::clone(&handler_seen);
+            async move {
+                handler_seen
+                    .lock()
+                    .expect("record fetch request")
+                    .push(request);
+                Ok(FetchResponse {
+                    status: 200,
+                    headers: vec![
+                        ("content-type".to_owned(), "application/json".to_owned()),
+                        ("x-answer".to_owned(), "42".to_owned()),
+                    ],
+                    body: br#"{"ok":true}"#.to_vec(),
+                })
+            }
+        })
+        .build();
+    let script = r#"
+(async () => {
+  const res = await fetch('https://example.test/data')
+  console.log(res.ok, res.status, res.statusText, res.headers.get('Content-Type'))
+  const data = await res.json()
+  console.log(data.ok)
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "true 200 OK application/json\ntrue\n");
+    let seen = seen.lock().expect("fetch request recorded");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].url, "https://example.test/data");
+    assert_eq!(seen[0].method, "GET");
+    assert_eq!(seen[0].body, None);
+}
+
+#[tokio::test]
+async fn js_fetch_post_string_body_and_header_object() {
+    // Header objects normalize to case-insensitive names and string bodies are
+    // transported as UTF-8 bytes.
+    let seen = Arc::new(Mutex::new(Vec::<FetchRequest>::new()));
+    let handler_seen = Arc::clone(&seen);
+    let sandbox = Sandbox::builder()
+        .fetch(move |request| {
+            let handler_seen = Arc::clone(&handler_seen);
+            async move {
+                handler_seen
+                    .lock()
+                    .expect("record fetch request")
+                    .push(request);
+                Ok(FetchResponse {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+            }
+        })
+        .build();
+    let script = r#"
+(async () => {
+  const res = await fetch('https://example.test/post', {
+    method: 'post',
+    headers: { 'Content-Type': 'text/plain', 'X-Token': 'abc' },
+    body: 'hello'
+  })
+  console.log(res.status, res.ok)
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "204 true\n");
+    let seen = seen.lock().expect("fetch request recorded");
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].body.as_deref(), Some(b"hello".as_slice()));
+    assert!(
+        seen[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name == "content-type" && value == "text/plain")
+    );
+    assert!(
+        seen[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-token" && value == "abc")
+    );
+}
+
+#[tokio::test]
+async fn js_fetch_binary_body_round_trips_bytes() {
+    // Request and response bodies use base64 at the host boundary so binary
+    // bytes survive without UTF-8 coercion.
+    let seen = Arc::new(Mutex::new(Vec::<FetchRequest>::new()));
+    let handler_seen = Arc::clone(&seen);
+    let sandbox = Sandbox::builder()
+        .fetch(move |request| {
+            let handler_seen = Arc::clone(&handler_seen);
+            async move {
+                handler_seen
+                    .lock()
+                    .expect("record fetch request")
+                    .push(request);
+                Ok(FetchResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: vec![9, 8, 7, 0],
+                })
+            }
+        })
+        .build();
+    let script = r#"
+(async () => {
+  const res = await fetch('https://example.test/binary', {
+    method: 'POST',
+    body: new Uint8Array([0, 255, 4, 128])
+  })
+  const bytes = new Uint8Array(await res.arrayBuffer())
+  console.log(Array.from(bytes).join(','))
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "9,8,7,0\n");
+    let seen = seen.lock().expect("fetch request recorded");
+    assert_eq!(seen[0].body.as_deref(), Some(&[0, 255, 4, 128][..]));
+}
+
+#[tokio::test]
+async fn js_fetch_handler_error_rejects_with_fetch_failed_cause() {
+    // Handler errors follow undici's catchable TypeError shape and preserve the
+    // host error message on `cause`.
+    let sandbox = Sandbox::builder()
+        .fetch(|_request| async { Err(SyscallError::new("upstream unavailable")) })
+        .build();
+    let script = r#"
+(async () => {
+  try {
+    await fetch('https://example.test/fail')
+  } catch (err) {
+    console.log(err.name, err.message)
+    console.log(err.cause && err.cause.message)
+  }
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "TypeError fetch failed\nupstream unavailable\n"
+    );
+}
+
+#[tokio::test]
+async fn js_fetch_hanging_handler_rejects_before_command_timeout() {
+    // A stuck handler should use the remaining wall-time budget to produce a
+    // catchable fetch rejection before the outer command timeout wins.
+    let sandbox = Sandbox::builder()
+        .limits(Limits {
+            wall_time: Duration::from_millis(500),
+            ..Limits::default()
+        })
+        .fetch(|_request| async {
+            std::future::pending::<Result<FetchResponse, SyscallError>>().await
+        })
+        .build();
+    let start = Instant::now();
+    let script = r#"
+(async () => {
+  try {
+    await fetch('https://example.test/hang')
+  } catch (err) {
+    console.log(err.name, err.message)
+    console.log(err.cause && err.cause.message)
+  }
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(result.stdout, "TypeError fetch failed\nfetch timed out\n");
+}
+
+#[tokio::test]
+async fn js_fetch_without_handler_rejects_but_global_exists() {
+    // The fetch global is always present, while network access remains disabled
+    // until the embedder provides a handler.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+(async () => {
+  console.log(typeof fetch)
+  try {
+    await fetch('https://example.test/')
+  } catch (err) {
+    console.log(err.name, err.message)
+    console.log(err.cause && err.cause.message)
+  }
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert!(
+        result
+            .stdout
+            .starts_with("function\nTypeError fetch failed\n")
+    );
+    assert!(result.stdout.contains("network is not available"));
+}
+
+#[tokio::test]
+async fn js_fetch_double_body_read_matches_undici_message() {
+    // Response body helpers consume exactly once and reject with undici's
+    // TypeError message on a second read.
+    let sandbox = Sandbox::builder()
+        .fetch(|_request| async {
+            Ok(FetchResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"hello".to_vec(),
+            })
+        })
+        .build();
+    let script = r#"
+(async () => {
+  const res = await fetch('https://example.test/body')
+  console.log(await res.text())
+  try {
+    await res.text()
+  } catch (err) {
+    console.log(err.name, err.message)
+  }
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "hello\nTypeError Body is unusable: Body has already been read\n"
+    );
+}
+
+#[tokio::test]
+async fn js_fetch_headers_are_case_insensitive_and_iterable() {
+    // Duplicate names combine with comma-space, lookup is case-insensitive, and
+    // iteration exposes normalized header names.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+const headers = new Headers([
+  ['X-Test', 'one'],
+  ['x-test', 'two'],
+  ['Content-Type', 'text/plain']
+])
+console.log(headers.get('X-TEST'))
+console.log(headers.has('content-type'))
+const forEach = []
+headers.forEach((value, name) => forEach.push(`${name}=${value}`))
+console.log(forEach.join('|'))
+console.log(Array.from(headers.entries()).map(([name, value]) => `${name}:${value}`).join('|'))
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "one, two\ntrue\ncontent-type=text/plain|x-test=one, two\ncontent-type:text/plain|x-test:one, two\n"
+    );
+}
+
+#[tokio::test]
+async fn js_fetch_signal_is_loudly_unsupported() {
+    // AbortController is outside this phase's subset, so passing a signal
+    // rejects clearly instead of pretending cancellation works.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+(async () => {
+  try {
+    await fetch('https://example.test/', { signal: {} })
+  } catch (err) {
+    console.log(err.name)
+    console.log(err.message)
+  }
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "TypeError\nAbortSignal is not supported in tinysandbox fetch\n"
+    );
+}
+
+#[tokio::test]
+async fn js_fetch_response_size_cap_rejects_with_custom_limit() {
+    // The host enforces the configured response cap before base64 response
+    // bytes are returned to the guest.
+    let sandbox = Sandbox::builder()
+        .limits(Limits {
+            fetch_response_bytes: 3,
+            ..Limits::default()
+        })
+        .fetch(|_request| async {
+            Ok(FetchResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: vec![1, 2, 3, 4],
+            })
+        })
+        .build();
+    let script = r#"
+(async () => {
+  try {
+    await fetch('https://example.test/too-large')
+  } catch (err) {
+    console.log(err.name, err.message)
+    console.log(err.cause && err.cause.message)
+  }
+})()
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "TypeError fetch failed\nfetch response body exceeded limit of 3 bytes\n"
+    );
+}
+
+#[tokio::test]
+async fn js_microtasks_are_drained_without_fetch() {
+    // Already-settled promise callbacks must run before the JS command exits.
+    let sandbox = Sandbox::builder().build();
+    let result = sandbox
+        .exec("js -e 'Promise.resolve().then(() => console.log(\"drained\"))'")
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "drained\n");
+}
+
+#[tokio::test]
+async fn js_unhandled_top_level_rejection_exits_nonzero() {
+    // A rejected promise that reaches the drain unhandled is reported like an
+    // uncaught error.
+    let sandbox = Sandbox::builder().build();
+    let result = sandbox
+        .exec("js -e 'Promise.reject(new Error(\"async boom\"))'")
+        .await;
+
+    assert_ne!(result.exit_code, 0);
+    assert_eq!(result.stdout, "");
+    assert!(result.stderr.starts_with("Error: async boom\n"));
+}
+
+#[tokio::test]
+async fn js_unhandled_rejection_tracker_keeps_unhandled_first_reason() {
+    // Handling a later rejection must not clear an earlier unhandled promise.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+const a = Promise.reject(new Error("A"))
+const b = Promise.reject(new Error("B"))
+b.catch(() => {})
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_ne!(result.exit_code, 0);
+    assert_eq!(result.stdout, "");
+    assert!(result.stderr.starts_with("Error: A\n"));
+}
+
+#[tokio::test]
+async fn js_unhandled_rejection_tracker_reports_second_if_first_later_handled() {
+    // A second rejected promise remains reportable even if the earlier one is
+    // handled before the drain completes.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+const first = Promise.reject(new Error("first"))
+const second = Promise.reject(new Error("second"))
+first.catch(() => {})
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_ne!(result.exit_code, 0);
+    assert_eq!(result.stdout, "");
+    assert!(result.stderr.starts_with("Error: second\n"));
+}
+
+#[tokio::test]
+async fn js_unhandled_rejection_tracker_clears_every_eventually_handled_promise() {
+    // Rejections handled from a later microtask should leave no stale entries at
+    // the final drain.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+const a = Promise.reject(new Error("A"))
+const b = Promise.reject(new Error("B"))
+Promise.resolve().then(() => {
+  a.catch(() => console.log("A handled"))
+  b.catch(() => console.log("B handled"))
+})
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "A handled\nB handled\n");
 }
 
 #[tokio::test]
@@ -303,6 +761,16 @@ fn js_syscall_names_are_validated_at_build() {
             .build()
     });
     assert!(duplicate.is_err(), "duplicate syscall names should panic");
+
+    let reserved_fetch = std::panic::catch_unwind(|| {
+        Sandbox::builder()
+            .syscall("fetch", |_args| async { Ok(Value::Null) })
+            .build()
+    });
+    assert!(
+        reserved_fetch.is_err(),
+        "reserved fetch syscall name should panic"
+    );
 }
 
 #[tokio::test]
