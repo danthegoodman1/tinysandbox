@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "tinysandbox"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Ultra-minimal Linux-like sandbox for AI agents: shell, coreutils, VFS, and a Wasmtime-hosted JS runtime in one crate"
 license = "MIT OR Apache-2.0"

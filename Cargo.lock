@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "tinysandbox"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64",
  "proptest",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "tinysandbox-node"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "napi",
  "napi-build",
