@@ -6,6 +6,7 @@
   "types": "index.d.ts",
   "scripts": {
     "build": "napi build --platform --release --js native.cjs --dts native.d.ts",
+    "benchmark:memory": "tsx benchmarks/memory.ts",
     "test": "npm run build && node --import tsx --test __test__/*.mjs",
     "examples": "tsx examples/quickstart.ts && tsx examples/custom_command.ts && tsx examples/js_scripts.ts && tsx examples/js_syscalls.ts && tsx examples/js_vfs.ts"
   },

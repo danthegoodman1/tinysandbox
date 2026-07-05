@@ -80,6 +80,7 @@ console.assert(result.stdout === '1\n')
   - [TypeScript](#typescript-8)
 - [Security model](#security-model)
 - [Comparison with just-bash](#comparison-with-just-bash)
+- [Performance](#performance)
 - [Feature flags](#feature-flags)
 - [Examples](#examples)
 - [License](#license)
@@ -783,6 +784,46 @@ but the designs differ in ways that matter:
   relies on language-level hardening against engine breakouts.
 - **Host language.** tinysandbox is a Rust crate with Node.js bindings;
   just-bash is TypeScript and runs in Node or the browser.s
+
+## Performance
+
+The repository includes memory benchmarks for the Rust crate and TypeScript
+binding. Each benchmark runs every sandbox count in a fresh child process,
+keeps all `N` sandboxes alive, samples resident set size (RSS), then runs a
+small VFS workload on up to 1,000 live sandboxes and extrapolates that sampled
+RSS delta across `N`.
+
+```bash
+cargo run --release --example memory_benchmark -- --counts 1000,10000,100000 --task-sample 1000
+npm --prefix tinysandbox-node run benchmark:memory -- --counts 1000,10000,100000 --task-sample 1000
+```
+
+Workload:
+
+```sh
+mkdir -p /bench && echo bench-payload > /bench/echo.txt && cat /bench/echo.txt
+```
+
+Measured on macOS 26.5.1 arm64 with `rustc 1.96.0` and Node.js `v24.15.0`.
+RSS includes runtime and allocator overhead for that process. `VFS bytes /
+sandbox` is logical file payload retained by the in-memory filesystem after
+the workload, not total allocator overhead.
+
+#### Rust
+
+| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | VFS bytes / sandbox | task time |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 8.84 MiB | 6.51 KiB | 49 ms | 1,000 | 12.08 MiB | 12.08 MiB | 14.0 B | 60 ms |
+| 10,000 | 60.78 MiB | 5.97 KiB | 75 ms | 1,000 | 64.09 MiB | 93.91 MiB | 14.0 B | 55 ms |
+| 100,000 | 580.58 MiB | 5.92 KiB | 312 ms | 1,000 | 583.86 MiB | 908.70 MiB | 14.0 B | 55 ms |
+
+#### TypeScript
+
+| active sandboxes | active peak RSS | active delta / sandbox | create time | task sample | measured task peak | extrapolated task peak | VFS bytes / sandbox | task time |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000 | 85.02 MiB | 6.61 KiB | 3 ms | 1,000 | 88.83 MiB | 88.83 MiB | 14.0 B | 33 ms |
+| 10,000 | 126.55 MiB | 6.43 KiB | 30 ms | 1,000 | 130.55 MiB | 166.55 MiB | 14.0 B | 37 ms |
+| 100,000 | 680.95 MiB | 6.32 KiB | 315 ms | 1,000 | 685.83 MiB | 1.14 GiB | 14.0 B | 38 ms |
 
 ## Feature flags
 
