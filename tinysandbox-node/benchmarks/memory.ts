@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { Sandbox } from '../index.js'
 
-const DEFAULT_COUNTS = [1_000, 10_000, 100_000]
+const DEFAULT_COUNTS = [1_000, 10_000, 100_000, 1_000_000]
 const DEFAULT_TASK_SAMPLE = 1_000
 const TASK = 'mkdir -p /bench && echo bench-payload > /bench/echo.txt && cat /bench/echo.txt'
 const TASK_OUTPUT = 'bench-payload\n'
@@ -163,7 +163,7 @@ function parseArgs(args: string[]): Config {
     } else if (arg === '--count') {
       childCount = parsePositiveInt(requireValue(args, ++index, '--count'), '--count')
     } else if (arg === '-h' || arg === '--help') {
-      throw new Error('usage: npm run benchmark:memory -- [--counts 1000,10000,100000] [--task-sample 1000]')
+      throw new Error('usage: npm run benchmark:memory -- [--counts 1000,10000,100000,1000000] [--task-sample 1000]')
     } else {
       throw new Error(`unknown argument: ${arg}`)
     }

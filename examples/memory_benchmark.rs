@@ -6,7 +6,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tinysandbox::sandbox::Sandbox;
 
-const DEFAULT_COUNTS: &[usize] = &[1_000, 10_000, 100_000];
+const DEFAULT_COUNTS: &[usize] = &[1_000, 10_000, 100_000, 1_000_000];
 const DEFAULT_TASK_SAMPLE: usize = 1_000;
 const TASK: &str = "mkdir -p /bench && echo bench-payload > /bench/echo.txt && cat /bench/echo.txt";
 const TASK_OUTPUT: &str = "bench-payload\n";
@@ -45,7 +45,7 @@ async fn main() -> ExitCode {
         Err(err) => {
             eprintln!("{err}");
             eprintln!(
-                "usage: cargo run --release --example memory_benchmark -- [--counts 1000,10000,100000] [--task-sample 1000]"
+                "usage: cargo run --release --example memory_benchmark -- [--counts 1000,10000,100000,1000000] [--task-sample 1000]"
             );
             return ExitCode::from(2);
         }

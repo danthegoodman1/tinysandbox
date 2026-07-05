@@ -794,8 +794,8 @@ small VFS workload on up to 1,000 live sandboxes and extrapolates that sampled
 RSS delta across `N`.
 
 ```bash
-cargo run --release --example memory_benchmark -- --counts 1000,10000,100000 --task-sample 1000
-npm --prefix tinysandbox-node run benchmark:memory -- --counts 1000,10000,100000 --task-sample 1000
+cargo run --release --example memory_benchmark -- --counts 1000,10000,100000,1000000 --task-sample 1000
+npm --prefix tinysandbox-node run benchmark:memory -- --counts 1000,10000,100000,1000000 --task-sample 1000
 ```
 
 Workload:
@@ -816,6 +816,7 @@ the workload, not total allocator overhead.
 | 1,000 | 8.84 MiB | 6.51 KiB | 49 ms | 1,000 | 12.08 MiB | 12.08 MiB | 14.0 B | 60 ms |
 | 10,000 | 60.78 MiB | 5.97 KiB | 75 ms | 1,000 | 64.09 MiB | 93.91 MiB | 14.0 B | 55 ms |
 | 100,000 | 580.58 MiB | 5.92 KiB | 312 ms | 1,000 | 583.86 MiB | 908.70 MiB | 14.0 B | 55 ms |
+| 1,000,000 | 5.64 GiB | 5.92 KiB | 2.56 s | 1,000 | 5.65 GiB | 8.92 GiB | 14.0 B | 44 ms |
 
 #### TypeScript
 
@@ -824,6 +825,7 @@ the workload, not total allocator overhead.
 | 1,000 | 85.02 MiB | 6.61 KiB | 3 ms | 1,000 | 88.83 MiB | 88.83 MiB | 14.0 B | 33 ms |
 | 10,000 | 126.55 MiB | 6.43 KiB | 30 ms | 1,000 | 130.55 MiB | 166.55 MiB | 14.0 B | 37 ms |
 | 100,000 | 680.95 MiB | 6.32 KiB | 315 ms | 1,000 | 685.83 MiB | 1.14 GiB | 14.0 B | 38 ms |
+| 1,000,000 | 6.16 GiB | 6.38 KiB | 3.04 s | 1,000 | 6.16 GiB | 9.03 GiB | 14.0 B | 29 ms |
 
 ## Feature flags
 
