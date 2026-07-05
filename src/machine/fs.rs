@@ -125,6 +125,51 @@ impl Fs {
         .await
     }
 
+    pub async fn open(&self, path: &str, mode: OpenMode) -> VfsResult<FileHandle> {
+        let path = self.resolve(path);
+        if is_bin_path(&path) {
+            return Err(if path == "/bin" {
+                VfsError::new(Errno::EISDIR)
+            } else if !mode.write && !self.bin_commands.contains(path.trim_start_matches("/bin/")) {
+                VfsError::new(Errno::ENOENT)
+            } else {
+                VfsError::new(Errno::EACCES)
+            });
+        }
+        self.dispatch(move |vfs| vfs.open(&path, mode)).await
+    }
+
+    pub async fn read_at(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        mut buf: Vec<u8>,
+    ) -> VfsResult<(Vec<u8>, usize)> {
+        self.dispatch(move |vfs| {
+            let n = vfs.read_at(handle, offset, &mut buf)?;
+            Ok((buf, n))
+        })
+        .await
+    }
+
+    pub async fn write_at(
+        &self,
+        handle: FileHandle,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> VfsResult<usize> {
+        self.dispatch(move |vfs| vfs.write_at(handle, offset, &data))
+            .await
+    }
+
+    pub async fn truncate(&self, handle: FileHandle, len: u64) -> VfsResult<()> {
+        self.dispatch(move |vfs| vfs.truncate(handle, len)).await
+    }
+
+    pub async fn close(&self, handle: FileHandle) -> VfsResult<()> {
+        self.dispatch(move |vfs| vfs.close(handle)).await
+    }
+
     async fn dispatch<R, F>(&self, op: F) -> VfsResult<R>
     where
         R: Send + 'static,

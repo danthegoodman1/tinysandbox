@@ -59,6 +59,7 @@ pub struct ExecMetrics {
     pub pipe_bytes: Vec<usize>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub peak_wasm_memory_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +112,11 @@ impl Machine {
     ///
     /// The wall-clock timeout is exec-wide. When it fires, partial stdout,
     /// stderr, metrics, and session mutations are discarded and the result
-    /// exits 124. Concurrent execs each start from the session state visible
-    /// at their own start; when they complete, the last stored session wins.
+    /// exits 124. Blocking host calls already running on worker threads are not
+    /// cancelled by that timeout, so VFS implementations should keep individual
+    /// operations bounded. Concurrent execs each start from the session state
+    /// visible at their own start; when they complete, the last stored session
+    /// wins.
     pub async fn exec(&self, input: &str) -> ExecResult {
         let started = Instant::now();
         let future = self.exec_inner(input);
@@ -131,6 +135,7 @@ impl Machine {
                     pipe_bytes: Vec::new(),
                     stdout_truncated: false,
                     stderr_truncated: false,
+                    peak_wasm_memory_bytes: None,
                 },
             },
         }
@@ -177,6 +182,7 @@ impl Machine {
                 pipe_bytes: exec.pipe_bytes,
                 stdout_truncated,
                 stderr_truncated,
+                peak_wasm_memory_bytes: exec.peak_wasm_memory_bytes,
             },
         }
     }
@@ -313,6 +319,12 @@ impl Machine {
                 commands: Arc::clone(&self.command_names),
             };
             let result = command.run(ctx).await;
+            if let Some(bytes) = result.peak_wasm_memory_bytes {
+                exec.peak_wasm_memory_bytes = Some(
+                    exec.peak_wasm_memory_bytes
+                        .map_or(bytes, |current| current.max(bytes)),
+                );
+            }
             (stdout.bytes(), stderr.bytes(), result.exit_code)
         } else {
             (
@@ -486,6 +498,8 @@ impl MachineBuilder {
     fn new() -> Self {
         let mut commands = BTreeMap::new();
         builtins::register(&mut commands);
+        #[cfg(feature = "js")]
+        crate::js::register(&mut commands);
         commands.insert(
             "cd".to_owned(),
             Arc::new(|_ctx: CommandContext| {
@@ -600,6 +614,7 @@ struct ExecState {
     last_status: i32,
     command_count: usize,
     limit_hit: bool,
+    peak_wasm_memory_bytes: Option<usize>,
 }
 
 impl ExecState {
@@ -612,6 +627,7 @@ impl ExecState {
             last_status,
             command_count: 0,
             limit_hit: false,
+            peak_wasm_memory_bytes: None,
         }
     }
 }
@@ -624,6 +640,7 @@ impl ExecMetrics {
             pipe_bytes: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            peak_wasm_memory_bytes: None,
         }
     }
 }

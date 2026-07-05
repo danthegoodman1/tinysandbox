@@ -43,11 +43,20 @@ pub struct CommandContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandResult {
     pub exit_code: i32,
+    pub peak_wasm_memory_bytes: Option<usize>,
 }
 
 impl CommandResult {
     pub const fn new(exit_code: i32) -> Self {
-        Self { exit_code }
+        Self {
+            exit_code,
+            peak_wasm_memory_bytes: None,
+        }
+    }
+
+    pub const fn with_peak_wasm_memory(mut self, bytes: usize) -> Self {
+        self.peak_wasm_memory_bytes = Some(bytes);
+        self
     }
 
     pub const fn success() -> Self {
@@ -66,6 +75,7 @@ pub struct Limits {
     pub stderr_bytes: usize,
     pub max_commands: usize,
     pub sort_input_bytes: usize,
+    pub wasm_memory_bytes: usize,
 }
 
 impl Default for Limits {
@@ -76,6 +86,7 @@ impl Default for Limits {
             stderr_bytes: 1024 * 1024,
             max_commands: 1024,
             sort_input_bytes: 8 * 1024 * 1024,
+            wasm_memory_bytes: 64 * 1024 * 1024,
         }
     }
 }

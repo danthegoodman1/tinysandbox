@@ -211,13 +211,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 4A: quickjs-ng wasm artifact vendored + engine cache | Missing: artifact, build provenance note, `src/js/engine.rs`. |
-| Incomplete | Work | 4B: Node `fs` hostcalls over the VFS | Missing: hostcall impl + corpus tests. |
-| Incomplete | Work | 4C: console/process/stdio wiring, exit codes | Missing: unit tests. |
-| Incomplete | Work | 4D: memory + epoch limits, peak-memory metric | Missing: adversarial tests passing. |
-| Incomplete | Work | 4E: `js` cargo feature gating | Missing: feature-matrix CI. |
-| Incomplete | Test | Node-compat script corpus | Missing: fixtures + runner. |
-| Incomplete | Gate | corpus + adversarial + feature matrix green | Missing: passing CI run. |
+| Complete | Work | 4A: quickjs-ng wasm artifact vendored + engine cache | `assets/quickjs.wasm` built from quickjs-ng `v0.15.1`; `assets/PROVENANCE.md` + `scripts/build-quickjs-wasm.sh`; `src/js/mod.rs` caches `Engine` + `InstancePre`. |
+| Complete | Work | 4B: Node `fs` hostcalls over the VFS | `src/js/mod.rs`: JSON hostcall ABI over `Fs`, descriptor table, recursive mkdir/rm, Node-shaped errno errors. |
+| Complete | Work | 4C: console/process/stdio wiring, exit codes | `src/js/quickjs_shim.c`: console stdout/stderr, `process.argv/env/cwd/exit`, `require('fs')`; uncaught errors flow to stderr. |
+| Complete | Work | 4D: memory + epoch limits, peak-memory metric | `Limits::wasm_memory_bytes`, Wasmtime `ResourceLimiter`, epoch deadline setup, `ExecMetrics::peak_wasm_memory_bytes`; adversarial tests cover timeout and memory cap. |
+| Complete | Work | 4E: `js` cargo feature gating | `Cargo.toml`: default `js` feature gates serde/wasmtime/runtime; CI includes no-default build/test. |
+| Complete | Test | Node-compat script corpus | `tests/js_runtime.rs`: console/process Node-verified shape plus VFS-backed fs round trips, descriptor offsets, error codes, quota, pipeline, metrics, timeout/OOM. |
+| Complete | Gate | corpus + adversarial + feature matrix green | Reviewer approved after 3 rounds; test --all-features / --no-default-features + clippy green locally. |
 
 ## Phase 5: Snapshots, hardening, release readiness
 
