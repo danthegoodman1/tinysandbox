@@ -57,8 +57,8 @@ pub struct Assignment {
 /// A shell word before field splitting.
 ///
 /// Bash field-splits unquoted expansion results after parsing. Thinbox keeps
-/// that information here so the Phase 3 executor can apply splitting with the
-/// final environment instead of flattening words during parsing.
+/// that information here so the executor can apply splitting with the final
+/// environment instead of flattening words during parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Word {
     pub segments: Vec<Segment>,

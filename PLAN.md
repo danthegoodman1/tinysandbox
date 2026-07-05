@@ -222,27 +222,43 @@ Status ledger:
 ## Phase 5: Snapshots, hardening, release readiness
 
 Goal:
-Copy-on-write snapshots for rollback/branching, fuzz/property hardening,
-and a documented crate ready for crates.io.
+Copy-on-write snapshots for rollback/branching, a comprehensive edge-case
+coverage sweep across the whole codebase, fuzz/property hardening, and a
+documented crate ready for crates.io.
 
 Scope:
 - `VfsSnapshot` extension trait: snapshot/restore/branch on `InMemoryVfs`
   (structural sharing so snapshots are cheap).
 - Conformance suite extension for snapshot semantics.
+- Coverage sweep: audit every module for untested edge cases and close the
+  gaps. Systematic sources: `cargo llvm-cov` uncovered branches; error paths
+  (every errno arm, every builtin failure message); boundary values (empty
+  input, zero-length files, offset/count extremes, quota exactly-at-limit);
+  interaction cases (redirects x pipes x limits, expansions in every word
+  position, unlink/rename races with open handles, session state across
+  failing execs); adversarial input (deep nesting, huge words, invalid
+  UTF-8 where accepted). Divergences found against real bash/GNU become
+  fixes plus pinned golden cases.
 - Fuzzing pass over shell parser and a VFS op fuzzer; fix all findings.
 - API polish: rustdoc on all public items, README with embedding example,
   examples/ dir, semver review, `cargo publish --dry-run`.
 
 Out of scope:
 - Persistent (disk/SQLite) snapshot storage.
+- Coverage-percentage targets for their own sake; the sweep chases real
+  edge-case bugs, not a number.
 
 Completion gate:
-Snapshot conformance tests pass; fuzzers run clean for a fixed budget;
-`cargo publish --dry-run` succeeds; README example compiles as a doc test.
+Snapshot conformance tests pass; coverage sweep documented (gaps found,
+bugs fixed, cases added) with `cargo llvm-cov` run as evidence; fuzzers run
+clean for a fixed budget; `cargo publish --dry-run` succeeds; README
+example compiles as a doc test.
 
 Testing plan:
 - Snapshot semantics: mutate-after-snapshot isolation, restore fidelity,
   branch independence, quota accounting across snapshots.
+- Coverage sweep cases land in the existing suites (conformance, golden
+  corpora, e2e, proptests) so they keep running in CI.
 - Fuzz budget run (e.g. 30 min each target) with zero crashes.
 - Docs build with `-D warnings`; example compiles in CI.
 
@@ -252,9 +268,10 @@ Status ledger:
 | --- | --- | --- | --- |
 | Incomplete | Work | 5A: `VfsSnapshot` + CoW on `InMemoryVfs` | Missing: impl + isolation tests. |
 | Incomplete | Work | 5B: conformance suite snapshot extension | Missing: suite section + green run. |
-| Incomplete | Work | 5C: fuzz targets + findings fixed | Missing: fuzz run logs. |
-| Incomplete | Work | 5D: rustdoc, README, examples, publish dry-run | Missing: docs + dry-run output. |
-| Incomplete | Gate | fuzz clean + dry-run + docs green | Missing: passing CI run. |
+| Incomplete | Work | 5C: comprehensive edge-case coverage sweep | Missing: llvm-cov audit, gap list, new cases + fixes. |
+| Incomplete | Work | 5D: fuzz targets + findings fixed | Missing: fuzz run logs. |
+| Incomplete | Work | 5E: rustdoc, README, examples, publish dry-run | Missing: docs + dry-run output. |
+| Incomplete | Gate | coverage sweep + fuzz clean + dry-run + docs green | Missing: passing CI run. |
 
 ## Phase 6: Node.js bindings
 

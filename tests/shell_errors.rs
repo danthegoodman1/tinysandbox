@@ -2,7 +2,7 @@ use thinbox::shell::{ParseErrorKind, QuoteKind, UnsupportedConstruct, parse};
 
 #[test]
 fn unsupported_constructs_report_the_construct_position() {
-    // Each assertion fixes the byte offset that Phase 3 can show in user-facing errors.
+    // Each assertion fixes the byte offset that the executor can show in user-facing errors.
     let cases = [
         (
             "echo *",

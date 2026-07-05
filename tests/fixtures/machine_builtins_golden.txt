@@ -1,4 +1,4 @@
-# Builtin golden corpus for Phase 3.
+# Builtin golden corpus.
 # Expected shapes were checked against GNU coreutils/bash behavior where the
 # supported feature is a GNU-compatible surface. macOS BSD-compatible cases
 # were also spot-checked locally. Known documented deviations: grep and sed use

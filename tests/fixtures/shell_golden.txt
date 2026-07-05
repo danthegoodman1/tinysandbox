@@ -1,4 +1,4 @@
-# Phase 2 shell parser golden corpus.
+# Shell parser golden corpus.
 # Observable word formation cases were manually checked against bash using
 # `set -- <case>; printf '<%s>\n' "$@"` style probes. Cases use \n for
 # literal newlines; <empty> pins empty input.

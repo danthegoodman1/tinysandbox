@@ -5,7 +5,7 @@ use thinbox::shell::{
 
 #[test]
 fn golden_corpus_matches_expected_ast() {
-    // These cases pin bash-compatible word formation separately from Phase 3 expansion/execution.
+    // These cases pin bash-compatible word formation separately from expansion/execution.
     let cases = vec![
         ("", Program::default()),
         (
@@ -338,7 +338,7 @@ fn golden_corpus_matches_expected_ast() {
 
 #[test]
 fn special_status_expansion_is_kept_for_executor_state() {
-    // Phase 3 owns the actual status value; the parser only preserves the expansion site.
+    // The executor owns the actual status value; the parser only preserves the expansion site.
     assert_eq!(
         parse("echo $?"),
         Ok(one(simple_words(vec![
