@@ -41,7 +41,7 @@ pub const JQ: &str = "`jq` supports a common subset: `-r`, `-j`, `-c`, `-e`, `-n
 /// The `js` command and its Node-compatible runtime, including the `fs` API.
 pub const JS: &str = "`js script.js [args...]` and `js -e 'code'` run JavaScript with Node-compatible semantics for what it implements:
 - `require()` for relative/absolute CommonJS modules (`./x`, `/x`, `.js`/`.json` inference, `dir/index.js`). There is no npm and no `node_modules`.
-- The sync `fs` API over the same filesystem as the shell: readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, rmdirSync, existsSync, copyFileSync, openSync, readSync, writeSync, ftruncateSync, closeSync. Errors are Node-shaped (`err.code === 'ENOENT'` etc.).
+- The sync `fs` API over the same filesystem as the shell: readFileSync, readLinesSync (UTF-8 line iterator, 64KB buffer), writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, rmdirSync, existsSync, copyFileSync, openSync, readSync, writeSync, ftruncateSync, closeSync. Errors are Node-shaped (`err.code === 'ENOENT'` etc.).
 - `console`, `process.argv/env/cwd()/exit()`, `Buffer`, `__filename`, `__dirname`.
 There are no timers and no event loop: only already-settled promise callbacks run before exit. Scripts run under memory and CPU limits; an infinite loop exits with code 124.";
 

@@ -287,7 +287,7 @@ fn sample_interval(count: usize) -> usize {
 }
 
 fn should_sample(done: usize, total: usize, interval: usize) -> bool {
-    done == total || done % interval == 0
+    done == total || done.is_multiple_of(interval)
 }
 
 fn per_sandbox(bytes: u64, count: usize) -> f64 {
