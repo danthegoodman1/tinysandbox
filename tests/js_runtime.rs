@@ -926,6 +926,96 @@ console.log(stat.isFile(), stat.isDirectory(), stat.size)
 }
 
 #[tokio::test]
+async fn js_fs_read_lines_sync_iterates_text_lines() {
+    // Covers the tinysandbox line helper's public contract: it is a sync
+    // iterable, strips LF/CRLF separators, preserves blank lines, and does not
+    // emit an extra line for a final newline.
+    let sandbox = Sandbox::builder().build();
+    let script = r#"
+const fs = require('fs')
+function dump(path, options) {
+  console.log(JSON.stringify(Array.from(fs.readLinesSync(path, options))))
+}
+fs.writeFileSync('/normal', 'alpha\nbeta\n')
+fs.writeFileSync('/mixed', 'a\r\nb\n\nc')
+fs.writeFileSync('/unterminated', 'last')
+fs.writeFileSync('/blank', '\n\nmiddle\n\n')
+const iterator = fs.readLinesSync('/normal')
+console.log(typeof iterator[Symbol.iterator], iterator === iterator[Symbol.iterator]())
+const normal = []
+for (const line of iterator) normal.push(line)
+console.log(JSON.stringify(normal))
+dump('/mixed', 'utf8')
+dump('/unterminated', { encoding: 'utf-8' })
+dump('/blank')
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "function true\n[\"alpha\",\"beta\"]\n[\"a\",\"b\",\"\",\"c\"]\n[\"last\"]\n[\"\",\"\",\"middle\",\"\"]\n"
+    );
+}
+
+#[tokio::test]
+async fn js_fs_read_lines_sync_closes_fd_after_iteration_stops() {
+    // Unlinking a fully quota-sized file only frees its storage after the read
+    // fd closes. The follow-up write would fail with ENOSPC if the iterator
+    // leaked the descriptor on break, throw, or exhaustion.
+    let sandbox = Sandbox::builder()
+        .vfs(InMemoryVfs::new(VfsQuota {
+            max_bytes: 4,
+            max_files: 8,
+            max_file_size: 4,
+        }))
+        .build();
+    let script = r#"
+const fs = require('fs')
+function releaseAfter(label, consume) {
+  fs.writeFileSync('/input', 'a\nb\n')
+  consume(fs.readLinesSync('/input'))
+  fs.unlinkSync('/input')
+  fs.writeFileSync(`/${label}`, 'x')
+  console.log(label, fs.readFileSync(`/${label}`, 'utf8'))
+  fs.unlinkSync(`/${label}`)
+}
+releaseAfter('break', iter => {
+  for (const line of iter) {
+    console.log('seen', line)
+    break
+  }
+})
+releaseAfter('throw', iter => {
+  try {
+    for (const line of iter) {
+      console.log('throw-seen', line)
+      throw new Error('stop')
+    }
+  } catch (err) {
+    console.log('caught', err.message)
+  }
+})
+releaseAfter('done', iter => {
+  console.log('done-lines', Array.from(iter).join('|'))
+})
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "seen a\nbreak x\nthrow-seen a\ncaught stop\nthrow x\ndone-lines a|b\ndone x\n"
+    );
+}
+
+#[tokio::test]
 async fn js_fs_write_buffer_two_arg_form_writes_all_bytes() {
     // Node returns 5 and writes the full Buffer for writeSync(fd, buffer).
     let sandbox = Sandbox::builder().build();
