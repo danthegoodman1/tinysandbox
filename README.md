@@ -294,13 +294,15 @@ identical output):
 | Errors | Node-shaped: `.code` (`'ENOENT'`...), libuv-faithful `.errno`, `.syscall`, `.path`, messages like `ENOENT: no such file or directory, open '/x'` |
 | Limits | Per-run memory cap (default 64 MB) with clean OOM errors, CPU deadline via epoch interruption (`while(true){}` exits 124), fetch response body cap, catchable `RangeError` on stack exhaustion |
 
-Not there on purpose: timers, an event loop, direct networking, and
-`node_modules` resolution — bare `require('lodash')` tells you plainly that
-there is no npm in the sandbox. Async is intentionally narrow: already-settled
-microtasks drain before exit, and `fetch` is available only through an
-embedder-granted handler. All file access goes through the same VFS and quotas
-as the shell. Known deviations (fetch subset details, stack-frame naming,
-line-1 column offsets) are documented in the `js` module docs.
+Not there on purpose: timers, an event loop, direct networking,
+`child_process`/process spawning, built-in shell command execution from
+JavaScript, and `node_modules` resolution — bare `require('lodash')` tells you
+plainly that there is no npm in the sandbox. Async is intentionally narrow:
+already-settled microtasks drain before exit, and `fetch` is available only
+through an embedder-granted handler. All file access goes through the same VFS
+and quotas as the shell. Known deviations (fetch subset details,
+stack-frame naming, line-1 column offsets) are documented in the `js` module
+docs.
 
 ## Prompt chunks
 
@@ -402,6 +404,11 @@ The `js` runtime can receive a smaller capability surface than a whole shell
 command. Register host syscalls for synchronous `sandbox.*` functions, add a
 prelude to shape the guest API, and grant `fetch` only when you want agent JS
 to reach an embedder-provided transport.
+
+Custom shell commands registered with `SandboxBuilder::command` / `commands`
+are available to the shell, not automatically to sandboxed JavaScript. If you
+want JavaScript to call custom host functionality, expose that functionality as
+a syscall and optionally wrap it with a JavaScript prelude.
 
 ### Syscalls
 
