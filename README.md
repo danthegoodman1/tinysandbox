@@ -594,6 +594,14 @@ Dedicate the directory to the sandbox — containment holds regardless, but
 quota accounting assumes no other process mutates the tree while the sandbox
 is live. `LocalVfs` passes the same conformance suite as `InMemoryVfs`.
 
+When the host does legitimately touch the tree — or tracks usage out of band
+entirely — rebaseline the counters from outside the sandbox: `refresh()`
+rescans the directory, and `set_usage()` pushes externally computed numbers.
+Enforcement then just answers "should this write be blocked" against the
+current baseline, with live operations applying their deltas on top. From
+TypeScript: `await sandbox.refreshLocalVfs()` and
+`sandbox.setLocalVfsUsage({ usedBytes, fileCount })`.
+
 #### Rust
 
 ```rust ignore

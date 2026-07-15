@@ -66,6 +66,10 @@ pub struct Sandbox {
     // Napi owns this Arc through the JS object finalizer, so the final drop of
     // JsVfs runtimes stays outside Tokio async contexts.
     inner: Arc<CoreSandbox>,
+    // Concrete handle kept alongside the type-erased one in the sandbox so
+    // refreshLocalVfs/setLocalVfsUsage can reach the LocalVfs-only API.
+    #[cfg(unix)]
+    local_vfs: Option<Arc<tinysandbox::vfs::LocalVfs>>,
 }
 
 #[napi]
@@ -73,6 +77,8 @@ impl Sandbox {
     #[napi(constructor)]
     pub fn new(options: Option<Object<'_>>) -> Result<Self> {
         let mut builder = CoreSandbox::builder();
+        #[cfg(unix)]
+        let mut local_vfs = None;
 
         if let Some(options) = options {
             if let Some(limits) = get_optional_object(&options, "limits")? {
@@ -135,8 +141,18 @@ impl Sandbox {
                 }
                 builder = builder.vfs_arc(Arc::new(JsVfs::new(vfs)?));
             }
-            if let Some(local_vfs) = get_optional_object(&options, "localVfs")? {
-                builder = builder.vfs_arc(build_local_vfs(&local_vfs)?);
+            #[cfg(unix)]
+            if let Some(local_vfs_options) = get_optional_object(&options, "localVfs")? {
+                let vfs = build_local_vfs(&local_vfs_options)?;
+                local_vfs = Some(Arc::clone(&vfs));
+                builder = builder.vfs_arc(vfs);
+            }
+            #[cfg(not(unix))]
+            if options.has_named_property("localVfs")? {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "localVfs is only supported on Unix hosts".to_owned(),
+                ));
             }
             if let Some(commands) = get_optional_object(&options, "commands")? {
                 for name in Object::keys(&commands)? {
@@ -159,6 +175,8 @@ impl Sandbox {
 
         Ok(Self {
             inner: Arc::new(builder.build()),
+            #[cfg(unix)]
+            local_vfs,
         })
     }
 
@@ -187,6 +205,65 @@ impl Sandbox {
         .await
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
     }
+
+    /// Rescans the localVfs root directory and replaces quota usage with the
+    /// result. Call this after the host mutates the directory outside the
+    /// sandbox. Rejects when the sandbox was not built with the localVfs
+    /// option.
+    #[napi]
+    pub async fn refresh_local_vfs(&self) -> Result<VfsStatsJs> {
+        #[cfg(unix)]
+        {
+            let vfs = self.local_vfs.clone().ok_or_else(local_vfs_missing)?;
+            tokio::task::spawn_blocking(move || {
+                vfs.refresh()
+                    .map(VfsStatsJs::from)
+                    .map_err(|err| napi_vfs_error(err, None))
+            })
+            .await
+            .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))?
+        }
+        #[cfg(not(unix))]
+        {
+            Err(local_vfs_missing())
+        }
+    }
+
+    /// Replaces localVfs quota usage with externally computed numbers, for
+    /// hosts that track usage out of band. Later file operations apply their
+    /// deltas on top of the pushed baseline and quota enforcement blocks
+    /// growth against it. Throws when the sandbox was not built with the
+    /// localVfs option.
+    #[napi]
+    pub fn set_local_vfs_usage(&self, usage: VfsStatsJs) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let vfs = self.local_vfs.as_ref().ok_or_else(local_vfs_missing)?;
+            let invalid = |field: &str| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("localVfs usage {field} must be a non-negative safe integer"),
+                )
+            };
+            vfs.set_usage(VfsStats {
+                used_bytes: u64_from_js(usage.used_bytes).map_err(|_| invalid("usedBytes"))?,
+                file_count: u64_from_js(usage.file_count).map_err(|_| invalid("fileCount"))?,
+            });
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = usage;
+            Err(local_vfs_missing())
+        }
+    }
+}
+
+fn local_vfs_missing() -> Error {
+    Error::new(
+        Status::GenericFailure,
+        "sandbox was not configured with the localVfs option".to_owned(),
+    )
 }
 
 #[napi]
@@ -1110,7 +1187,7 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
 }
 
 #[cfg(unix)]
-fn build_local_vfs(options: &Object<'_>) -> Result<Arc<dyn Vfs>> {
+fn build_local_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::LocalVfs>> {
     let root: String = options.get_named_property("root")?;
     let mut quota = VfsQuota::unlimited();
     if let Some(limits) = get_optional_object(options, "quota")? {
@@ -1138,14 +1215,6 @@ fn quota_value(value: f64, name: &str) -> Result<u64> {
             format!("localVfs quota {name} must be a non-negative safe integer"),
         )
     })
-}
-
-#[cfg(not(unix))]
-fn build_local_vfs(_options: &Object<'_>) -> Result<Arc<dyn Vfs>> {
-    Err(Error::new(
-        Status::InvalidArg,
-        "localVfs is only supported on Unix hosts".to_owned(),
-    ))
 }
 
 fn validate_syscall_name(name: &str) -> Result<()> {

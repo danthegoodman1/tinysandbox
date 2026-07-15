@@ -1,6 +1,6 @@
 //! Local-directory VFS that persists sandbox files under a host directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
@@ -82,6 +82,52 @@ impl LocalVfs {
             used_bytes: state.used_bytes,
             file_count: state.file_count,
         })
+    }
+
+    /// Rescans the backing directory and replaces quota usage with the
+    /// result, returning the new numbers.
+    ///
+    /// Call this after the host mutates the tree so enforcement runs against
+    /// reality again. Unlinked-but-open files are no longer visible in the
+    /// tree but keep their bytes and entry slot accounted until the last
+    /// handle closes, exactly as live accounting does.
+    pub fn refresh(&self) -> VfsResult<VfsStats> {
+        let mut state = self.state();
+        let mut used_bytes = 0;
+        let mut file_count = 0;
+        scan_tree(&self.root, &mut used_bytes, &mut file_count).map_err(|err| io_error(&err))?;
+
+        let mut counted = BTreeSet::new();
+        for handle in state.handles.values() {
+            let unlinked = state
+                .open_files
+                .get(&handle.key)
+                .is_some_and(|open_file| open_file.unlinked);
+            if unlinked && counted.insert(handle.key) {
+                used_bytes = used_bytes.saturating_add(file_len(&handle.file).unwrap_or(0));
+                file_count += 1;
+            }
+        }
+
+        state.used_bytes = used_bytes;
+        state.file_count = file_count;
+        Ok(VfsStats {
+            used_bytes,
+            file_count,
+        })
+    }
+
+    /// Replaces quota usage with externally computed numbers.
+    ///
+    /// For hosts that track usage out of band instead of trusting the VFS to
+    /// aggregate it. Subsequent operations apply their deltas on top of the
+    /// pushed baseline, and quota enforcement blocks growth against it.
+    /// Numbers above the quota are accepted; they only prevent further
+    /// growth, matching how construction treats oversized existing trees.
+    pub fn set_usage(&self, usage: VfsStats) {
+        let mut state = self.state();
+        state.used_bytes = usage.used_bytes;
+        state.file_count = usage.file_count;
     }
 
     fn state(&self) -> MutexGuard<'_, State> {

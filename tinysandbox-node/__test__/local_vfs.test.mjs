@@ -77,6 +77,43 @@ test('localVfs enforces quota and reports stats', { skip: !isUnix }, async () =>
   })
 })
 
+test('localVfs usage can be refreshed and pushed from the host', { skip: !isUnix }, async () => {
+  await withScratchDir(async (root) => {
+    const sandbox = new Sandbox({ localVfs: { root, quota: { maxBytes: 16 } } })
+    await sandbox.fs.writeFile('/a.bin', Buffer.alloc(4, 1))
+
+    // The host mutates the tree behind the sandbox's back...
+    await writeFile(join(root, 'external.bin'), Buffer.alloc(6, 2))
+    let stats = await sandbox.stats()
+    assert.equal(stats.vfs.usedBytes, 4)
+
+    // ...and reconciles with a rescan.
+    const refreshed = await sandbox.refreshLocalVfs()
+    assert.equal(refreshed.usedBytes, 10)
+    assert.equal(refreshed.fileCount, 2)
+    stats = await sandbox.stats()
+    assert.equal(stats.vfs.usedBytes, 10)
+
+    // Pushed usage becomes the enforcement baseline.
+    sandbox.setLocalVfsUsage({ usedBytes: 16, fileCount: 2 })
+    await assert.rejects(
+      () => sandbox.fs.appendFile('/a.bin', Buffer.from('x')),
+      (err) => {
+        assert.equal(err.code, 'ENOSPC')
+        return true
+      }
+    )
+    sandbox.setLocalVfsUsage({ usedBytes: 10, fileCount: 2 })
+    await sandbox.fs.appendFile('/a.bin', Buffer.from('x'))
+
+    assert.throws(() => sandbox.setLocalVfsUsage({ usedBytes: -1, fileCount: 0 }), /usedBytes/)
+
+    const plain = new Sandbox()
+    await assert.rejects(() => plain.refreshLocalVfs(), /localVfs/)
+    assert.throws(() => plain.setLocalVfsUsage({ usedBytes: 0, fileCount: 0 }), /localVfs/)
+  })
+})
+
 test('localVfs rejects invalid configuration', { skip: !isUnix }, async () => {
   await withScratchDir(async (root) => {
     assert.throws(() => new Sandbox({ localVfs: { root: join(root, 'missing') } }), /localVfs root/)
