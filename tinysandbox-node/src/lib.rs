@@ -127,7 +127,16 @@ impl Sandbox {
                 });
             }
             if let Some(vfs) = get_optional_object(&options, "vfs")? {
+                if options.has_named_property("localVfs")? {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "Sandbox constructor accepts either vfs or localVfs, not both".to_owned(),
+                    ));
+                }
                 builder = builder.vfs_arc(Arc::new(JsVfs::new(vfs)?));
+            }
+            if let Some(local_vfs) = get_optional_object(&options, "localVfs")? {
+                builder = builder.vfs_arc(build_local_vfs(&local_vfs)?);
             }
             if let Some(commands) = get_optional_object(&options, "commands")? {
                 for name in Object::keys(&commands)? {
@@ -1098,6 +1107,45 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
         parsed.fetch_response_bytes = usize_from_number(bytes)?;
     }
     Ok(parsed)
+}
+
+#[cfg(unix)]
+fn build_local_vfs(options: &Object<'_>) -> Result<Arc<dyn Vfs>> {
+    let root: String = options.get_named_property("root")?;
+    let mut quota = VfsQuota::unlimited();
+    if let Some(limits) = get_optional_object(options, "quota")? {
+        if let Some(value) = get_optional::<f64>(&limits, "maxBytes")? {
+            quota.max_bytes = quota_value(value, "maxBytes")?;
+        }
+        if let Some(value) = get_optional::<f64>(&limits, "maxFiles")? {
+            quota.max_files = quota_value(value, "maxFiles")?;
+        }
+        if let Some(value) = get_optional::<f64>(&limits, "maxFileSize")? {
+            quota.max_file_size = quota_value(value, "maxFileSize")?;
+        }
+    }
+
+    let vfs = tinysandbox::vfs::LocalVfs::with_quota(&root, quota)
+        .map_err(|err| Error::new(Status::InvalidArg, format!("localVfs root '{root}': {err}")))?;
+    Ok(Arc::new(vfs))
+}
+
+#[cfg(unix)]
+fn quota_value(value: f64, name: &str) -> Result<u64> {
+    u64_from_js(value).map_err(|_| {
+        Error::new(
+            Status::InvalidArg,
+            format!("localVfs quota {name} must be a non-negative safe integer"),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn build_local_vfs(_options: &Object<'_>) -> Result<Arc<dyn Vfs>> {
+    Err(Error::new(
+        Status::InvalidArg,
+        "localVfs is only supported on Unix hosts".to_owned(),
+    ))
 }
 
 fn validate_syscall_name(name: &str) -> Result<()> {

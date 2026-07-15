@@ -1,6 +1,8 @@
-//! Virtual filesystem traits and the in-memory implementation.
+//! Virtual filesystem traits with in-memory and local-directory implementations.
 
 pub mod conformance;
+#[cfg(unix)]
+pub mod local;
 pub mod mem;
 
 mod path;
@@ -8,6 +10,8 @@ mod path;
 use std::error::Error;
 use std::fmt;
 
+#[cfg(unix)]
+pub use local::LocalVfs;
 pub use mem::{InMemoryVfs, InMemoryVfsSnapshot, VfsQuota, VfsStats};
 
 /// Result type returned by VFS operations.

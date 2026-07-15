@@ -65,19 +65,22 @@ console.assert(result.stdout === '1\n')
   - [Syscalls](#syscalls)
   - [JavaScript prelude](#javascript-prelude)
   - [Fetch](#fetch)
-- [Bring your own VFS](#bring-your-own-vfs)
+- [Local directory VFS](#local-directory-vfs)
   - [Rust](#rust-4)
   - [TypeScript](#typescript-4)
-  - [Rust lower-level VFS](#rust-5)
-  - [TypeScript lower-level VFS](#typescript-5)
+- [Bring your own VFS](#bring-your-own-vfs)
+  - [Rust](#rust-5)
+  - [TypeScript](#typescript-5)
+  - [Rust lower-level VFS](#rust-6)
+  - [TypeScript lower-level VFS](#typescript-6)
 - [Snapshots](#snapshots)
-  - [Rust](#rust-6)
-  - [TypeScript](#typescript-6)
-  - [Rust diffing](#rust-7)
-  - [TypeScript diffing](#typescript-7)
+  - [Rust](#rust-7)
+  - [TypeScript](#typescript-7)
+  - [Rust diffing](#rust-8)
+  - [TypeScript diffing](#typescript-8)
 - [Limits and observability](#limits-and-observability)
-  - [Rust](#rust-8)
-  - [TypeScript](#typescript-8)
+  - [Rust](#rust-9)
+  - [TypeScript](#typescript-9)
 - [Security model](#security-model)
 - [Comparison with just-bash](#comparison-with-just-bash)
 - [Performance](#performance)
@@ -575,6 +578,52 @@ const result = await sandbox.exec(
 console.assert(result.stdout === 'echo https://example.test/echo hi\n')
 ```
 
+## Local directory VFS
+
+On Unix hosts a second built-in filesystem, `LocalVfs`, roots the sandbox in
+a directory on the host disk. Files persist across sandboxes and process
+restarts, existing content in the directory is visible inside, and host
+tools can read what the agent writes.
+
+Containment is strict: every sandbox path resolves beneath the root (`..` is
+clamped by normalization before touching the OS), symbolic links are never
+followed (they are invisible to lookups and rejected with `O_NOFOLLOW` at
+open time), and special files are refused. The same quota knobs as
+`InMemoryVfs` apply, seeded by scanning the existing tree at construction.
+Dedicate the directory to the sandbox — containment holds regardless, but
+quota accounting assumes no other process mutates the tree while the sandbox
+is live. `LocalVfs` passes the same conformance suite as `InMemoryVfs`.
+
+#### Rust
+
+```rust ignore
+use tinysandbox::sandbox::Sandbox;
+use tinysandbox::vfs::{LocalVfs, VfsQuota};
+
+let sandbox = Sandbox::builder()
+    .vfs(LocalVfs::new("/srv/agent-42-workspace")?)
+    .build();
+
+// Or with quota limits:
+let quota = VfsQuota { max_bytes: 64 << 20, max_files: 4096, max_file_size: 16 << 20 };
+let sandbox = Sandbox::builder()
+    .vfs(LocalVfs::with_quota("/srv/agent-42-workspace", quota)?)
+    .build();
+```
+
+#### TypeScript
+
+```ts
+import { Sandbox } from '@tinysandbox/tinysandbox'
+
+const sandbox = new Sandbox({
+  localVfs: {
+    root: '/srv/agent-42-workspace',
+    quota: { maxBytes: 64 * 1024 * 1024 } // optional; unset limits are unlimited
+  }
+})
+```
+
 ## Bring your own VFS
 
 The filesystem is a trait, and the in-memory implementation is just the
@@ -759,7 +808,9 @@ reports VFS usage and total commands run.
   VFS, quotas, and path containment as everything else.
 - **Resources are bounded** per execution: memory (ResourceLimiter), CPU
   (epoch interruption), wall clock, output size, file quotas.
-- `..` traversal is contained at the VFS root; `/bin` is read-only.
+- `..` traversal is contained at the VFS root; `/bin` is read-only. With
+  the local directory VFS, containment also refuses symlinks and special
+  files, so the sandbox cannot reach outside its host directory.
 
 tinysandbox is one layer, not the whole story: for hostile multi-tenant
 workloads you should still run your process under OS-level defense in depth
