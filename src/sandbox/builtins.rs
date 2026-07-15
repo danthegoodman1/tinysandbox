@@ -309,10 +309,7 @@ async fn cat_stream(
 fn echo(ctx: CommandContext) -> CommandFuture {
     boxed(async move {
         let CommandContext {
-            args,
-            mut stdout,
-            stderr: _,
-            ..
+            args, mut stdout, ..
         } = ctx;
         let mut newline = true;
         let mut escapes = false;

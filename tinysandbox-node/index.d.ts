@@ -37,7 +37,29 @@ export interface SandboxOptions {
   syscalls?: Record<string, JsSyscall>
   jsPrelude?: string
   fetch?: JsFetch
+  /** Custom VFS implemented in JavaScript. Mutually exclusive with localVfs. */
   vfs?: JsVfs
+  /** Persist the sandbox filesystem under a host directory. Mutually exclusive with vfs. */
+  localVfs?: LocalVfsOptions
+}
+
+/**
+ * Backs the sandbox filesystem with a directory on the host (Unix only).
+ *
+ * Sandbox paths resolve strictly beneath the root: `..` is clamped at the
+ * sandbox root and symlinks are never followed. The directory must exist and
+ * should be dedicated to the sandbox; existing regular files and directories
+ * are visible inside and count toward the quota.
+ */
+export interface LocalVfsOptions {
+  /** Existing host directory that becomes the sandbox root `/`. */
+  root: string
+  /** Storage limits. Unset fields are unlimited. */
+  quota?: {
+    maxBytes?: number
+    maxFiles?: number
+    maxFileSize?: number
+  }
 }
 
 export interface LimitsOptions {

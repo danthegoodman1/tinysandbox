@@ -12,6 +12,21 @@ export declare class NativeSandbox {
   exec(script: string): Promise<ExecResult>
   get fs(): SandboxFs
   stats(): Promise<SandboxStats>
+  /**
+   * Rescans the localVfs root directory and replaces quota usage with the
+   * result. Call this after the host mutates the directory outside the
+   * sandbox. Rejects when the sandbox was not built with the localVfs
+   * option.
+   */
+  refreshLocalVfs(): Promise<VfsStatsJs>
+  /**
+   * Replaces localVfs quota usage with externally computed numbers, for
+   * hosts that track usage out of band. Later file operations apply their
+   * deltas on top of the pushed baseline and quota enforcement blocks
+   * growth against it. Throws when the sandbox was not built with the
+   * localVfs option.
+   */
+  setLocalVfsUsage(usage: VfsStatsJs): void
 }
 export type Sandbox = NativeSandbox
 

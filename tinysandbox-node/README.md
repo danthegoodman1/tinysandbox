@@ -23,6 +23,7 @@ console.log(result.stdout)
 - A bash-like shell subset with pipelines, redirects, variables, and session state.
 - Built-in commands such as `cat`, `grep`, `head`, `tail`, `sort`, `uniq`, `wc`, `sed`, `jq`, `ls`, `cp`, `mv`, `rm`, and `mkdir`.
 - A quota-enforced virtual filesystem with direct host APIs and JavaScript-backed VFS adapters.
+- An optional local directory VFS (`localVfs: { root, quota? }`, Unix only) that persists the sandbox filesystem under a host directory with strict path containment (`..` clamped at the root, symlinks never followed). Quota usage can be rebaselined from the host via `sandbox.refreshLocalVfs()` (rescan) or `sandbox.setLocalVfsUsage({ usedBytes, fileCount })` (push).
 - A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`; expose JS-facing custom host functionality as syscalls.
 - Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes and JSON nesting are capped before evaluation, and the jq filter program text (not input data) is capped on size, nesting, and syntax complexity; jq filter evaluation has the limitations documented in the repository README.
 
