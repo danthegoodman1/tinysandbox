@@ -311,7 +311,6 @@ fn echo(ctx: CommandContext) -> CommandFuture {
         let CommandContext {
             args,
             mut stdout,
-            stderr: _,
             ..
         } = ctx;
         let mut newline = true;
