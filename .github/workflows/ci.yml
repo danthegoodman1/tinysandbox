@@ -40,6 +40,26 @@ jobs:
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
       - run: cargo publish --dry-run --locked -p tinysandbox
 
+  rust-s3-compat:
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-s3-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-s3-
+            ${{ runner.os }}-cargo-
+      - name: Test Rust against loopback S3-compatible API
+        run: scripts/test-s3-compat.sh
+
   node:
     strategy:
       fail-fast: false
