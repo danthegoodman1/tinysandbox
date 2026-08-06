@@ -68,6 +68,8 @@ Installing `@tinysandbox/tinysandbox` automatically selects one optional native
 package for the current operating system, CPU, and Linux libc. The public import
 stays the same, while the main package contains only JavaScript and TypeScript
 definitions and the selected native package contains exactly one binding.
+Installations must leave optional dependencies enabled; using
+`--omit=optional` removes the native binding required at runtime.
 
 Prebuilt bindings cover both 64-bit processor families on the supported
 desktop/server platforms:
