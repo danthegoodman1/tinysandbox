@@ -169,6 +169,7 @@ export type VfsErrno =
   | 'EBUSY'
   | 'EACCES'
   | 'EEXIST'
+  | 'EIO'
   | 'EINVAL'
   | 'EISDIR'
   | 'ENOENT'

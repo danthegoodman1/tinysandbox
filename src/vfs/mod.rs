@@ -4,6 +4,8 @@ pub mod conformance;
 #[cfg(unix)]
 pub mod local;
 pub mod mem;
+#[cfg(feature = "s3")]
+pub mod s3;
 
 mod path;
 
@@ -13,6 +15,8 @@ use std::fmt;
 #[cfg(unix)]
 pub use local::LocalVfs;
 pub use mem::{InMemoryVfs, InMemoryVfsSnapshot, VfsQuota, VfsStats};
+#[cfg(feature = "s3")]
+pub use s3::S3Vfs;
 
 /// Result type returned by VFS operations.
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -29,6 +33,8 @@ pub enum Errno {
     EACCES,
     /// File exists.
     EEXIST,
+    /// Input/output error.
+    EIO,
     /// Invalid argument.
     EINVAL,
     /// Is a directory.
@@ -51,6 +57,7 @@ impl Errno {
             Self::EBUSY => 16,
             Self::EACCES => 13,
             Self::EEXIST => 17,
+            Self::EIO => 5,
             Self::EINVAL => 22,
             Self::EISDIR => 21,
             Self::ENOENT => 2,
@@ -67,6 +74,7 @@ impl Errno {
             Self::EBUSY => "EBUSY",
             Self::EACCES => "EACCES",
             Self::EEXIST => "EEXIST",
+            Self::EIO => "EIO",
             Self::EINVAL => "EINVAL",
             Self::EISDIR => "EISDIR",
             Self::ENOENT => "ENOENT",
@@ -345,6 +353,7 @@ mod tests {
     #[test]
     fn errno_values_match_linux_numbers() {
         assert_eq!(Errno::ENOENT.code(), 2);
+        assert_eq!(Errno::EIO.code(), 5);
         assert_eq!(Errno::EACCES.code(), 13);
         assert_eq!(Errno::EBUSY.code(), 16);
         assert_eq!(Errno::ENOSPC.code(), 28);

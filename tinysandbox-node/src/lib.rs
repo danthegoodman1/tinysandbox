@@ -1307,6 +1307,7 @@ fn errno_from_code(code: Option<&str>) -> Errno {
         Some("EBUSY") => Errno::EBUSY,
         Some("EACCES") => Errno::EACCES,
         Some("EEXIST") => Errno::EEXIST,
+        Some("EIO") => Errno::EIO,
         Some("EINVAL") => Errno::EINVAL,
         Some("EISDIR") => Errno::EISDIR,
         Some("ENOENT") => Errno::ENOENT,
