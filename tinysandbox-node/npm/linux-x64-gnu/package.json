@@ -1,0 +1,39 @@
+{
+  "name": "@tinysandbox/tinysandbox-linux-x64-gnu",
+  "version": "0.4.5",
+  "cpu": [
+    "x64"
+  ],
+  "main": "tinysandbox-node.linux-x64-gnu.node",
+  "files": [
+    "tinysandbox-node.linux-x64-gnu.node"
+  ],
+  "description": "Node.js bindings for the tinysandbox in-process AI agent sandbox",
+  "keywords": [
+    "sandbox",
+    "agent",
+    "shell",
+    "vfs",
+    "quickjs"
+  ],
+  "author": "Dan Goodman",
+  "homepage": "https://github.com/danthegoodman1/tinysandbox#readme",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/tinysandbox.git",
+    "directory": "tinysandbox-node"
+  },
+  "bugs": {
+    "url": "https://github.com/danthegoodman1/tinysandbox/issues"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

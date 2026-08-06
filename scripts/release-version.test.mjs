@@ -50,6 +50,21 @@ test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) =
     /tinysandbox = \{ version = "1\.4\.0", path = "\.\.", features = \["s3"\] \}/
   )
   assert.equal(JSON.parse(readFileSync(join(repoRoot, "tinysandbox-node/package.json"), "utf8")).version, "1.4.0")
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(repoRoot, "tinysandbox-node/package.json"), "utf8")).optionalDependencies,
+    Object.fromEntries(nativePackageNames.map((name) => [name, "1.4.0"]))
+  )
+  assert.match(
+    readFileSync(join(repoRoot, "tinysandbox-node/native.cjs"), "utf8"),
+    /const packageVersion = '1\.4\.0'/
+  )
+  for (const name of nativePackageNames) {
+    const target = name.slice("@tinysandbox/tinysandbox-".length)
+    assert.equal(
+      JSON.parse(readFileSync(join(repoRoot, `tinysandbox-node/npm/${target}/package.json`), "utf8")).version,
+      "1.4.0"
+    )
+  }
   assert.equal(JSON.parse(readFileSync(join(repoRoot, "tinysandbox-node/package-lock.json"), "utf8")).packages[""].version, "1.4.0")
 })
 
@@ -59,7 +74,6 @@ test("checkVersion rejects lockstep disagreement", (t) => {
     join(repoRoot, "tinysandbox-node/package.json"),
     `${JSON.stringify({ name: "@tinysandbox/tinysandbox", version: "9.9.9" }, null, 2)}\n`
   )
-
   assert.throws(() => checkVersion("0.3.0", repoRoot), /tinysandbox-node\/package\.json version is 9\.9\.9/)
   assert.throws(() => readCurrentVersion(repoRoot), /tinysandbox-node\/package\.json version is 9\.9\.9/)
 })
@@ -79,7 +93,10 @@ test("run next writes the computed version", (t) => {
 function createFixtureRepo(t) {
   const repoRoot = mkdtempSync(join(tmpdir(), "tinysandbox-release-"))
   t.after(() => rmSync(repoRoot, { recursive: true, force: true }))
-  mkdirSync(join(repoRoot, "tinysandbox-node"), { recursive: true })
+  const nativeTargets = nativePackageNames.map((name) => name.slice("@tinysandbox/tinysandbox-".length))
+  for (const target of nativeTargets) {
+    mkdirSync(join(repoRoot, "tinysandbox-node", "npm", target), { recursive: true })
+  }
   writeFileSync(
     join(repoRoot, "Cargo.toml"),
     `[workspace]
@@ -107,8 +124,23 @@ tinysandbox = { version = "0.3.0", path = "..", features = ["s3"] }
   )
   writeFileSync(
     join(repoRoot, "tinysandbox-node/package.json"),
-    `${JSON.stringify({ name: "@tinysandbox/tinysandbox", version: "0.3.0" }, null, 2)}\n`
+    `${JSON.stringify({
+      name: "@tinysandbox/tinysandbox",
+      version: "0.3.0",
+      optionalDependencies: Object.fromEntries(nativePackageNames.map((name) => [name, "0.3.0"]))
+    }, null, 2)}\n`
   )
+  writeFileSync(
+    join(repoRoot, "tinysandbox-node/native.cjs"),
+    "const packageVersion = '0.3.0'\n"
+  )
+  for (const name of nativePackageNames) {
+    const target = name.slice("@tinysandbox/tinysandbox-".length)
+    writeFileSync(
+      join(repoRoot, `tinysandbox-node/npm/${target}/package.json`),
+      `${JSON.stringify({ name, version: "0.3.0" }, null, 2)}\n`
+    )
+  }
   writeFileSync(
     join(repoRoot, "tinysandbox-node/package-lock.json"),
     `${JSON.stringify({
@@ -119,10 +151,18 @@ tinysandbox = { version = "0.3.0", path = "..", features = ["s3"] }
       packages: {
         "": {
           name: "@tinysandbox/tinysandbox",
-          version: "0.3.0"
+          version: "0.3.0",
+          optionalDependencies: Object.fromEntries(nativePackageNames.map((name) => [name, "0.3.0"]))
         }
       }
     }, null, 2)}\n`
   )
   return repoRoot
 }
+
+const nativePackageNames = [
+  "@tinysandbox/tinysandbox-darwin-arm64",
+  "@tinysandbox/tinysandbox-darwin-x64",
+  "@tinysandbox/tinysandbox-linux-arm64-gnu",
+  "@tinysandbox/tinysandbox-linux-x64-gnu"
+]

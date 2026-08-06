@@ -8,8 +8,15 @@ const rustManifests = [
   { path: "Cargo.toml", packageName: "tinysandbox" },
   { path: "tinysandbox-node/Cargo.toml", packageName: "tinysandbox-node" }
 ]
+const nativeNpmPackages = [
+  { path: "tinysandbox-node/npm/darwin-arm64/package.json", packageName: "@tinysandbox/tinysandbox-darwin-arm64" },
+  { path: "tinysandbox-node/npm/darwin-x64/package.json", packageName: "@tinysandbox/tinysandbox-darwin-x64" },
+  { path: "tinysandbox-node/npm/linux-arm64-gnu/package.json", packageName: "@tinysandbox/tinysandbox-linux-arm64-gnu" },
+  { path: "tinysandbox-node/npm/linux-x64-gnu/package.json", packageName: "@tinysandbox/tinysandbox-linux-x64-gnu" }
+]
 const npmPackages = [
-  { path: "tinysandbox-node/package.json", packageName: "@tinysandbox/tinysandbox" }
+  { path: "tinysandbox-node/package.json", packageName: "@tinysandbox/tinysandbox" },
+  ...nativeNpmPackages
 ]
 const npmLockfiles = ["tinysandbox-node/package-lock.json"]
 
@@ -79,6 +86,8 @@ export function applyVersion(version, repoRoot = defaultRepoRoot) {
   for (const npmPackage of npmPackages) {
     updateNpmPackage(repoRoot, npmPackage.path, npmPackage.packageName, version)
   }
+  updateNativeOptionalDependencies(repoRoot, version)
+  updateNativeLoaderVersion(repoRoot, version)
   for (const lockfilePath of npmLockfiles) {
     updateNpmLockfile(repoRoot, lockfilePath, version)
   }
@@ -110,6 +119,19 @@ export function checkVersion(version, repoRoot = defaultRepoRoot) {
     }
   }
 
+  const mainPackage = readJson(repoRoot, "tinysandbox-node/package.json")
+  for (const { packageName } of nativeNpmPackages) {
+    const actual = mainPackage.optionalDependencies?.[packageName]
+    if (actual !== version) {
+      fail(`tinysandbox-node/package.json optional dependency ${packageName} is ${actual ?? "missing"}, expected ${version}`)
+    }
+  }
+
+  const loaderVersion = readNativeLoaderVersion(repoRoot)
+  if (loaderVersion !== version) {
+    fail(`tinysandbox-node/native.cjs version is ${loaderVersion}, expected ${version}`)
+  }
+
   for (const lockfilePath of npmLockfiles) {
     const lockfile = readJson(repoRoot, lockfilePath)
     if (lockfile.name !== "@tinysandbox/tinysandbox") {
@@ -123,6 +145,12 @@ export function checkVersion(version, repoRoot = defaultRepoRoot) {
     }
     if (lockfile.packages?.[""]?.version !== version) {
       fail(`${lockfilePath} root package version is ${lockfile.packages?.[""]?.version}, expected ${version}`)
+    }
+    for (const { packageName } of nativeNpmPackages) {
+      const actual = lockfile.packages?.[""]?.optionalDependencies?.[packageName]
+      if (actual !== version) {
+        fail(`${lockfilePath} optional dependency ${packageName} is ${actual ?? "missing"}, expected ${version}`)
+      }
     }
   }
 }
@@ -201,6 +229,37 @@ function updateNpmPackage(repoRoot, packageJsonPath, packageName, version) {
   writeJson(repoRoot, packageJsonPath, packageJson)
 }
 
+function updateNativeOptionalDependencies(repoRoot, version) {
+  const packageJsonPath = "tinysandbox-node/package.json"
+  const packageJson = readJson(repoRoot, packageJsonPath)
+  packageJson.optionalDependencies ??= {}
+  for (const { packageName } of nativeNpmPackages) {
+    packageJson.optionalDependencies[packageName] = version
+  }
+  writeJson(repoRoot, packageJsonPath, packageJson)
+}
+
+function updateNativeLoaderVersion(repoRoot, version) {
+  const loaderPath = "tinysandbox-node/native.cjs"
+  const contents = readFile(repoRoot, loaderPath)
+  const currentVersion = readNativeLoaderVersion(repoRoot)
+  writeFile(
+    repoRoot,
+    loaderPath,
+    contents.replace(`const packageVersion = '${currentVersion}'`, `const packageVersion = '${version}'`)
+  )
+}
+
+function readNativeLoaderVersion(repoRoot) {
+  const loaderPath = "tinysandbox-node/native.cjs"
+  const contents = readFile(repoRoot, loaderPath)
+  const match = contents.match(/^const packageVersion = '([^']+)'$/mu)
+  if (!match) {
+    fail(`${loaderPath} is missing packageVersion`)
+  }
+  return match[1]
+}
+
 function updateNpmLockfile(repoRoot, lockfilePath, version) {
   const lockfile = readJson(repoRoot, lockfilePath)
   lockfile.version = version
@@ -208,6 +267,10 @@ function updateNpmLockfile(repoRoot, lockfilePath, version) {
     fail(`${lockfilePath} is missing the root package entry`)
   }
   lockfile.packages[""].version = version
+  lockfile.packages[""].optionalDependencies ??= {}
+  for (const { packageName } of nativeNpmPackages) {
+    lockfile.packages[""].optionalDependencies[packageName] = version
+  }
   writeJson(repoRoot, lockfilePath, lockfile)
 }
 

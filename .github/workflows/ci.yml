@@ -99,5 +99,5 @@ jobs:
         working-directory: tinysandbox-node
       - run: npm run examples
         working-directory: tinysandbox-node
-      - run: npm publish --dry-run --access public
+      - run: npm pack --dry-run
         working-directory: tinysandbox-node

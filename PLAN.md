@@ -451,8 +451,9 @@ Scope:
   already-published idempotency checks (curl the crates.io API before
   `cargo publish --locked`), waiting for dependency crates to become
   visible before publishing dependents; builds Linux and macOS x64 and arm64
-  native Node artifacts before assembling the npm package; publishes npm
-  packages via OIDC trusted publishing with `npm view` idempotency checks.
+  native Node artifacts into platform-constrained optional packages, then
+  publishes the JS-only facade package; publishes npm packages via OIDC trusted
+  publishing with `npm view` idempotency checks.
 - CI workflow gains any missing release-blocking gates so "CI green on
   main" is a trustworthy release trigger (doc build and publish dry-run
   land in Phase 5).
@@ -493,10 +494,10 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 8A: `scripts/release-version.mjs` lockstep versioning | `next`/`apply`/`check` covers root Cargo, N-API Cargo, npm package, package lock, and N-API dependency version. |
-| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds and validates Linux glibc plus macOS native artifacts for both x64 and arm64; refuses incomplete artifact sets; publishes crates.io + npm idempotently. |
-| Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script/native-matrix tests, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/publish dry-run on Linux glibc and macOS across x64 and arm64. |
-| Complete | Test | script unit tests + dry-run roundtrip | `node --test scripts/release-version.test.mjs scripts/release-native-artifacts.test.mjs` verifies lockstep versions plus the exact four-build/assembly/loader contract; `node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"`; `cargo publish --dry-run --locked -p tinysandbox --allow-dirty`; `npm publish --dry-run --access public` from `tinysandbox-node`. |
+| Complete | Work | 8A: `scripts/release-version.mjs` lockstep versioning | `next`/`apply`/`check` covers root Cargo, N-API Cargo, the facade and four native npm packages, package lock, loader version, optional dependencies, and N-API dependency version. |
+| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds Linux glibc plus macOS native artifacts for x64 and arm64; publishes each artifact in one platform-constrained optional package before the JS-only facade; publishes crates.io + npm idempotently. |
+| Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script/native-package tests, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/package dry-run on Linux glibc and macOS across x64 and arm64. |
+| Complete | Test | script unit tests + dry-run roundtrip | Release tests verify lockstep versions, exact four-package metadata, artifact routing, and a zero-native facade tarball; every native CI runner also bundles the facade with esbuild and loads only its auto-detected package. `release-version.mjs check`, crate publish dry-run, and npm package dry-run remain gates. |
 | Incomplete | Gate | end-to-end auto-release on both registries | Missing: first successful `main` release observed on crates.io and npm. |
 
 ## Phase 9: Prefix-rooted read-only S3 VFS
