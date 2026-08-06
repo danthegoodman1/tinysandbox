@@ -37,10 +37,12 @@ export interface SandboxOptions {
   syscalls?: Record<string, JsSyscall>
   jsPrelude?: string
   fetch?: JsFetch
-  /** Custom VFS implemented in JavaScript. Mutually exclusive with localVfs. */
+  /** Custom VFS implemented in JavaScript. Mutually exclusive with localVfs and s3Vfs. */
   vfs?: JsVfs
-  /** Persist the sandbox filesystem under a host directory. Mutually exclusive with vfs. */
+  /** Persist the sandbox filesystem under a host directory. Mutually exclusive with vfs and s3Vfs. */
   localVfs?: LocalVfsOptions
+  /** Read-only S3 bucket/prefix filesystem. Mutually exclusive with vfs and localVfs. */
+  s3Vfs?: S3VfsOptions
 }
 
 /**
@@ -59,6 +61,31 @@ export interface LocalVfsOptions {
     maxBytes?: number
     maxFiles?: number
     maxFileSize?: number
+  }
+}
+
+/**
+ * Exposes one S3 bucket/key prefix as the read-only sandbox root `/`.
+ *
+ * Region and credentials use the AWS SDK default provider chains when they
+ * are omitted. Endpoint and path-style overrides support compatible services.
+ */
+export interface S3VfsOptions {
+  /** Bucket containing the exposed objects. */
+  bucket: string
+  /** Key prefix exposed as `/`; leading/trailing slashes are normalized. */
+  prefix?: string
+  /** AWS region override. */
+  region?: string
+  /** S3-compatible service endpoint override. */
+  endpointUrl?: string
+  /** Force path-style bucket addressing. */
+  forcePathStyle?: boolean
+  /** Explicit credentials; omit to use the AWS SDK default provider chain. */
+  credentials?: {
+    accessKeyId: string
+    secretAccessKey: string
+    sessionToken?: string
   }
 }
 
@@ -169,6 +196,7 @@ export type VfsErrno =
   | 'EBUSY'
   | 'EACCES'
   | 'EEXIST'
+  | 'EIO'
   | 'EINVAL'
   | 'EISDIR'
   | 'ENOENT'

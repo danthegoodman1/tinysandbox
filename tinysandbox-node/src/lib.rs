@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use napi::bindgen_prelude::{
-    AsyncTask, Buffer, External, FromNapiValue, Function, JsObjectValue, Object, Promise,
+    AsyncTask, Buffer, External, FromNapiValue, Function, JsObjectValue, Object, Promise, Unknown,
+    ValueType,
 };
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Error, JsExternal, Result, Status, Task};
@@ -81,6 +82,7 @@ impl Sandbox {
         let mut local_vfs = None;
 
         if let Some(options) = options {
+            validate_builtin_vfs_selection(&options)?;
             if let Some(limits) = get_optional_object(&options, "limits")? {
                 builder = builder.limits(parse_limits(limits)?);
             }
@@ -133,12 +135,6 @@ impl Sandbox {
                 });
             }
             if let Some(vfs) = get_optional_object(&options, "vfs")? {
-                if options.has_named_property("localVfs")? {
-                    return Err(Error::new(
-                        Status::InvalidArg,
-                        "Sandbox constructor accepts either vfs or localVfs, not both".to_owned(),
-                    ));
-                }
                 builder = builder.vfs_arc(Arc::new(JsVfs::new(vfs)?));
             }
             #[cfg(unix)]
@@ -148,11 +144,14 @@ impl Sandbox {
                 builder = builder.vfs_arc(vfs);
             }
             #[cfg(not(unix))]
-            if options.has_named_property("localVfs")? {
+            if has_non_nullish_named_property(&options, "localVfs")? {
                 return Err(Error::new(
                     Status::InvalidArg,
                     "localVfs is only supported on Unix hosts".to_owned(),
                 ));
+            }
+            if let Some(s3_vfs_options) = get_optional_object(&options, "s3Vfs")? {
+                builder = builder.vfs_arc(build_s3_vfs(&s3_vfs_options)?);
             }
             if let Some(commands) = get_optional_object(&options, "commands")? {
                 for name in Object::keys(&commands)? {
@@ -1186,6 +1185,157 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
     Ok(parsed)
 }
 
+fn validate_builtin_vfs_selection(options: &Object<'_>) -> Result<()> {
+    let mut configured = Vec::new();
+    for name in ["vfs", "localVfs", "s3Vfs"] {
+        if has_non_nullish_named_property(options, name)? {
+            configured.push(name);
+        }
+    }
+    if configured.len() > 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "Sandbox constructor accepts either vfs or localVfs or s3Vfs, not more than one"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+struct S3ClientOptions {
+    region: Option<String>,
+    endpoint_url: Option<String>,
+    force_path_style: Option<bool>,
+    credentials: Option<S3Credentials>,
+}
+
+struct S3Credentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
+
+fn build_s3_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::S3Vfs>> {
+    let bucket = required_nonempty_string(options, "bucket", "s3Vfs")?;
+    let prefix = get_optional::<String>(options, "prefix")?;
+    let region = optional_nonempty_string(options, "region", "s3Vfs")?;
+    let endpoint_url = optional_nonempty_string(options, "endpointUrl", "s3Vfs")?;
+    let force_path_style = get_optional::<bool>(options, "forcePathStyle")?;
+    let credentials = get_optional_object(options, "credentials")?
+        .map(|credentials| parse_s3_credentials(&credentials))
+        .transpose()?;
+
+    let client = build_s3_client(S3ClientOptions {
+        region,
+        endpoint_url,
+        force_path_style,
+        credentials,
+    })?;
+    let vfs = tinysandbox::vfs::S3Vfs::new(client, bucket, prefix.as_deref()).map_err(|err| {
+        Error::new(
+            Status::InvalidArg,
+            format!("invalid s3Vfs bucket or prefix: {err}"),
+        )
+    })?;
+    Ok(Arc::new(vfs))
+}
+
+fn parse_s3_credentials(credentials: &Object<'_>) -> Result<S3Credentials> {
+    Ok(S3Credentials {
+        access_key_id: required_nonempty_string(credentials, "accessKeyId", "s3Vfs credentials")?,
+        secret_access_key: required_nonempty_string(
+            credentials,
+            "secretAccessKey",
+            "s3Vfs credentials",
+        )?,
+        session_token: optional_nonempty_string(credentials, "sessionToken", "s3Vfs credentials")?,
+    })
+}
+
+fn required_nonempty_string(object: &Object<'_>, name: &str, scope: &str) -> Result<String> {
+    if !has_non_nullish_named_property(object, name)? {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{scope} {name} is required and must be a nonempty string"),
+        ));
+    }
+    let value: String = object.get_named_property(name)?;
+    validate_nonempty_string(value, name, scope)
+}
+
+fn optional_nonempty_string(
+    object: &Object<'_>,
+    name: &str,
+    scope: &str,
+) -> Result<Option<String>> {
+    get_optional::<String>(object, name)?
+        .map(|value| validate_nonempty_string(value, name, scope))
+        .transpose()
+}
+
+fn validate_nonempty_string(value: String, name: &str, scope: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{scope} {name} must be a nonempty string"),
+        ));
+    }
+    Ok(value)
+}
+
+fn build_s3_client(options: S3ClientOptions) -> Result<aws_sdk_s3::Client> {
+    let thread = std::thread::Builder::new()
+        .name("tinysandbox-s3-config".to_owned())
+        .spawn(move || -> std::result::Result<aws_sdk_s3::Client, String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("could not create configuration runtime: {err}"))?;
+            runtime.block_on(async move {
+                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+                if let Some(region) = options.region {
+                    loader = loader.region(aws_sdk_s3::config::Region::new(region));
+                }
+                if let Some(credentials) = options.credentials {
+                    loader = loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+                        credentials.access_key_id,
+                        credentials.secret_access_key,
+                        credentials.session_token,
+                        None,
+                        "tinysandbox-node-s3Vfs",
+                    ));
+                }
+                let shared_config = loader.load().await;
+                let mut service_config = aws_sdk_s3::config::Builder::from(&shared_config);
+                if let Some(endpoint_url) = options.endpoint_url {
+                    service_config = service_config.endpoint_url(endpoint_url);
+                }
+                if let Some(force_path_style) = options.force_path_style {
+                    service_config = service_config.force_path_style(force_path_style);
+                }
+                Ok(aws_sdk_s3::Client::from_conf(service_config.build()))
+            })
+        })
+        .map_err(|err| {
+            Error::new(
+                Status::GenericFailure,
+                format!("could not start s3Vfs configuration: {err}"),
+            )
+        })?;
+
+    match thread.join() {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(message)) => Err(Error::new(
+            Status::GenericFailure,
+            format!("could not configure s3Vfs: {message}"),
+        )),
+        Err(_) => Err(Error::new(
+            Status::GenericFailure,
+            "could not configure s3Vfs: configuration worker panicked".to_owned(),
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn build_local_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::LocalVfs>> {
     let root: String = options.get_named_property("root")?;
@@ -1246,7 +1396,7 @@ fn get_optional<T>(object: &Object<'_>, name: &str) -> Result<Option<T>>
 where
     T: napi::bindgen_prelude::FromNapiValue + napi::bindgen_prelude::ValidateNapiValue,
 {
-    if object.has_named_property(name)? {
+    if has_non_nullish_named_property(object, name)? {
         object.get_named_property(name).map(Some)
     } else {
         Ok(None)
@@ -1254,11 +1404,22 @@ where
 }
 
 fn get_optional_object<'env>(object: &Object<'env>, name: &str) -> Result<Option<Object<'env>>> {
-    if object.has_named_property(name)? {
+    if has_non_nullish_named_property(object, name)? {
         object.get_named_property(name).map(Some)
     } else {
         Ok(None)
     }
+}
+
+fn has_non_nullish_named_property(object: &Object<'_>, name: &str) -> Result<bool> {
+    if !object.has_named_property(name)? {
+        return Ok(false);
+    }
+    let value: Unknown<'_> = object.get_named_property(name)?;
+    Ok(!matches!(
+        value.get_type()?,
+        ValueType::Null | ValueType::Undefined
+    ))
 }
 
 fn vfs_callback(vfs: &Object<'_>, name: &'static str) -> Result<JsVfsCallback> {
@@ -1307,6 +1468,7 @@ fn errno_from_code(code: Option<&str>) -> Errno {
         Some("EBUSY") => Errno::EBUSY,
         Some("EACCES") => Errno::EACCES,
         Some("EEXIST") => Errno::EEXIST,
+        Some("EIO") => Errno::EIO,
         Some("EINVAL") => Errno::EINVAL,
         Some("EISDIR") => Errno::EISDIR,
         Some("ENOENT") => Errno::ENOENT,

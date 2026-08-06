@@ -256,6 +256,7 @@ const errnos = [
   'EBUSY',
   'EACCES',
   'EEXIST',
+  'EIO',
   'EINVAL',
   'EISDIR',
   'ENOENT',

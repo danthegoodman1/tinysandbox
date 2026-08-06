@@ -132,9 +132,21 @@ jobs:
       matrix:
         include:
           - os: ubuntu-26.04
-            artifact: linux
+            artifact: linux-x64-gnu
+            uname_arch: x86_64
+            binding: tinysandbox-node.linux-x64-gnu.node
+          - os: ubuntu-26.04-arm
+            artifact: linux-arm64-gnu
+            uname_arch: aarch64
+            binding: tinysandbox-node.linux-arm64-gnu.node
+          - os: macos-26-intel
+            artifact: macos-x64
+            uname_arch: x86_64
+            binding: tinysandbox-node.darwin-x64.node
           - os: macos-26
-            artifact: macos
+            artifact: macos-arm64
+            uname_arch: arm64
+            binding: tinysandbox-node.darwin-arm64.node
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -150,9 +162,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-native-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-native-
+            ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-
             ${{ runner.os }}-cargo-
 
       - uses: actions/setup-node@v4
@@ -171,8 +183,20 @@ jobs:
 
       - name: Collect native binding
         run: |
+          set -euo pipefail
+          actual_arch="$(uname -m)"
+          if [ "$actual_arch" != "${{ matrix.uname_arch }}" ]; then
+            echo "expected ${{ matrix.uname_arch }} runner, got ${actual_arch}" >&2
+            exit 1
+          fi
+          binding="tinysandbox-node/${{ matrix.binding }}"
+          if [ ! -f "$binding" ]; then
+            echo "expected native binding ${binding}" >&2
+            find tinysandbox-node -maxdepth 1 -name '*.node' -print >&2
+            exit 1
+          fi
           mkdir native-artifact
-          cp tinysandbox-node/*.node native-artifact/
+          cp "$binding" native-artifact/
           ls -lh native-artifact
 
       - uses: actions/upload-artifact@v4
@@ -234,10 +258,29 @@ jobs:
       - name: Assemble native package artifacts
         run: |
           set -euo pipefail
-          cp native-artifacts/*.node tinysandbox-node/
+          required_native_bindings=(
+            tinysandbox-node.linux-x64-gnu.node
+            tinysandbox-node.linux-arm64-gnu.node
+            tinysandbox-node.darwin-x64.node
+            tinysandbox-node.darwin-arm64.node
+          )
+          artifact_count="$(find native-artifacts -maxdepth 1 -name '*.node' | wc -l | tr -d ' ')"
+          if [ "$artifact_count" -ne "${#required_native_bindings[@]}" ]; then
+            echo "expected ${#required_native_bindings[@]} downloaded native artifacts, found ${artifact_count}" >&2
+            find native-artifacts -maxdepth 1 -name '*.node' -print >&2
+            exit 1
+          fi
+          for binding in "${required_native_bindings[@]}"; do
+            source="native-artifacts/${binding}"
+            if [ ! -f "$source" ]; then
+              echo "missing required native artifact ${binding}" >&2
+              exit 1
+            fi
+            cp "$source" tinysandbox-node/
+          done
           native_count="$(find tinysandbox-node -maxdepth 1 -name '*.node' | wc -l | tr -d ' ')"
-          if [ "$native_count" -lt 2 ]; then
-            echo "expected at least 2 native package artifacts, found ${native_count}" >&2
+          if [ "$native_count" -ne "${#required_native_bindings[@]}" ]; then
+            echo "expected exactly ${#required_native_bindings[@]} native package artifacts, found ${native_count}" >&2
             exit 1
           fi
           ls -lh tinysandbox-node/*.node

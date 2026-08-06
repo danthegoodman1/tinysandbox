@@ -362,6 +362,7 @@ pub(crate) fn errno_message(errno: Errno) -> &'static str {
         Errno::EBUSY => "Device or resource busy",
         Errno::EACCES => "Permission denied",
         Errno::EEXIST => "File exists",
+        Errno::EIO => "Input/output error",
         Errno::EINVAL => "Invalid argument",
         Errno::EISDIR => "Is a directory",
         Errno::ENOENT => "No such file or directory",

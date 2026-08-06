@@ -59,28 +59,32 @@ console.assert(result.stdout === '1\n')
   - [JavaScript runtime](#javascript-runtime)
 - [Prompt chunks](#prompt-chunks)
 - [Custom commands](#custom-commands)
-  - [Rust](#rust-3)
-  - [TypeScript](#typescript-3)
+  - [Rust](#rust-4)
+  - [TypeScript](#typescript-4)
 - [JavaScript host capabilities](#javascript-host-capabilities)
   - [Syscalls](#syscalls)
   - [JavaScript prelude](#javascript-prelude)
   - [Fetch](#fetch)
+- [Filesystem backends](#filesystem-backends)
 - [Local directory VFS](#local-directory-vfs)
-  - [Rust](#rust-4)
-  - [TypeScript](#typescript-4)
-- [Bring your own VFS](#bring-your-own-vfs)
   - [Rust](#rust-5)
   - [TypeScript](#typescript-5)
-  - [Rust lower-level VFS](#rust-6)
-  - [TypeScript lower-level VFS](#typescript-6)
-- [Snapshots](#snapshots)
+- [Read-only S3 VFS](#read-only-s3-vfs)
+  - [Rust](#rust-6)
+  - [TypeScript](#typescript-6)
+- [Bring your own VFS](#bring-your-own-vfs)
   - [Rust](#rust-7)
   - [TypeScript](#typescript-7)
-  - [Rust diffing](#rust-8)
-  - [TypeScript diffing](#typescript-8)
-- [Limits and observability](#limits-and-observability)
+  - [Rust lower-level VFS](#rust-8)
+  - [TypeScript lower-level VFS](#typescript-8)
+- [Snapshots](#snapshots)
   - [Rust](#rust-9)
   - [TypeScript](#typescript-9)
+  - [Rust diffing](#rust-10)
+  - [TypeScript diffing](#typescript-10)
+- [Limits and observability](#limits-and-observability)
+  - [Rust](#rust-11)
+  - [TypeScript](#typescript-11)
 - [Security model](#security-model)
 - [Comparison with just-bash](#comparison-with-just-bash)
 - [Performance](#performance)
@@ -578,6 +582,14 @@ const result = await sandbox.exec(
 console.assert(result.stdout === 'echo https://example.test/echo hi\n')
 ```
 
+## Filesystem backends
+
+| Backend | Host storage | Mutability | Availability |
+| --- | --- | --- | --- |
+| `InMemoryVfs` | Process memory | Read/write | Default |
+| `LocalVfs` | Contained host directory | Read/write | Unix |
+| `S3Vfs` | Bucket/key prefix | Read-only | Cargo feature `s3`; included in Node |
+
 ## Local directory VFS
 
 On Unix hosts a second built-in filesystem, `LocalVfs`, roots the sandbox in
@@ -631,6 +643,111 @@ const sandbox = new Sandbox({
   }
 })
 ```
+
+## Read-only S3 VFS
+
+The optional `s3` Cargo feature provides `S3Vfs`, a read-only view of one S3
+bucket/key prefix. The Node package includes the same backend as the `s3Vfs`
+constructor option. The configured prefix becomes `/`; an empty prefix exposes
+the whole bucket, and a prefix with no matching keys is a valid empty virtual
+root. Sandbox path normalization and a fixed prefix boundary prevent access to
+adjacent keys.
+
+Files are read with bounded S3 `Range` requests rather than whole-object
+downloads. Shell and embedded-JavaScript streams use 64 KiB chunks, so an
+early-exit pipeline such as `cat /large.log | head -n 1` only fetches the
+needed prefix. Open handles pin the object's ETag with `If-Match`; replacement
+during a read fails with `EIO` instead of combining revisions. Object bodies
+and directory listings are not cached; each open handle retains only its key,
+length, and ETag.
+
+Directories are virtual: both implicit prefixes and zero-byte marker objects
+ending in `/` appear as directories. If an object `a` and descendants under
+`a/` both exist, directory identity wins and the colliding object is hidden.
+All writes and path mutations fail with `EACCES`; VFS quotas/stats, snapshots,
+version-history browsing, S3 Express, and access points are not supported.
+
+#### Rust
+
+Enable the backend and add the AWS SDK used to configure its client:
+
+```bash
+cargo add tinysandbox --features s3
+cargo add aws-config aws-sdk-s3
+cargo add tokio --features macros,rt-multi-thread
+```
+
+```rust no_run
+use aws_sdk_s3::Client;
+use tinysandbox::sandbox::Sandbox;
+use tinysandbox::vfs::S3Vfs;
+
+async fn run_with_client(client: Client) -> Result<(), Box<dyn std::error::Error>> {
+    let vfs = S3Vfs::new(client, "agent-inputs", Some("tenant-42/jobs/current"))?;
+    let sandbox = Sandbox::builder().vfs(vfs).build();
+
+    let result = sandbox.exec("grep ERROR /logs/app.log | head").await;
+    println!("{}", result.stdout);
+    Ok(())
+}
+```
+
+`S3Vfs` accepts an already configured `aws_sdk_s3::Client`; endpoint,
+credentials, region, retry, timeout, TLS, and path-style policy remain owned by
+that client. This also supports S3-compatible services without adding a second
+configuration layer to the VFS.
+
+#### TypeScript
+
+The Node binding uses the AWS SDK's default region and credential provider
+chains when overrides are omitted. Explicit credentials must include both key
+fields; `endpointUrl` and `forcePathStyle` support compatible services.
+
+```ts
+import { Sandbox } from '@tinysandbox/tinysandbox'
+
+const sandbox = new Sandbox({
+  s3Vfs: {
+    bucket: 'agent-inputs',
+    prefix: 'tenant-42/jobs/current',
+    region: 'us-east-1',
+    endpointUrl: 'http://127.0.0.1:9000', // omit for AWS
+    forcePathStyle: true,                  // commonly needed by compatible APIs
+    credentials: {                        // omit to use the default provider chain
+      accessKeyId: process.env.S3_ACCESS_KEY!,
+      secretAccessKey: process.env.S3_SECRET_KEY!
+    }
+  }
+})
+
+const firstLine = await sandbox.exec('cat /logs/app.log | head -n 1')
+```
+
+The minimal IAM shape is `s3:GetObject` on the exposed keys and
+prefix-restricted `s3:ListBucket` on the bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::agent-inputs",
+      "Condition": { "StringLike": { "s3:prefix": ["tenant-42/jobs/current", "tenant-42/jobs/current/*"] } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::agent-inputs/tenant-42/jobs/current/*"
+    }
+  ]
+}
+```
+
+Compatibility tests use a loopback-only, pinned S3-compatible container with
+throwaway credentials; the project test suite never contacts AWS or another
+public object store.
 
 ## Bring your own VFS
 
@@ -896,6 +1013,7 @@ RSS includes runtime and allocator overhead for that process.
 | Feature | Default | Effect |
 | --- | --- | --- |
 | `js` | on | The `js` command, Wasmtime, and the embedded QuickJS module (~600 KB). Disable with `default-features = false` for a shell-and-coreutils-only sandbox with a much smaller dependency tree. |
+| `s3` | off | The read-only, prefix-rooted `S3Vfs` and AWS S3 SDK client adapter. The Node package enables this feature. |
 
 ## Examples
 

@@ -5,12 +5,13 @@
 Build `tinysandbox`: a Rust crate providing an ultra-minimal, Linux-like agent
 sandbox — a VFS behind a trait, a bash-compatible shell subset, native
 coreutils builtins, and a Wasmtime-hosted QuickJS runtime — that other Rust
-projects embed via `Sandbox::builder().vfs(...).command(...).build()`. The
-final phase adds Node.js bindings (napi-rs) so the whole sandbox, including
-custom JS-implemented VFS backends, is usable from Node.
+projects embed via `Sandbox::builder().vfs(...).command(...).build()`. Built-in
+VFS choices include memory, a local directory, and a prefix-rooted read-only S3
+view. Node.js bindings (napi-rs) expose the same sandbox and built-in backends,
+including custom JS-implemented VFS backends.
 
-Non-goals: no real network access from the sandbox, no Python runtime, no
-container/microVM tiers, no persistence backends beyond what snapshots need.
+Non-goals: no real network access from inside the sandbox, no Python runtime,
+no container/microVM tiers, and no writable remote-object-store filesystem.
 
 ## Implementation Principles
 
@@ -28,7 +29,9 @@ container/microVM tiers, no persistence backends beyond what snapshots need.
   sequentially with buffered pipes until streaming is needed.
 - Wasm isolation only for agent-authored code (JS). Builtins are trusted
   native functions over the VFS.
-- No test touches the network or the host filesystem outside temp dirs.
+- No test reaches a public cloud service. Filesystem tests use temp dirs;
+  remote-backend tests use deterministic fakes or an isolated local
+  S3-compatible container.
 
 ## Testing Strategy
 
@@ -40,6 +43,9 @@ container/microVM tiers, no persistence backends beyond what snapshots need.
 - Property tests (proptest) for VFS operation sequences and shell lexing;
   fuzz target for the shell parser (no panics on arbitrary input).
 - End-to-end pipeline tests through the public `Sandbox` API.
+- Network-backed VFS tests split into deterministic protocol-independent fake
+  tests and a local S3-compatible interoperability test; no real AWS account or
+  credentials are used.
 - CI gate per phase: `cargo test --all-features` green, `cargo clippy` clean.
 
 ## Phase 1: VFS trait, in-memory backend, conformance suite
@@ -444,9 +450,9 @@ Scope:
   `chore(release): X.Y.Z [skip release]`; publishes crates with
   already-published idempotency checks (curl the crates.io API before
   `cargo publish --locked`), waiting for dependency crates to become
-  visible before publishing dependents; builds Linux and macOS native Node
-  artifacts before assembling the npm package; publishes npm packages via
-  OIDC trusted publishing with `npm view` idempotency checks.
+  visible before publishing dependents; builds Linux and macOS x64 and arm64
+  native Node artifacts before assembling the npm package; publishes npm
+  packages via OIDC trusted publishing with `npm view` idempotency checks.
 - CI workflow gains any missing release-blocking gates so "CI green on
   main" is a trustworthy release trigger (doc build and publish dry-run
   land in Phase 5).
@@ -465,8 +471,8 @@ Scope:
   contributors require approval from a maintainer).
 
 Out of scope:
-- Prebuilt native binary matrices beyond the Linux/macOS npm package artifacts
-  needed for the first publish; changelog generation; GitHub Releases/tags
+- Prebuilt native binary matrices beyond Linux glibc and macOS on x64/arm64;
+  changelog generation; GitHub Releases/tags
   beyond what the version commit provides.
 
 Completion gate:
@@ -488,7 +494,134 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 8A: `scripts/release-version.mjs` lockstep versioning | `next`/`apply`/`check` covers root Cargo, N-API Cargo, npm package, package lock, and N-API dependency version. |
-| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds Linux/macOS native artifacts; publishes crates.io + npm idempotently. |
-| Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script tests/check, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/publish dry-run on Linux + macOS. |
-| Complete | Test | script unit tests + dry-run roundtrip | `node --test scripts/release-version.test.mjs`; `node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"`; `cargo publish --dry-run --locked -p tinysandbox --allow-dirty`; `npm publish --dry-run --access public` from `tinysandbox-node`. |
+| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds and validates Linux glibc plus macOS native artifacts for both x64 and arm64; refuses incomplete artifact sets; publishes crates.io + npm idempotently. |
+| Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script/native-matrix tests, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/publish dry-run on Linux glibc and macOS across x64 and arm64. |
+| Complete | Test | script unit tests + dry-run roundtrip | `node --test scripts/release-version.test.mjs scripts/release-native-artifacts.test.mjs` verifies lockstep versions plus the exact four-build/assembly/loader contract; `node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"`; `cargo publish --dry-run --locked -p tinysandbox --allow-dirty`; `npm publish --dry-run --access public` from `tinysandbox-node`. |
 | Incomplete | Gate | end-to-end auto-release on both registries | Missing: first successful `main` release observed on crates.io and npm. |
+
+## Phase 9: Prefix-rooted read-only S3 VFS
+
+Goal:
+Add an optional `S3Vfs` that exposes one S3 bucket/key prefix as sandbox root
+`/`, supports filesystem-shaped metadata, directory listings, and ranged
+reads, and cannot mutate remote state. Expose the backend through both Rust
+and Node without requiring a real AWS account for any test.
+
+Scope:
+- Add an opt-in Cargo feature `s3` and `src/vfs/s3.rs`, using an optional
+  `aws-sdk-s3` dependency and the Tokio runtime features required by its private
+  execution bridge. Keep the core crate's default feature set unchanged; the
+  shipped Node binding enables S3 support and adds `aws-config` for its default
+  provider chain. Add dependencies with `cargo add` and inspect both manifest
+  and lockfile diffs.
+- Give Rust callers a constructor that accepts a preconfigured
+  `aws_sdk_s3::Client`, bucket, and optional key prefix. Keep endpoint,
+  credential-provider, retry, timeout, path-style, and TLS policy in the SDK
+  client rather than duplicating AWS configuration in the VFS.
+- Canonicalize the configured root prefix once: accept an empty prefix,
+  normalize optional leading/trailing `/`, reject NUL and empty/`.`/`..`
+  interior components, and append exactly one `/` boundary. Normalize every
+  sandbox path with the existing `normalize_path` before joining it, so no
+  operation can address a sibling key outside the configured prefix.
+- Model directories with `ListObjectsV2(prefix, delimiter="/")`. Root always
+  exists as a virtual directory; non-root directories exist when at least one
+  descendant or a zero-byte directory-marker object exists. Paginate to
+  exhaustion, ignore the marker itself, hide names the VFS cannot represent,
+  deduplicate entries, and return lexicographically sorted `DirEntry` values.
+  If both object `a` and descendants under `a/` exist, directory semantics win
+  consistently in `stat`, `open`, and `readdir`, and the colliding object is
+  hidden.
+- Implement `stat` and read-only `open` with list/head requests and maintain a
+  small mutex-protected handle table containing key, length, and ETag. Implement
+  `read_at` with bounded `GetObject` byte ranges, EOF and empty-buffer fast
+  paths, checked range arithmetic, exact response validation, and `If-Match`
+  so an externally replaced object fails instead of mixing versions. `close`
+  invalidates the handle; object bodies and directory listings are not cached.
+- Make the read-only contract explicit: any open mode containing write,
+  create, create-new, truncate, or append fails with `EACCES`; path mutation
+  methods fail with `EACCES`; `write_at`/`truncate` preserve the established
+  invalid/read-only-handle errno behavior. `stats()` remains unsupported and
+  `is_fast()` remains false.
+- Add Linux `EIO` (5) to `Errno`, shell/Node error messages, and the JS custom
+  VFS errno union. Map missing bucket/key to `ENOENT`, authorization failures
+  to `EACCES`, and transport, retry exhaustion, malformed/truncated responses,
+  ETag precondition failures, and other remote failures to `EIO`; never panic
+  or translate remote failures to `EINVAL`.
+- Put the SDK behind a small internal S3-operation interface. Its production
+  adapter runs SDK futures on owned runtime workers and synchronously returns
+  results without nesting `Runtime::block_on`, so direct `Vfs` calls work both
+  inside and outside an existing Tokio runtime and concurrent sandbox reads do
+  not deadlock.
+- Add Node `s3Vfs` options (`bucket`, optional `prefix`, `region`,
+  `endpointUrl`, `forcePathStyle`, and optional explicit credentials), using
+  the default AWS region/credential provider chain when overrides are absent.
+  It is mutually exclusive with `vfs` and `localVfs`; configuration errors are
+  reported synchronously and request errors use the normal filesystem error
+  shape.
+- Document Rust and TypeScript setup, read-only behavior, prefix/collision and
+  external-mutation semantics, S3-compatible endpoints, and least-privilege
+  `s3:GetObject` plus prefix-restricted `s3:ListBucket` policy. Document that a
+  configured prefix with no matching keys is a valid empty virtual root and
+  that S3 Express,
+  access points, writable operations, snapshots, quotas, body/list caches, and
+  version-history browsing are out of scope.
+
+Out of scope:
+- Put/copy/delete, multipart upload, writable rename emulation, and local
+  write-back caching.
+- Full writable-VFS conformance; `S3Vfs` has a purpose-built read-only suite.
+- Tests against AWS or any other public service.
+
+Correctness invariants:
+- Every emitted request key is either the configured prefix marker or begins
+  with the configured prefix plus its `/` boundary; normalized sandbox paths
+  can never escape it.
+- `stat`, `readdir`, and `open` agree on file-versus-directory identity for
+  marker objects, implicit directories, and file/directory collisions.
+- Listings include every page exactly once, and each non-empty read requests
+  no more than the caller's buffer and never returns bytes from a different
+  object revision.
+- SDK/runtime failures return a stable errno and never panic, hang indefinitely
+  due to a nested runtime, or mutate S3.
+
+Completion gate:
+The fake-backed suite proves mapping, pagination, range, handle, error, and
+read-only behavior; an isolated local S3-compatible container proves the AWS
+SDK wire path and prefix containment; Rust and Node end-to-end reads pass; the
+full feature matrix, clippy, rustdoc, and npm tests are green without any AWS
+credentials.
+
+Testing plan:
+- Unit tests in `src/vfs/s3.rs` use a scripted fake operation interface to pin
+  exact bucket/prefix/range/If-Match requests, empty and nested roots, directory
+  markers, unrepresentable names, file/directory collisions, more than 1,000
+  entries and continuation tokens, deterministic sorting, EOF/short reads,
+  double-close/unknown handles, all mutation rejections, and 403/404/412/5xx/
+  transport error mapping.
+- Integration tests in `tests/vfs_s3.rs` exercise `Sandbox::fs`, shell
+  `cat`/`grep`, streaming early exit, and JS `fs` reads while redirects,
+  `touch`, and removal fail read-only. Include simultaneous reads and direct
+  calls made from within a Tokio runtime to catch runtime/deadlock regressions.
+- `scripts/test-s3-compat.sh` starts a pinned S3-compatible Docker image,
+  creates a unique bucket, seeds a configured root plus a sibling secret,
+  runs ranged-read/list/stat and Rust/Node sandbox smoke tests, and tears the
+  container down. CI runs this as a separate Linux job; all credentials are
+  throwaway local values and the endpoint is loopback-only.
+- Re-run `cargo test --workspace --all-features --locked`, the existing
+  no-default-features build/tests, clippy with warnings denied, rustdoc with
+  warnings denied, `npm test`, examples, and publish dry-runs.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 9A: feature-gated dependencies and public Rust construction API | `Cargo.toml`/`Cargo.lock`: optional `aws-sdk-s3` 1.140.0 under exact `s3`; default remains `js`. `src/vfs/mod.rs` exports documented `S3Vfs`; `cargo doc -p tinysandbox --features s3 --no-deps` is clean. |
+| Complete | Work | 9B: contained prefix mapping and virtual-directory semantics | `src/vfs/s3.rs`: normalized prefix boundary, paginated delimiter listings, marker/implicit directories, sorted deduplication, parent validation, and directory-wins collisions. Focused tests pin exact requests and malformed pagination. |
+| Complete | Work | 9C: read-only handles and bounded ETag-pinned range reads | `src/vfs/s3.rs`: ETag/length handle state, exact Range + If-Match, header validation before body reads, and hard cap of requested bytes plus one sentinel. Tests cover EOF/tail, short/overlong/infinite bodies, revision change, and handle errors. |
+| Complete | Work | 9D: runtime bridge plus `EIO`/remote error mapping | Shared two-worker SDK runtime uses spawn + sync response channel without nested `block_on`; current-thread/multi-thread Tokio, 8-way concurrency, and worker panic are tested. `EIO` is exhaustive across VFS, shell, embedded JS/libuv, N-API parsing, and TS custom-VFS types. |
+| Complete | Work | 9E: Node `s3Vfs` option with AWS and compatible-endpoint configuration | `tinysandbox-node/src/lib.rs` builds the shared core `S3Vfs` with explicit overrides or the AWS default region/credential chains on a dedicated configuration thread. Runtime validation covers nullish optional values, selector mutual exclusion, credential completeness, request-time `EIO`, and TypeScript declarations. |
+| Complete | Doc | Rust/TypeScript usage, IAM, semantics, and feature documentation | `README.md` and `tinysandbox-node/README.md` document construction, strict prefix roots, bounded ETag-pinned ranges, virtual directories, read-only errors, S3-compatible endpoints, empty/missing roots, unsupported features, and least-privilege IAM; the backend/feature tables and duplicate-heading anchors are updated. |
+| Complete | Test | deterministic fake-backed S3 semantics suite | `src/vfs/s3.rs`: 16 tests; `cargo test --locked --features s3 vfs::s3::tests` and `cargo test --locked --no-default-features --features s3 vfs::s3::tests` both pass 16/16; skeptical reviewer approved after bounded-body and malformed-pagination fixes. |
+| Complete | Test | local S3-compatible interoperability suite | Pinned MinIO gate passes Rust 1/1 and Node 9/9 with strict per-request loopback guards and exact container/network/volume cleanup. Coverage includes explicit and default-provider configuration, seeded adjacent-prefix secret, direct middle/tail/EOF ranges, concurrent VFS/Sandbox reads, shell and embedded-JS streaming, mutations, bucket-root and missing-prefix semantics, and Node error shapes. Phase-1 fakes remain authoritative for standards-shaped exact-object/descendant collisions because MinIO collapses that delimiter-list edge case. Separate Linux CI job runs the combined gate. |
+| Complete | Test | full workspace regression and feature matrix | From committed `57fc370`: `cargo fmt --all --check`; locked workspace all-features tests (164 passed plus 14 compiled doctests, 3 ignored); locked workspace no-default build/tests; Clippy all targets/features with `-D warnings`; and rustdoc with `-D warnings` all pass. `npm test` passes 35 with 5 loopback-only skips, and all 5 Node examples pass. Cargo publish dry-run packages/verifies 51 files; npm pack dry-run verifies the 7-file, 12.2 MB tarball. npm publish dry-run produces the identical manifest before the expected refusal to overwrite already-published `0.4.4`. |
+| Complete | Gate | read-only S3 VFS complete without real AWS access | Fake-backed semantics, Rust/Node surfaces, documentation, regression gates, and the compatibility gate are complete. Final `scripts/test-s3-compat.sh` run passes Rust 1/1 and Node 9/9 using only strict `http://127.0.0.1:<port>` guards and throwaway credentials. It removes its container, network, and volume; independent filtered Docker queries for project `tinysandbox-s3-dangoodman-15052` returned empty. No AWS or other public object-store endpoint was contacted. |

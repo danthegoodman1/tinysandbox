@@ -1,0 +1,20 @@
+services:
+  s3:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --address ":9000"
+    environment:
+      MINIO_ROOT_USER: ${TINYSANDBOX_S3_TEST_ACCESS_KEY:?set by scripts/test-s3-compat.sh}
+      MINIO_ROOT_PASSWORD: ${TINYSANDBOX_S3_TEST_SECRET_KEY:?set by scripts/test-s3-compat.sh}
+    ports:
+      - "127.0.0.1:${TINYSANDBOX_S3_TEST_PORT:?set by scripts/test-s3-compat.sh}:9000"
+    volumes:
+      - s3-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 2s
+
+volumes:
+  s3-data:

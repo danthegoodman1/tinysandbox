@@ -93,9 +93,11 @@ export function checkVersion(version, repoRoot = defaultRepoRoot) {
     }
   }
 
-  const nodeCargo = readFile(repoRoot, "tinysandbox-node/Cargo.toml")
-  if (!nodeCargo.includes(`tinysandbox = { version = "${version}", path = ".." }`)) {
-    fail(`tinysandbox-node/Cargo.toml tinysandbox dependency must use ${version}`)
+  const nodeDependency = readTinysandboxNodeDependency(repoRoot)
+  if (nodeDependency.version !== version) {
+    fail(
+      `tinysandbox-node/Cargo.toml tinysandbox dependency uses ${nodeDependency.version}, expected ${version}`
+    )
   }
 
   for (const npmPackage of npmPackages) {
@@ -164,11 +166,30 @@ function updateRustPackageVersion(repoRoot, manifest, packageName, version) {
 function updateTinysandboxNodeDependency(repoRoot, version) {
   const manifest = "tinysandbox-node/Cargo.toml"
   const contents = readFile(repoRoot, manifest)
-  const dependencyPattern = /^tinysandbox = \{ version = "[^"]+", path = "\.\." \}$/mu
-  if (!dependencyPattern.test(contents)) {
+  const dependency = readTinysandboxNodeDependency(repoRoot)
+  const updated = dependency.line.replace(
+    /(?<prefix>\bversion\s*=\s*")[^"]+(?<suffix>")/u,
+    `$<prefix>${version}$<suffix>`
+  )
+  writeFile(repoRoot, manifest, contents.replace(dependency.line, updated))
+}
+
+function readTinysandboxNodeDependency(repoRoot) {
+  const manifest = "tinysandbox-node/Cargo.toml"
+  const contents = readFile(repoRoot, manifest)
+  const dependency = contents.match(/^tinysandbox\s*=\s*\{(?<fields>[^\n{}]*)\}\s*$/mu)
+  if (!dependency?.groups?.fields) {
     fail(`${manifest} tinysandbox dependency was not found`)
   }
-  writeFile(repoRoot, manifest, contents.replace(dependencyPattern, `tinysandbox = { version = "${version}", path = ".." }`))
+  const version = dependency.groups.fields.match(/(?:^|,)\s*version\s*=\s*"([^"]+)"/u)?.[1]
+  if (!version) {
+    fail(`${manifest} tinysandbox dependency is missing version`)
+  }
+  const path = dependency.groups.fields.match(/(?:^|,)\s*path\s*=\s*"([^"]+)"/u)?.[1]
+  if (path !== "..") {
+    fail(`${manifest} tinysandbox dependency path is ${path ?? "missing"}, expected ..`)
+  }
+  return { line: dependency[0], version }
 }
 
 function updateNpmPackage(repoRoot, packageJsonPath, packageName, version) {

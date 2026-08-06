@@ -8,6 +8,7 @@
     "build": "napi build --platform --release --js native.cjs --dts native.d.ts",
     "benchmark:memory": "tsx benchmarks/memory.ts",
     "test": "npm run build && node --import tsx --test __test__/*.mjs",
+    "test:s3-compat": "node --test __test__/s3_vfs.test.mjs",
     "examples": "tsx examples/quickstart.ts && tsx examples/custom_command.ts && tsx examples/js_scripts.ts && tsx examples/js_syscalls.ts && tsx examples/js_vfs.ts"
   },
   "repository": {

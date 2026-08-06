@@ -47,7 +47,7 @@ test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) =
   assert.match(readFileSync(join(repoRoot, "Cargo.toml"), "utf8"), /version = "1\.4\.0"/)
   assert.match(
     readFileSync(join(repoRoot, "tinysandbox-node/Cargo.toml"), "utf8"),
-    /tinysandbox = \{ version = "1\.4\.0", path = "\.\." \}/
+    /tinysandbox = \{ version = "1\.4\.0", path = "\.\.", features = \["s3"\] \}/
   )
   assert.equal(JSON.parse(readFileSync(join(repoRoot, "tinysandbox-node/package.json"), "utf8")).version, "1.4.0")
   assert.equal(JSON.parse(readFileSync(join(repoRoot, "tinysandbox-node/package-lock.json"), "utf8")).packages[""].version, "1.4.0")
@@ -102,7 +102,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tinysandbox = { version = "0.3.0", path = ".." }
+tinysandbox = { version = "0.3.0", path = "..", features = ["s3"] }
 `
   )
   writeFileSync(
