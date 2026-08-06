@@ -450,9 +450,9 @@ Scope:
   `chore(release): X.Y.Z [skip release]`; publishes crates with
   already-published idempotency checks (curl the crates.io API before
   `cargo publish --locked`), waiting for dependency crates to become
-  visible before publishing dependents; builds Linux and macOS native Node
-  artifacts before assembling the npm package; publishes npm packages via
-  OIDC trusted publishing with `npm view` idempotency checks.
+  visible before publishing dependents; builds Linux and macOS x64 and arm64
+  native Node artifacts before assembling the npm package; publishes npm
+  packages via OIDC trusted publishing with `npm view` idempotency checks.
 - CI workflow gains any missing release-blocking gates so "CI green on
   main" is a trustworthy release trigger (doc build and publish dry-run
   land in Phase 5).
@@ -471,8 +471,8 @@ Scope:
   contributors require approval from a maintainer).
 
 Out of scope:
-- Prebuilt native binary matrices beyond the Linux/macOS npm package artifacts
-  needed for the first publish; changelog generation; GitHub Releases/tags
+- Prebuilt native binary matrices beyond Linux glibc and macOS on x64/arm64;
+  changelog generation; GitHub Releases/tags
   beyond what the version commit provides.
 
 Completion gate:
@@ -494,9 +494,9 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 8A: `scripts/release-version.mjs` lockstep versioning | `next`/`apply`/`check` covers root Cargo, N-API Cargo, npm package, package lock, and N-API dependency version. |
-| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds Linux/macOS native artifacts; publishes crates.io + npm idempotently. |
-| Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script tests/check, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/publish dry-run on Linux + macOS. |
-| Complete | Test | script unit tests + dry-run roundtrip | `node --test scripts/release-version.test.mjs`; `node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"`; `cargo publish --dry-run --locked -p tinysandbox --allow-dirty`; `npm publish --dry-run --access public` from `tinysandbox-node`. |
+| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds and validates Linux glibc plus macOS native artifacts for both x64 and arm64; refuses incomplete artifact sets; publishes crates.io + npm idempotently. |
+| Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script/native-matrix tests, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/publish dry-run on Linux glibc and macOS across x64 and arm64. |
+| Complete | Test | script unit tests + dry-run roundtrip | `node --test scripts/release-version.test.mjs scripts/release-native-artifacts.test.mjs` verifies lockstep versions plus the exact four-build/assembly/loader contract; `node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"`; `cargo publish --dry-run --locked -p tinysandbox --allow-dirty`; `npm publish --dry-run --access public` from `tinysandbox-node`. |
 | Incomplete | Gate | end-to-end auto-release on both registries | Missing: first successful `main` release observed on crates.io and npm. |
 
 ## Phase 9: Prefix-rooted read-only S3 VFS

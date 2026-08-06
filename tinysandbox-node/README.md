@@ -64,7 +64,18 @@ details, IAM JSON, and the complete semantics.
 
 ## Platform Support
 
-Published packages include native bindings built by the release workflow. Linux and macOS artifacts are included in the npm package.
+The npm package includes native bindings for both 64-bit processor families on
+the supported desktop/server platforms:
+
+| Platform | x64 | arm64 |
+| --- | --- | --- |
+| Linux (glibc) | yes | yes |
+| macOS | yes | yes |
+
+CI tests each OS/architecture pair on a native runner. The release workflow
+also refuses to publish unless all four architecture-specific bindings are
+present. Alpine and other musl-based Linux distributions are not currently
+included.
 
 ## More
 

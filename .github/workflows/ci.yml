@@ -28,9 +28,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Check release version script
+      - name: Check release scripts and native matrix
         run: |
-          node --test scripts/release-version.test.mjs
+          node --test scripts/release-version.test.mjs scripts/release-native-artifacts.test.mjs
           node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"
       - run: cargo fmt --all --check
       - run: cargo test --workspace --all-features --locked
@@ -71,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-26.04, macos-26]
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26-intel, macos-26]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -84,9 +84,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-node-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-node-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-node-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-node-
             ${{ runner.os }}-cargo-
       - uses: actions/setup-node@v4
         with:
