@@ -53,11 +53,18 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-s3-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-s3-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-s3-
             ${{ runner.os }}-cargo-
-      - name: Test Rust against loopback S3-compatible API
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tinysandbox-node/package-lock.json
+      - run: npm ci
+        working-directory: tinysandbox-node
+      - name: Test Rust and Node against loopback S3-compatible API
         run: scripts/test-s3-compat.sh
 
   node:

@@ -24,6 +24,10 @@ export TINYSANDBOX_S3_TEST_ACCESS_KEY="tinysandbox-test"
 export TINYSANDBOX_S3_TEST_SECRET_KEY="tinysandbox-test-secret"
 export TINYSANDBOX_S3_TEST_BUCKET="tinysandbox-${project}"
 export TINYSANDBOX_S3_TEST_PREFIX="fixtures/${project}/root"
+export AWS_REGION="$TINYSANDBOX_S3_TEST_REGION"
+export AWS_ACCESS_KEY_ID="$TINYSANDBOX_S3_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$TINYSANDBOX_S3_TEST_SECRET_KEY"
+export AWS_EC2_METADATA_DISABLED="true"
 
 cleanup() {
   docker compose --project-name "$project" --file "$compose_file" down --volumes --remove-orphans
@@ -36,3 +40,5 @@ docker compose --project-name "$project" --file "$compose_file" up --detach --wa
 
 cd "$repo_dir"
 cargo test --locked --features s3 --test vfs_s3 -- --ignored --nocapture --test-threads=1
+npm --prefix "$repo_dir/tinysandbox-node" run build
+npm --prefix "$repo_dir/tinysandbox-node" run test:s3-compat
