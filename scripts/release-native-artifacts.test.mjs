@@ -77,19 +77,15 @@ test("publish assembly routes the complete artifact set into platform packages",
   assert.match(workflow, /package_dir="tinysandbox-node\/npm\/\$\{target\}"/)
 })
 
-test("release versioning preserves unpublished optional packages and supports bootstrap auth", () => {
+test("release versioning preserves unpublished optional packages and uses OIDC publishing", () => {
   assert.doesNotMatch(
     workflow,
     /npm install --prefix tinysandbox-node --package-lock-only/,
     "release preparation must not resolve versions that have not been published yet"
   )
-  assert.match(workflow, /NPM_TOKEN_AVAILABLE: \$\{\{ secrets\.NPM_TOKEN != '' \}\}/)
-  assert.match(workflow, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/)
-
-  const bootstrapCheck = workflow.indexOf("- name: Check npm publishing bootstrap")
-  const cratePublish = workflow.indexOf("- name: Publish crate")
-  assert.ok(bootstrapCheck >= 0, "release workflow must check first-publish authentication")
-  assert.ok(bootstrapCheck < cratePublish, "npm bootstrap must be checked before publishing the crate")
+  assert.match(workflow, /id-token: write/)
+  assert.match(workflow, /ACTIONS_ID_TOKEN_REQUEST_URL/)
+  assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN/)
 })
 
 test("platform packages and optional dependencies stay in lockstep", () => {

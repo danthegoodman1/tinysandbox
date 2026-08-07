@@ -2,8 +2,6 @@
 # - CARGO_REGISTRY_TOKEN must allow publishing the tinysandbox crate.
 # - npm trusted publishing must trust this workflow for @tinysandbox/tinysandbox
 #   and its four @tinysandbox/tinysandbox-{platform} native packages.
-# - NPM_TOKEN must be set while bootstrapping new native package names. Remove
-#   it after the first publish and configure trusted publishing for each package.
 # - Branch protection must allow github-actions[bot] to push the release commit to main.
 # - External contributor Actions runs should require maintainer approval before CI runs.
 name: Release
@@ -294,32 +292,6 @@ jobs:
           fi
           node scripts/verify-native-packages.mjs --require-binaries
 
-      - name: Check npm publishing bootstrap
-        env:
-          NPM_TOKEN_AVAILABLE: ${{ secrets.NPM_TOKEN != '' }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        working-directory: tinysandbox-node
-        run: |
-          set -euo pipefail
-          native_packages=(
-            @tinysandbox/tinysandbox-darwin-arm64
-            @tinysandbox/tinysandbox-darwin-x64
-            @tinysandbox/tinysandbox-linux-arm64-gnu
-            @tinysandbox/tinysandbox-linux-x64-gnu
-          )
-          missing_packages=()
-          for package_name in "${native_packages[@]}"; do
-            if ! npm view "${package_name}" name >/dev/null 2>&1; then
-              missing_packages+=("${package_name}")
-            fi
-          done
-          if [ "${#missing_packages[@]}" -gt 0 ] && [ "$NPM_TOKEN_AVAILABLE" != "true" ]; then
-            echo "The following npm packages need an initial token-authenticated publish:" >&2
-            printf '  %s\n' "${missing_packages[@]}" >&2
-            echo "Add an NPM_TOKEN repository secret, rerun this release, then configure trusted publishing and remove the secret." >&2
-            exit 1
-          fi
-
       - name: Publish crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -337,7 +309,6 @@ jobs:
       - name: Publish native and facade npm packages
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: tinysandbox-node
         run: |
           set -euo pipefail
