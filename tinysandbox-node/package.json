@@ -5,7 +5,7 @@
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
-    "build": "napi build --platform --release --js native.cjs --dts native.d.ts",
+    "build": "napi build --platform --release --no-js --dts native.d.ts",
     "benchmark:memory": "tsx benchmarks/memory.ts",
     "test": "npm run build && node --import tsx --test __test__/*.mjs",
     "test:s3-compat": "node --test __test__/s3_vfs.test.mjs",
@@ -35,18 +35,30 @@
   "devDependencies": {
     "@napi-rs/cli": "^3.7.2",
     "@types/node": "^26.1.0",
+    "esbuild": "^0.28.1",
     "tsx": "^4.23.0"
+  },
+  "optionalDependencies": {
+    "@tinysandbox/tinysandbox-darwin-arm64": "0.4.5",
+    "@tinysandbox/tinysandbox-darwin-x64": "0.4.5",
+    "@tinysandbox/tinysandbox-linux-arm64-gnu": "0.4.5",
+    "@tinysandbox/tinysandbox-linux-x64-gnu": "0.4.5"
   },
   "files": [
     "README.md",
     "index.js",
     "index.d.ts",
     "native.cjs",
-    "native.d.ts",
-    "*.node"
+    "native.d.ts"
   ],
   "napi": {
     "binaryName": "tinysandbox-node",
-    "packageName": "tinysandbox"
+    "packageName": "@tinysandbox/tinysandbox",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu"
+    ]
   }
 }

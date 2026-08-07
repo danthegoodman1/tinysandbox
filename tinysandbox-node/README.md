@@ -64,18 +64,27 @@ details, IAM JSON, and the complete semantics.
 
 ## Platform Support
 
-The npm package includes native bindings for both 64-bit processor families on
-the supported desktop/server platforms:
+Installing `@tinysandbox/tinysandbox` automatically selects one optional native
+package for the current operating system, CPU, and Linux libc. The public import
+stays the same, while the main package contains only JavaScript and TypeScript
+definitions and the selected native package contains exactly one binding.
+Installations must leave optional dependencies enabled; using
+`--omit=optional` removes the native binding required at runtime.
+
+Prebuilt bindings cover both 64-bit processor families on the supported
+desktop/server platforms:
 
 | Platform | x64 | arm64 |
 | --- | --- | --- |
 | Linux (glibc) | yes | yes |
 | macOS | yes | yes |
 
-CI tests each OS/architecture pair on a native runner. The release workflow
-also refuses to publish unless all four architecture-specific bindings are
-present. Alpine and other musl-based Linux distributions are not currently
-included.
+CI tests each OS/architecture pair on a native runner. It also bundles the main
+entry point with esbuild and verifies that the resulting application loads only
+the auto-detected native package. The release workflow refuses to publish unless
+all four architecture-specific packages are complete, but the main npm tarball
+is rejected if it contains any `.node` file. Alpine and other musl-based Linux
+distributions are not currently included.
 
 ## More
 

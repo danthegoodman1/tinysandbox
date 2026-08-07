@@ -2,6 +2,8 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { test } from "node:test"
 
+import { nativeTargets, verifyNativePackages } from "./verify-native-packages.mjs"
+
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
 const ciWorkflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8")
 const loader = readFileSync(new URL("../tinysandbox-node/native.cjs", import.meta.url), "utf8")
@@ -60,7 +62,7 @@ test("release matrix builds the four supported native bindings", () => {
   assert.match(ciWorkflow, /runner\.arch.*cargo-node/)
 })
 
-test("publish assembly requires exactly the complete native artifact set", () => {
+test("publish assembly routes the complete artifact set into platform packages", () => {
   const requiredBlock = workflow.match(/required_native_bindings=\(\n([\s\S]*?)\n\s+\)/)
   assert.ok(requiredBlock, "release workflow must declare required_native_bindings")
   const requiredBindings = requiredBlock[1]
@@ -69,11 +71,22 @@ test("publish assembly requires exactly the complete native artifact set", () =>
     .map((line) => line.trim())
 
   assert.deepEqual(requiredBindings, expectedBuilds.map(({ binding }) => binding))
-  assert.match(workflow, /native_count.*\n\s+if \[ "\$native_count" -ne "\$\{#required_native_bindings\[@\]\}" \]/)
-  assert.ok(packageJson.files.includes("*.node"), "npm package must include native bindings")
+  assert.match(workflow, /verify-native-packages\.mjs --require-binaries/)
+  assert.ok(!packageJson.files.includes("*.node"), "main npm package must exclude native bindings")
 
-  for (const binding of requiredBindings) {
-    assert.match(loader, new RegExp(`require\\(['\"]\\./${escapeRegExp(binding)}['\"]\\)`))
+  assert.match(workflow, /package_dir="tinysandbox-node\/npm\/\$\{target\}"/)
+})
+
+test("platform packages and optional dependencies stay in lockstep", () => {
+  verifyNativePackages()
+
+  assert.deepEqual(packageJson.napi.targets, nativeTargets.map(({ triple }) => triple))
+  assert.match(loader, /const nativePackage = `@tinysandbox\/tinysandbox-\$\{target\}`/)
+  for (const { target } of nativeTargets) {
+    assert.doesNotMatch(
+      loader,
+      new RegExp(`require\\(['\"]@tinysandbox/tinysandbox-${escapeRegExp(target)}`)
+    )
   }
 })
 
