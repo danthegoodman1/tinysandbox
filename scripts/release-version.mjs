@@ -151,6 +151,14 @@ export function checkVersion(version, repoRoot = defaultRepoRoot) {
       if (actual !== version) {
         fail(`${lockfilePath} optional dependency ${packageName} is ${actual ?? "missing"}, expected ${version}`)
       }
+      const packagePath = `node_modules/${packageName}`
+      const packageEntry = lockfile.packages?.[packagePath]
+      if (!packageEntry || packageEntry.optional !== true) {
+        fail(`${lockfilePath} is missing the optional package entry ${packagePath}`)
+      }
+      if (packageEntry.version !== undefined && packageEntry.version !== version) {
+        fail(`${lockfilePath} package entry ${packagePath} is ${packageEntry.version}, expected ${version}`)
+      }
     }
   }
 }
@@ -270,6 +278,10 @@ function updateNpmLockfile(repoRoot, lockfilePath, version) {
   lockfile.packages[""].optionalDependencies ??= {}
   for (const { packageName } of nativeNpmPackages) {
     lockfile.packages[""].optionalDependencies[packageName] = version
+    // The release version does not exist on npm yet, so a package-lock refresh
+    // cannot resolve it. Keep an unresolved optional entry: npm ci accepts it,
+    // while a missing or stale entry makes the clean install fail before build.
+    lockfile.packages[`node_modules/${packageName}`] = { optional: true }
   }
   writeJson(repoRoot, lockfilePath, lockfile)
 }
