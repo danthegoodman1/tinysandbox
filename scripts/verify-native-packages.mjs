@@ -94,7 +94,23 @@ function packFiles(packageDir) {
     }
   })
   assert.equal(result.status, 0, result.stderr)
-  return JSON.parse(result.stdout)[0].files.map(({ path }) => path).sort()
+  return parsePackFiles(result.stdout)
+}
+
+export function parsePackFiles(stdout) {
+  const parsed = JSON.parse(stdout)
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : parsed && Array.isArray(parsed.files)
+      ? [parsed]
+      : Object.values(parsed ?? {})
+  assert.equal(entries.length, 1, `npm pack returned invalid package metadata: ${stdout}`)
+  const metadata = entries[0]
+  assert.ok(
+    metadata && Array.isArray(metadata.files),
+    `npm pack returned invalid package metadata: ${stdout}`
+  )
+  return metadata.files.map(({ path }) => path).sort()
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -2,7 +2,11 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { test } from "node:test"
 
-import { nativeTargets, verifyNativePackages } from "./verify-native-packages.mjs"
+import {
+  nativeTargets,
+  parsePackFiles,
+  verifyNativePackages
+} from "./verify-native-packages.mjs"
 
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
 const ciWorkflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8")
@@ -99,6 +103,33 @@ test("platform packages and optional dependencies stay in lockstep", () => {
       new RegExp(`require\\(['\"]@tinysandbox/tinysandbox-${escapeRegExp(target)}`)
     )
   }
+})
+
+test("npm pack metadata supports npm 11 and npm 12 output", () => {
+  const metadata = {
+    files: [
+      { path: "package.json" },
+      { path: "index.js" }
+    ]
+  }
+
+  assert.deepEqual(parsePackFiles(JSON.stringify([metadata])), ["index.js", "package.json"])
+  assert.deepEqual(
+    parsePackFiles(JSON.stringify({ "@tinysandbox/tinysandbox": metadata })),
+    ["index.js", "package.json"]
+  )
+  assert.throws(
+    () => parsePackFiles("[]"),
+    /npm pack returned invalid package metadata/
+  )
+})
+
+test("release checks and publishing use the same pinned npm CLI", () => {
+  const releaseNpm = workflow.match(/npm install -g npm@([^\s]+)/)?.[1]
+  const ciNpm = ciWorkflow.match(/npm install -g npm@([^\s]+)/)?.[1]
+
+  assert.equal(releaseNpm, "12.0.2")
+  assert.equal(ciNpm, releaseNpm)
 })
 
 function escapeRegExp(value) {

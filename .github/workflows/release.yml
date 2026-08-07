@@ -239,7 +239,7 @@ jobs:
           cache-dependency-path: tinysandbox-node/package-lock.json
 
       - name: Update npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@12.0.2
 
       - name: Install Node dependencies
         run: npm ci
