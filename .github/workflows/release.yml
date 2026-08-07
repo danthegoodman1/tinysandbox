@@ -325,7 +325,7 @@ jobs:
             if npm view "${package_name}@${VERSION}" version >/dev/null 2>&1; then
               echo "${package_name} ${VERSION} is already published"
             else
-              npm publish "${package_dir}" --access public
+              npm publish "./${package_dir}" --access public
             fi
           done
 

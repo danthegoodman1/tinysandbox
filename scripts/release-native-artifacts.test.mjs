@@ -132,6 +132,11 @@ test("release checks and publishing use the same pinned npm CLI", () => {
   assert.equal(ciNpm, releaseNpm)
 })
 
+test("npm publishes native packages from explicit local paths", () => {
+  assert.match(workflow, /npm publish "\.\/\$\{package_dir\}" --access public/)
+  assert.doesNotMatch(workflow, /npm publish "\$\{package_dir\}" --access public/)
+})
+
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
