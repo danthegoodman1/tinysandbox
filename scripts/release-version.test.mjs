@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -65,7 +66,26 @@ test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) =
       "1.4.0"
     )
   }
-  assert.equal(JSON.parse(readFileSync(join(repoRoot, "tinysandbox-node/package-lock.json"), "utf8")).packages[""].version, "1.4.0")
+  const lockfile = JSON.parse(
+    readFileSync(join(repoRoot, "tinysandbox-node/package-lock.json"), "utf8")
+  )
+  assert.equal(lockfile.packages[""].version, "1.4.0")
+  for (const name of nativePackageNames) {
+    assert.deepEqual(lockfile.packages[`node_modules/${name}`], { optional: true })
+  }
+})
+
+test("release-versioned optional packages support a clean npm install before publication", (t) => {
+  const repoRoot = createFixtureRepo(t)
+  const nodeRoot = join(repoRoot, "tinysandbox-node")
+
+  applyVersion("1.4.0", repoRoot)
+
+  execFileSync(
+    process.platform === "win32" ? "npm.cmd" : "npm",
+    ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", join(repoRoot, ".npm-cache")],
+    { cwd: nodeRoot, stdio: "pipe" }
+  )
 })
 
 test("checkVersion rejects lockstep disagreement", (t) => {
@@ -153,7 +173,16 @@ tinysandbox = { version = "0.3.0", path = "..", features = ["s3"] }
           name: "@tinysandbox/tinysandbox",
           version: "0.3.0",
           optionalDependencies: Object.fromEntries(nativePackageNames.map((name) => [name, "0.3.0"]))
-        }
+        },
+        ...Object.fromEntries(nativePackageNames.map((name) => [
+          `node_modules/${name}`,
+          {
+            version: "0.3.0",
+            resolved: "https://registry.npmjs.org/stale-package.tgz",
+            integrity: "sha512-stale",
+            optional: true
+          }
+        ]))
       }
     }, null, 2)}\n`
   )
