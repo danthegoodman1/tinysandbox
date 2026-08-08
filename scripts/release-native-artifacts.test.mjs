@@ -42,6 +42,17 @@ const expectedBuilds = [
   }
 ]
 
+const linuxContainers = new Map([
+  [
+    "ubuntu-26.04",
+    "quay.io/pypa/manylinux_2_34_x86_64@sha256:249cdcdcd91ba0639b50140a5a4cd09eead2056e2f76267e7919678a66f9d33d"
+  ],
+  [
+    "ubuntu-26.04-arm",
+    "quay.io/pypa/manylinux_2_34_aarch64@sha256:8621bc7caecfd1e7818a800e8ae8c979936665f180a93e13efeed54cbb026d74"
+  ]
+])
+
 test("release matrix builds the four supported native bindings", () => {
   const matrixEntries = [...workflow.matchAll(
     /- os: ([^\n]+)\n\s+artifact: ([^\n]+)\n\s+uname_arch: ([^\n]+)\n\s+binding: ([^\n]+)/g
@@ -57,13 +68,38 @@ test("release matrix builds the four supported native bindings", () => {
   assert.match(workflow, /matrix\.uname_arch/)
   assert.match(workflow, /cargo-native-\$\{\{ matrix\.artifact \}\}/)
 
-  const nodeMatrix = ciWorkflow.match(/\n  node:\n[\s\S]*?\n        os: \[([^\]]+)\]/)
-  assert.ok(nodeMatrix, "CI must define the Node OS/architecture matrix")
+  const macosNodeMatrix = ciWorkflow.match(/\n  node-macos:\n[\s\S]*?\n        os: \[([^\]]+)\]/)
+  assert.ok(macosNodeMatrix, "CI must define the macOS Node architecture matrix")
   assert.deepEqual(
-    nodeMatrix[1].split(",").map((value) => value.trim()),
-    expectedBuilds.map(({ os }) => os)
+    macosNodeMatrix[1].split(",").map((value) => value.trim()),
+    expectedBuilds.filter(({ os }) => os.startsWith("macos")).map(({ os }) => os)
   )
   assert.match(ciWorkflow, /runner\.arch.*cargo-node/)
+})
+
+test("Linux release and CI builds use pinned GLIBC 2.34 containers", () => {
+  assert.match(workflow, /\n  build-linux-native:/)
+  assert.match(workflow, /\n  build-macos-native:/)
+  assert.match(workflow, /- build-linux-native\n\s+- build-macos-native/)
+  assert.match(ciWorkflow, /\n  node-linux:/)
+
+  for (const [os, image] of linuxContainers) {
+    const escapedImage = escapeRegExp(image)
+    const releaseEntry = new RegExp(
+      `- os: ${escapeRegExp(os)}[\\s\\S]*?container_image: ${escapedImage}`
+    )
+    const ciEntry = new RegExp(
+      `- os: ${escapeRegExp(os)}[\\s\\S]*?container_image: ${escapedImage}`
+    )
+    assert.match(workflow, releaseEntry)
+    assert.match(ciWorkflow, ciEntry)
+  }
+
+  for (const source of [workflow, ciWorkflow]) {
+    assert.match(source, /getconf GNU_LIBC_VERSION/)
+    assert.match(source, /verify-glibc-baseline\.mjs[^\n]*2\.34/)
+  }
+  assert.match(workflow, /Load native binding on GLIBC 2\.34/)
 })
 
 test("publish assembly routes the complete artifact set into platform packages", () => {
@@ -130,6 +166,8 @@ test("release checks and publishing use the same pinned npm CLI", () => {
 
   assert.equal(releaseNpm, "12.0.2")
   assert.equal(ciNpm, releaseNpm)
+  assert.equal([...workflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 3)
+  assert.equal([...ciWorkflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 4)
 })
 
 test("npm publishes native packages from explicit local paths", () => {

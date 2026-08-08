@@ -124,7 +124,7 @@ jobs:
         id: release_ref
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  build-native:
+  build-linux-native:
     needs: prepare
     if: needs.prepare.outputs.release == 'true'
     strategy:
@@ -135,10 +135,92 @@ jobs:
             artifact: linux-x64-gnu
             uname_arch: x86_64
             binding: tinysandbox-node.linux-x64-gnu.node
+            container_image: quay.io/pypa/manylinux_2_34_x86_64@sha256:249cdcdcd91ba0639b50140a5a4cd09eead2056e2f76267e7919678a66f9d33d
           - os: ubuntu-26.04-arm
             artifact: linux-arm64-gnu
             uname_arch: aarch64
             binding: tinysandbox-node.linux-arm64-gnu.node
+            container_image: quay.io/pypa/manylinux_2_34_aarch64@sha256:8621bc7caecfd1e7818a800e8ae8c979936665f180a93e13efeed54cbb026d74
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-
+            ${{ runner.os }}-cargo-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tinysandbox-node/package-lock.json
+
+      - name: Install pinned npm CLI
+        run: npm install -g npm@12.0.2
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: tinysandbox-node
+
+      - name: Verify GLIBC build environment
+        run: test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.34"
+
+      - name: Build native binding
+        run: npm run build
+        working-directory: tinysandbox-node
+
+      - name: Verify native GLIBC baseline
+        run: node scripts/verify-glibc-baseline.mjs "tinysandbox-node/${{ matrix.binding }}" 2.34
+
+      - name: Load native binding on GLIBC 2.34
+        run: |
+          node -e "const binding = require('./tinysandbox-node/${{ matrix.binding }}'); if (typeof binding.NativeSandbox !== 'function') throw new Error('NativeSandbox export missing')"
+
+      - name: Collect native binding
+        run: |
+          set -euo pipefail
+          actual_arch="$(uname -m)"
+          if [ "$actual_arch" != "${{ matrix.uname_arch }}" ]; then
+            echo "expected ${{ matrix.uname_arch }} runner, got ${actual_arch}" >&2
+            exit 1
+          fi
+          binding="tinysandbox-node/${{ matrix.binding }}"
+          if [ ! -f "$binding" ]; then
+            echo "expected native binding ${binding}" >&2
+            find tinysandbox-node -maxdepth 1 -name '*.node' -print >&2
+            exit 1
+          fi
+          mkdir native-artifact
+          cp "$binding" native-artifact/
+          ls -lh native-artifact
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          path: native-artifact/*.node
+          if-no-files-found: error
+
+  build-macos-native:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - os: macos-26-intel
             artifact: macos-x64
             uname_arch: x86_64
@@ -173,6 +255,9 @@ jobs:
           cache: npm
           cache-dependency-path: tinysandbox-node/package-lock.json
 
+      - name: Install pinned npm CLI
+        run: npm install -g npm@12.0.2
+
       - name: Install Node dependencies
         run: npm ci
         working-directory: tinysandbox-node
@@ -180,6 +265,10 @@ jobs:
       - name: Build native binding
         run: npm run build
         working-directory: tinysandbox-node
+
+      - name: Load native binding
+        run: |
+          node -e "const binding = require('./tinysandbox-node/${{ matrix.binding }}'); if (typeof binding.NativeSandbox !== 'function') throw new Error('NativeSandbox export missing')"
 
       - name: Collect native binding
         run: |
@@ -208,7 +297,8 @@ jobs:
   publish:
     needs:
       - prepare
-      - build-native
+      - build-linux-native
+      - build-macos-native
     if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-26.04
     steps:
