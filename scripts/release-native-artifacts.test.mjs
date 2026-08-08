@@ -160,14 +160,10 @@ test("npm pack metadata supports npm 11 and npm 12 output", () => {
   )
 })
 
-test("release checks and publishing use the same pinned npm CLI", () => {
-  const releaseNpm = workflow.match(/npm install -g npm@([^\s]+)/)?.[1]
-  const ciNpm = ciWorkflow.match(/npm install -g npm@([^\s]+)/)?.[1]
-
-  assert.equal(releaseNpm, "12.0.2")
-  assert.equal(ciNpm, releaseNpm)
+test("workflows pin npm CLIs compatible with their Node versions", () => {
   assert.equal([...workflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 3)
-  assert.equal([...ciWorkflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 4)
+  assert.equal([...ciWorkflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 1)
+  assert.equal([...ciWorkflow.matchAll(/npm install -g npm@11\.12\.1/g)].length, 3)
 })
 
 test("npm publishes native packages from explicit local paths", () => {
