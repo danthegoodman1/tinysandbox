@@ -79,11 +79,13 @@ desktop/server platforms:
 | Linux (glibc) | yes | yes |
 | macOS | yes | yes |
 
-CI tests each OS/architecture pair on a native runner. It also bundles the main
-entry point with esbuild and verifies that the resulting application loads only
-the auto-detected native package. The release workflow refuses to publish unless
-all four architecture-specific packages are complete, but the main npm tarball
-is rejected if it contains any `.node` file. Alpine and other musl-based Linux
+Linux prebuilt bindings require glibc 2.34 or newer. CI tests each
+OS/architecture pair on a native runner, with Linux builds and tests running in
+pinned glibc 2.34 containers. It also bundles the main entry point with esbuild
+and verifies that the resulting application loads only the auto-detected native
+package. The release workflow refuses to publish unless all four
+architecture-specific packages are complete, but the main npm tarball is
+rejected if it contains any `.node` file. Alpine and other musl-based Linux
 distributions are not currently included.
 
 ## More
