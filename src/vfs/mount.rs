@@ -16,6 +16,13 @@ struct MountedHandle {
     inner: FileHandle,
 }
 
+struct MountedPath {
+    mount: String,
+    vfs: Arc<dyn Vfs>,
+    inner: String,
+    at_mount: bool,
+}
+
 /// A read-only virtual root whose immediate children are static VFS mounts.
 ///
 /// Mount names are single path components. Each backend remains rooted at `/`:
@@ -48,7 +55,7 @@ impl MountedVfs {
         self.mounts.keys().map(String::as_str)
     }
 
-    fn mounted_path(&self, path: &str) -> VfsResult<Option<(String, Arc<dyn Vfs>, String, bool)>> {
+    fn mounted_path(&self, path: &str) -> VfsResult<Option<MountedPath>> {
         let components = normalize_path(path)?;
         let Some(name) = components.first() else {
             return Ok(None);
@@ -62,7 +69,12 @@ impl MountedVfs {
         } else {
             format!("/{}", components[1..].join("/"))
         };
-        Ok(Some((name.clone(), Arc::clone(vfs), inner, at_mount)))
+        Ok(Some(MountedPath {
+            mount: name.clone(),
+            vfs: Arc::clone(vfs),
+            inner,
+            at_mount,
+        }))
     }
 
     fn handle(&self, handle: FileHandle) -> VfsResult<(Arc<dyn Vfs>, FileHandle)> {
@@ -96,14 +108,14 @@ impl Default for MountedVfs {
 impl Vfs for MountedVfs {
     fn stat(&self, path: &str) -> VfsResult<Metadata> {
         match self.mounted_path(path)? {
-            Some((_, vfs, inner, _)) => vfs.stat(&inner),
+            Some(path) => path.vfs.stat(&path.inner),
             None => Ok(directory_metadata()),
         }
     }
 
     fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
         match self.mounted_path(path)? {
-            Some((_, vfs, inner, _)) => vfs.readdir(&inner),
+            Some(path) => path.vfs.readdir(&path.inner),
             None => Ok(self
                 .mounts
                 .keys()
@@ -117,8 +129,8 @@ impl Vfs for MountedVfs {
 
     fn mkdir(&self, path: &str) -> VfsResult<()> {
         match self.mounted_path(path) {
-            Ok(Some((_, _, _, true))) => Err(VfsError::new(Errno::EEXIST)),
-            Ok(Some((_, vfs, inner, false))) => vfs.mkdir(&inner),
+            Ok(Some(path)) if path.at_mount => Err(VfsError::new(Errno::EEXIST)),
+            Ok(Some(path)) => path.vfs.mkdir(&path.inner),
             Ok(None) => Err(VfsError::new(Errno::EACCES)),
             Err(err) if err.errno() == Errno::ENOENT => Err(VfsError::new(Errno::EACCES)),
             Err(err) => Err(err),
@@ -126,13 +138,13 @@ impl Vfs for MountedVfs {
     }
 
     fn rename(&self, from: &str, to: &str) -> VfsResult<()> {
-        let (from_mount, from_vfs, from_inner, from_root) = self
+        let from = self
             .mounted_path(from)?
             .ok_or(VfsError::new(Errno::EBUSY))?;
-        if from_root {
+        if from.at_mount {
             return Err(VfsError::new(Errno::EBUSY));
         }
-        let (to_mount, _to_vfs, to_inner, to_root) = self
+        let to = self
             .mounted_path(to)
             .map_err(|err| {
                 if err.errno() == Errno::ENOENT {
@@ -142,38 +154,40 @@ impl Vfs for MountedVfs {
                 }
             })?
             .ok_or(VfsError::new(Errno::EBUSY))?;
-        if to_root {
+        if to.at_mount {
             return Err(VfsError::new(Errno::EBUSY));
         }
-        if from_mount != to_mount {
+        if from.mount != to.mount {
             return Err(VfsError::new(Errno::EXDEV));
         }
-        from_vfs.rename(&from_inner, &to_inner)
+        from.vfs.rename(&from.inner, &to.inner)
     }
 
     fn unlink(&self, path: &str) -> VfsResult<()> {
         match self.mounted_path(path)? {
-            Some((_, _, _, true)) | None => Err(VfsError::new(Errno::EISDIR)),
-            Some((_, vfs, inner, false)) => vfs.unlink(&inner),
+            Some(path) if path.at_mount => Err(VfsError::new(Errno::EISDIR)),
+            Some(path) => path.vfs.unlink(&path.inner),
+            None => Err(VfsError::new(Errno::EISDIR)),
         }
     }
 
     fn rmdir(&self, path: &str) -> VfsResult<()> {
         match self.mounted_path(path)? {
-            Some((_, _, _, true)) | None => Err(VfsError::new(Errno::EBUSY)),
-            Some((_, vfs, inner, false)) => vfs.rmdir(&inner),
+            Some(path) if path.at_mount => Err(VfsError::new(Errno::EBUSY)),
+            Some(path) => path.vfs.rmdir(&path.inner),
+            None => Err(VfsError::new(Errno::EBUSY)),
         }
     }
 
     fn open(&self, path: &str, mode: OpenMode) -> VfsResult<FileHandle> {
-        let (_, vfs, inner, at_mount) = self
+        let path = self
             .mounted_path(path)?
             .ok_or(VfsError::new(Errno::EISDIR))?;
-        if at_mount {
+        if path.at_mount {
             return Err(VfsError::new(Errno::EISDIR));
         }
-        let inner_handle = vfs.open(&inner, mode)?;
-        Ok(self.insert_handle(vfs, inner_handle))
+        let inner_handle = path.vfs.open(&path.inner, mode)?;
+        Ok(self.insert_handle(path.vfs, inner_handle))
     }
 
     fn read_at(&self, handle: FileHandle, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
