@@ -39,6 +39,10 @@ function liveOptions(prefix = requiredEnv('TINYSANDBOX_S3_TEST_PREFIX')) {
   }
 }
 
+function sandboxWithS3(options) {
+  return new Sandbox({ mounts: { input: { type: 's3', ...options } } })
+}
+
 test('S3 compatibility endpoint guard is strictly loopback-only', () => {
   for (const value of ['http://127.0.0.1:9000', 'http://localhost:1']) {
     assert.equal(isAllowedLoopbackEndpoint(value), true, value)
@@ -56,67 +60,48 @@ test('S3 compatibility endpoint guard is strictly loopback-only', () => {
   }
 })
 
-test('s3Vfs validates option shapes synchronously', () => {
-  assert.doesNotThrow(() => new Sandbox({ s3Vfs: null }))
-  assert.doesNotThrow(() => new Sandbox({ s3Vfs: undefined }))
-  assert.throws(() => new Sandbox({ s3Vfs: {} }), /s3Vfs bucket is required/)
-  assert.throws(() => new Sandbox({ s3Vfs: 42 }), /object/i)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: '' } }), /bucket must be a nonempty string/)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: '   ' } }), /bucket must be a nonempty string/)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: 42 } }), /string/i)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: 'bucket', prefix: 42 } }), /string/i)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: 'bucket', region: '' } }), /region must be a nonempty string/)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: 'bucket', region: 42 } }), /string/i)
-  assert.throws(() => new Sandbox({ s3Vfs: { bucket: 'bucket', endpointUrl: '' } }), /endpointUrl must be a nonempty string/)
+test('s3 mount validates option shapes synchronously', () => {
+  assert.throws(() => sandboxWithS3({}), /S3 mount bucket is required/)
+  assert.throws(() => sandboxWithS3({ bucket: '' }), /bucket must be a nonempty string/)
+  assert.throws(() => sandboxWithS3({ bucket: '   ' }), /bucket must be a nonempty string/)
+  assert.throws(() => sandboxWithS3({ bucket: 42 }), /string/i)
+  assert.throws(() => sandboxWithS3({ bucket: 'bucket', prefix: 42 }), /string/i)
+  assert.throws(() => sandboxWithS3({ bucket: 'bucket', region: '' }), /region must be a nonempty string/)
+  assert.throws(() => sandboxWithS3({ bucket: 'bucket', region: 42 }), /string/i)
+  assert.throws(() => sandboxWithS3({ bucket: 'bucket', endpointUrl: '' }), /endpointUrl must be a nonempty string/)
   assert.throws(
-    () => new Sandbox({ s3Vfs: { bucket: 'bucket', credentials: { secretAccessKey: 'secret' } } }),
+    () => sandboxWithS3({ bucket: 'bucket', credentials: { secretAccessKey: 'secret' } }),
     /accessKeyId is required/
   )
   assert.throws(
-    () => new Sandbox({ s3Vfs: { bucket: 'bucket', credentials: { accessKeyId: 'key' } } }),
+    () => sandboxWithS3({ bucket: 'bucket', credentials: { accessKeyId: 'key' } }),
     /secretAccessKey is required/
   )
   assert.throws(
-    () => new Sandbox({
-      s3Vfs: {
-        bucket: 'bucket',
-        credentials: { accessKeyId: 'key', secretAccessKey: 'secret', sessionToken: '' }
-      }
+    () => sandboxWithS3({
+      bucket: 'bucket',
+      credentials: { accessKeyId: 'key', secretAccessKey: 'secret', sessionToken: '' }
     }),
     /sessionToken must be a nonempty string/
-  )
-  assert.throws(
-    () => new Sandbox({ vfs: {}, s3Vfs: {} }),
-    /either vfs or localVfs or s3Vfs/
-  )
-  assert.throws(
-    () => new Sandbox({ localVfs: {}, s3Vfs: {} }),
-    /either vfs or localVfs or s3Vfs/
   )
 
   const accessKeyId = 'shape-test-key'
   const secretAccessKey = 'shape-test-secret'
-  assert.doesNotThrow(() => new Sandbox({
-    vfs: null,
-    localVfs: undefined,
-    s3Vfs: {
-      bucket: 'bucket',
-      prefix: null,
-      region: 'us-east-1',
-      endpointUrl: null,
-      forcePathStyle: null,
-      credentials: { accessKeyId, secretAccessKey, sessionToken: null }
-    }
+  assert.doesNotThrow(() => sandboxWithS3({
+    bucket: 'bucket',
+    prefix: null,
+    region: 'us-east-1',
+    endpointUrl: null,
+    forcePathStyle: null,
+    credentials: { accessKeyId, secretAccessKey, sessionToken: null }
   }))
-  assert.doesNotThrow(() => new Sandbox({
-    s3Vfs: { bucket: 'bucket', region: 'us-east-1', credentials: null }
-  }))
+  assert.doesNotThrow(() => sandboxWithS3({ bucket: 'bucket', region: 'us-east-1', credentials: null }))
 
   const originalRegion = process.env.AWS_REGION
   process.env.AWS_REGION = 'us-east-1'
   try {
-    assert.doesNotThrow(() => new Sandbox({
-      s3Vfs: { bucket: 'bucket', region: null, credentials: { accessKeyId, secretAccessKey } }
+    assert.doesNotThrow(() => sandboxWithS3({
+      bucket: 'bucket', region: null, credentials: { accessKeyId, secretAccessKey }
     }))
   } finally {
     if (originalRegion === undefined) delete process.env.AWS_REGION
@@ -129,41 +114,39 @@ test('custom VFS EIO errors retain their code', async () => {
     ['stat', 'readdir', 'mkdir', 'rename', 'unlink', 'rmdir', 'open', 'readAt', 'writeAt', 'truncate', 'close']
       .map((name) => [name, async () => { const error = new Error('remote I/O failed'); error.code = 'EIO'; throw error }])
   )
-  const sandbox = new Sandbox({ vfs })
-  await assert.rejects(() => sandbox.fs.stat('/x'), { code: 'EIO' })
+  const sandbox = new Sandbox({ mounts: { remote: { type: 'custom', vfs } } })
+  await assert.rejects(() => sandbox.fs.stat('/remote/x'), { code: 'EIO' })
 })
 
-test('built-in s3Vfs request failures use the normal EIO filesystem shape', async () => {
-  const sandbox = new Sandbox({
-    s3Vfs: {
-      bucket: 'bucket',
-      region: 'us-east-1',
-      endpointUrl: 'not a url',
-      forcePathStyle: true,
-      credentials: { accessKeyId: 'key', secretAccessKey: 'secret' }
-    }
+test('built-in S3 mount request failures use the normal EIO filesystem shape', async () => {
+  const sandbox = sandboxWithS3({
+    bucket: 'bucket',
+    region: 'us-east-1',
+    endpointUrl: 'not a url',
+    forcePathStyle: true,
+    credentials: { accessKeyId: 'key', secretAccessKey: 'secret' }
   })
   await assert.rejects(
-    () => sandbox.fs.stat('/x'),
+    () => sandbox.fs.stat('/input/x'),
     (error) => {
       assert.equal(error.code, 'EIO')
-      assert.match(error.message, /^EIO: \/x$/)
+      assert.match(error.message, /^EIO: \/input\/x$/)
       return true
     }
   )
 })
 
-test('s3Vfs reads a prefix through host, shell, and embedded JS APIs', { skip: !live }, async () => {
-  const sandbox = new Sandbox({ s3Vfs: liveOptions() })
+test('S3 mount reads a prefix through host, shell, and embedded JS APIs', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3(liveOptions())
 
-  assert.deepEqual(await sandbox.fs.stat('/alpha.txt'), {
+  assert.deepEqual(await sandbox.fs.stat('/input/alpha.txt'), {
     fileType: 'file',
     len: 6,
     isFile: true,
     isDir: false
   })
   assert.deepEqual(
-    (await sandbox.fs.readdir('/')).map(({ name, fileType }) => [name, fileType]),
+    (await sandbox.fs.readdir('/input')).map(({ name, fileType }) => [name, fileType]),
     [
       ['alpha.txt', 'file'],
       ['empty-marker', 'directory'],
@@ -171,9 +154,9 @@ test('s3Vfs reads a prefix through host, shell, and embedded JS APIs', { skip: !
       ['nested', 'directory']
     ]
   )
-  assert.equal(String(await sandbox.fs.readFile('/nested/data.txt')), 'nested needle\nanother line\n')
+  assert.equal(String(await sandbox.fs.readFile('/input/nested/data.txt')), 'nested needle\nanother line\n')
 
-  const handle = await sandbox.fs.open('/large.txt', { read: true })
+  const handle = await sandbox.fs.open('/input/large.txt', { read: true })
   try {
     assert.equal(String(await sandbox.fs.readAt(handle, 13, 11)), 'record-0000')
   } finally {
@@ -181,63 +164,61 @@ test('s3Vfs reads a prefix through host, shell, and embedded JS APIs', { skip: !
   }
 
   const [alpha, nested] = await Promise.all([
-    sandbox.fs.readFile('/alpha.txt'),
-    sandbox.fs.readFile('/nested/data.txt')
+    sandbox.fs.readFile('/input/alpha.txt'),
+    sandbox.fs.readFile('/input/nested/data.txt')
   ])
   assert.equal(String(alpha), 'alpha\n')
   assert.equal(String(nested), 'nested needle\nanother line\n')
 
-  const head = await sandbox.exec('cat /large.txt | head -n 1')
+  const head = await sandbox.exec('cat /input/large.txt | head -n 1')
   assert.equal(head.exitCode, 0, head.stderr)
   assert.equal(head.stdout, 'first record\n')
-  const grep = await sandbox.exec('grep needle /nested/data.txt')
+  const grep = await sandbox.exec('grep needle /input/nested/data.txt')
   assert.equal(grep.exitCode, 0, grep.stderr)
   assert.equal(grep.stdout, 'nested needle\n')
-  const embedded = await sandbox.exec(`js -e 'const fs=require("fs"); console.log(fs.readFileSync("/alpha.txt","utf8").trim())'`)
+  const embedded = await sandbox.exec(`js -e 'const fs=require("fs"); console.log(fs.readFileSync("/input/alpha.txt","utf8").trim())'`)
   assert.equal(embedded.exitCode, 0, embedded.stderr)
   assert.equal(embedded.stdout, 'alpha\n')
 })
 
-test('s3Vfs rejects mutations and contains its configured prefix', { skip: !live }, async () => {
-  const sandbox = new Sandbox({ s3Vfs: liveOptions() })
+test('S3 mount rejects mutations and contains its configured prefix', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3(liveOptions())
 
-  await assert.rejects(() => sandbox.fs.writeFile('/new.txt', Buffer.from('forbidden')), { code: 'EACCES' })
-  await assert.rejects(() => sandbox.fs.mkdir('/new-dir'), { code: 'EACCES' })
-  await assert.rejects(() => sandbox.fs.stat('/../root-secret.txt'), { code: 'ENOENT' })
-  assert.ok((await sandbox.fs.readdir('/')).every((entry) => !entry.name.includes('secret')))
+  await assert.rejects(() => sandbox.fs.writeFile('/input/new.txt', Buffer.from('forbidden')), { code: 'EACCES' })
+  await assert.rejects(() => sandbox.fs.mkdir('/input/new-dir'), { code: 'EACCES' })
+  await assert.rejects(() => sandbox.fs.stat('/input/../root-secret.txt'), { code: 'ENOENT' })
+  assert.ok((await sandbox.fs.readdir('/input')).every((entry) => !entry.name.includes('secret')))
 
-  const redirect = await sandbox.exec('echo forbidden > /new.txt')
+  const redirect = await sandbox.exec('echo forbidden > /input/new.txt')
   assert.notEqual(redirect.exitCode, 0)
   assert.match(redirect.stderr, /Permission denied/)
 })
 
-test('s3Vfs makes real reads from an explicitly empty bucket-root prefix', { skip: !live }, async () => {
-  const sandbox = new Sandbox({ s3Vfs: liveOptions('') })
-  const fullKey = `/${requiredEnv('TINYSANDBOX_S3_TEST_PREFIX')}/alpha.txt`
+test('S3 mount makes real reads from an explicitly empty bucket-root prefix', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3(liveOptions(''))
+  const fullKey = `/input/${requiredEnv('TINYSANDBOX_S3_TEST_PREFIX')}/alpha.txt`
   assert.equal(String(await sandbox.fs.readFile(fullKey)), 'alpha\n')
 })
 
-test('s3Vfs treats a missing configured prefix as an empty virtual root', { skip: !live }, async () => {
+test('S3 mount treats a missing configured prefix as an empty virtual root', { skip: !live }, async () => {
   const missingPrefix = `${requiredEnv('TINYSANDBOX_S3_TEST_PREFIX')}-missing`
-  const sandbox = new Sandbox({ s3Vfs: liveOptions(missingPrefix) })
-  assert.deepEqual(await sandbox.fs.stat('/'), {
+  const sandbox = sandboxWithS3(liveOptions(missingPrefix))
+  assert.deepEqual(await sandbox.fs.stat('/input'), {
     fileType: 'directory',
     len: 0,
     isFile: false,
     isDir: true
   })
-  assert.deepEqual(await sandbox.fs.readdir('/'), [])
-  await assert.rejects(() => sandbox.fs.stat('/missing.txt'), { code: 'ENOENT' })
+  assert.deepEqual(await sandbox.fs.readdir('/input'), [])
+  await assert.rejects(() => sandbox.fs.stat('/input/missing.txt'), { code: 'ENOENT' })
 })
 
-test('s3Vfs default AWS region and credential chains can read the live fixture', { skip: !live }, async () => {
-  const sandbox = new Sandbox({
-    s3Vfs: {
-      bucket: requiredEnv('TINYSANDBOX_S3_TEST_BUCKET'),
-      prefix: requiredEnv('TINYSANDBOX_S3_TEST_PREFIX'),
-      endpointUrl: requireLoopbackEndpoint(),
-      forcePathStyle: true
-    }
+test('S3 mount default AWS region and credential chains can read the live fixture', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3({
+    bucket: requiredEnv('TINYSANDBOX_S3_TEST_BUCKET'),
+    prefix: requiredEnv('TINYSANDBOX_S3_TEST_PREFIX'),
+    endpointUrl: requireLoopbackEndpoint(),
+    forcePathStyle: true
   })
-  assert.equal(String(await sandbox.fs.readFile('/alpha.txt')), 'alpha\n')
+  assert.equal(String(await sandbox.fs.readFile('/input/alpha.txt')), 'alpha\n')
 })

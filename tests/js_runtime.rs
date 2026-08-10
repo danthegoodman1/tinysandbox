@@ -897,22 +897,22 @@ async fn js_fs_sync_surface_round_trips_text_binary_and_offsets() {
     let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
-fs.mkdirSync('/work', { recursive: true })
-fs.writeFileSync('/work/text.txt', 'hello')
-fs.appendFileSync('/work/text.txt', ' world')
-const fd = fs.openSync('/work/bin', 'w+')
+fs.mkdirSync('/workspace/work', { recursive: true })
+fs.writeFileSync('/workspace/work/text.txt', 'hello')
+fs.appendFileSync('/workspace/work/text.txt', ' world')
+const fd = fs.openSync('/workspace/work/bin', 'w+')
 fs.writeSync(fd, Buffer.from([1, 2, 3, 4]), 0, 4, 0)
 fs.writeSync(fd, Buffer.from([9]), 0, 1, 2)
 fs.ftruncateSync(fd, 3)
 fs.closeSync(fd)
 const input = Buffer.alloc(4)
-const readFd = fs.openSync('/work/bin', 'r')
+const readFd = fs.openSync('/workspace/work/bin', 'r')
 const n = fs.readSync(readFd, input, 1, 3, 0)
 fs.closeSync(readFd)
-console.log(fs.readFileSync('/work/text.txt', 'utf8'))
+console.log(fs.readFileSync('/workspace/work/text.txt', 'utf8'))
 console.log(n, Array.from(input).join(','))
-console.log(fs.readdirSync('/work').join(','))
-const stat = fs.statSync('/work/bin')
+console.log(fs.readdirSync('/workspace/work').join(','))
+const stat = fs.statSync('/workspace/work/bin')
 console.log(stat.isFile(), stat.isDirectory(), stat.size)
 "#;
 
@@ -936,18 +936,18 @@ const fs = require('fs')
 function dump(path, options) {
   console.log(JSON.stringify(Array.from(fs.readLinesSync(path, options))))
 }
-fs.writeFileSync('/normal', 'alpha\nbeta\n')
-fs.writeFileSync('/mixed', 'a\r\nb\n\nc')
-fs.writeFileSync('/unterminated', 'last')
-fs.writeFileSync('/blank', '\n\nmiddle\n\n')
-const iterator = fs.readLinesSync('/normal')
+fs.writeFileSync('/workspace/normal', 'alpha\nbeta\n')
+fs.writeFileSync('/workspace/mixed', 'a\r\nb\n\nc')
+fs.writeFileSync('/workspace/unterminated', 'last')
+fs.writeFileSync('/workspace/blank', '\n\nmiddle\n\n')
+const iterator = fs.readLinesSync('/workspace/normal')
 console.log(typeof iterator[Symbol.iterator], iterator === iterator[Symbol.iterator]())
 const normal = []
 for (const line of iterator) normal.push(line)
 console.log(JSON.stringify(normal))
-dump('/mixed', 'utf8')
-dump('/unterminated', { encoding: 'utf-8' })
-dump('/blank')
+dump('/workspace/mixed', 'utf8')
+dump('/workspace/unterminated', { encoding: 'utf-8' })
+dump('/workspace/blank')
 "#;
 
     let result = sandbox
@@ -967,21 +967,24 @@ async fn js_fs_read_lines_sync_closes_fd_after_iteration_stops() {
     // fd closes. The follow-up write would fail with ENOSPC if the iterator
     // leaked the descriptor on break, throw, or exhaustion.
     let sandbox = Sandbox::builder()
-        .vfs(InMemoryVfs::new(VfsQuota {
-            max_bytes: 4,
-            max_files: 8,
-            max_file_size: 4,
-        }))
+        .mount(
+            "workspace",
+            InMemoryVfs::new(VfsQuota {
+                max_bytes: 4,
+                max_files: 8,
+                max_file_size: 4,
+            }),
+        )
         .build();
     let script = r#"
 const fs = require('fs')
 function releaseAfter(label, consume) {
-  fs.writeFileSync('/input', 'a\nb\n')
-  consume(fs.readLinesSync('/input'))
-  fs.unlinkSync('/input')
-  fs.writeFileSync(`/${label}`, 'x')
-  console.log(label, fs.readFileSync(`/${label}`, 'utf8'))
-  fs.unlinkSync(`/${label}`)
+  fs.writeFileSync('/workspace/input', 'a\nb\n')
+  consume(fs.readLinesSync('/workspace/input'))
+  fs.unlinkSync('/workspace/input')
+  fs.writeFileSync(`/workspace/${label}`, 'x')
+  console.log(label, fs.readFileSync(`/workspace/${label}`, 'utf8'))
+  fs.unlinkSync(`/workspace/${label}`)
 }
 releaseAfter('break', iter => {
   for (const line of iter) {
@@ -1021,11 +1024,11 @@ async fn js_fs_write_buffer_two_arg_form_writes_all_bytes() {
     let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
-fs.writeFileSync('/out', '')
-const fd = fs.openSync('/out', 'r+')
+fs.writeFileSync('/workspace/out', '')
+const fd = fs.openSync('/workspace/out', 'r+')
 const n = fs.writeSync(fd, Buffer.from('hello'))
 fs.closeSync(fd)
-console.log(n, fs.readFileSync('/out').toString())
+console.log(n, fs.readFileSync('/workspace/out').toString())
 "#;
 
     let result = sandbox
@@ -1043,10 +1046,10 @@ async fn js_fs_buffer_to_string_and_is_buffer_match_node() {
     let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
-fs.writeFileSync('/text', 'hello')
-console.log(fs.readFileSync('/text').toString())
+fs.writeFileSync('/workspace/text', 'hello')
+console.log(fs.readFileSync('/workspace/text').toString())
 console.log(Buffer.from('hi').toString('utf8'))
-console.log(Buffer.isBuffer(fs.readFileSync('/text')), Buffer.isBuffer(new Uint8Array()))
+console.log(Buffer.isBuffer(fs.readFileSync('/workspace/text')), Buffer.isBuffer(new Uint8Array()))
 "#;
 
     let result = sandbox
@@ -1070,16 +1073,18 @@ async fn js_fs_large_binary_payloads_round_trip_under_memory_cap() {
     write_vfs_file(vfs.as_ref(), "/big.bin", &input);
 
     let sandbox_vfs: Arc<dyn Vfs> = vfs.clone();
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
     let spot_index = 1_234_567;
     let script = format!(
         r#"
 const fs = require('fs')
-const data = fs.readFileSync('/big.bin')
+const data = fs.readFileSync('/workspace/big.bin')
 console.log(data.length, data[0], data[{spot_index}], data[data.length - 1])
-fs.writeFileSync('/copy.bin', data)
-fs.writeFileSync('/small', 'abc')
-const fd = fs.openSync('/small', 'r')
+fs.writeFileSync('/workspace/copy.bin', data)
+fs.writeFileSync('/workspace/small', 'abc')
+const fd = fs.openSync('/workspace/small', 'r')
 const small = Buffer.alloc(16)
 const n = fs.readSync(fd, small, 0, 20 * 1024 * 1024, 0)
 fs.closeSync(fd)
@@ -1111,11 +1116,11 @@ async fn js_fs_write_string_position_overload_matches_node() {
     let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
-fs.writeFileSync('/out', 'hello world')
-const fd = fs.openSync('/out', 'r+')
+fs.writeFileSync('/workspace/out', 'hello world')
+const fd = fs.openSync('/workspace/out', 'r+')
 const n = fs.writeSync(fd, 'XY', 0)
 fs.closeSync(fd)
-console.log(n, fs.readFileSync('/out', 'utf8'))
+console.log(n, fs.readFileSync('/workspace/out', 'utf8'))
 "#;
 
     let result = sandbox
@@ -1159,10 +1164,10 @@ async fn js_fs_readdir_with_file_types_returns_dirents() {
     let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
-fs.mkdirSync('/dir')
-fs.writeFileSync('/dir/file', 'x')
-fs.mkdirSync('/dir/sub')
-const entries = fs.readdirSync('/dir', { withFileTypes: true })
+fs.mkdirSync('/workspace/dir')
+fs.writeFileSync('/workspace/dir/file', 'x')
+fs.mkdirSync('/workspace/dir/sub')
+const entries = fs.readdirSync('/workspace/dir', { withFileTypes: true })
   .sort((a, b) => a.name.localeCompare(b.name))
 for (const entry of entries) console.log(entry.name, entry.isFile(), entry.isDirectory())
 "#;
@@ -1181,9 +1186,9 @@ async fn js_fs_errors_use_libuv_errno_values() {
     let sandbox = Sandbox::builder().build();
     let script = r#"
 const fs = require('fs')
-fs.mkdirSync('/dir')
-fs.writeFileSync('/dir/file', 'x')
-try { fs.rmdirSync('/dir') } catch (err) { console.log(err.code, err.errno) }
+fs.mkdirSync('/workspace/dir')
+fs.writeFileSync('/workspace/dir/file', 'x')
+try { fs.rmdirSync('/workspace/dir') } catch (err) { console.log(err.code, err.errno) }
 "#;
 
     let result = sandbox
@@ -1227,17 +1232,20 @@ async fn js_fs_errors_are_node_shaped_and_quota_errors_surface() {
     // JS catches errno-shaped errors from the VFS and sees the Node-style code
     // and message fields rather than a Rust/internal failure.
     let sandbox = Sandbox::builder()
-        .vfs(InMemoryVfs::new(VfsQuota {
-            max_bytes: 4,
-            max_files: 8,
-            max_file_size: 4,
-        }))
+        .mount(
+            "workspace",
+            InMemoryVfs::new(VfsQuota {
+                max_bytes: 4,
+                max_files: 8,
+                max_file_size: 4,
+            }),
+        )
         .build();
     let script = r#"
 const fs = require('fs')
-try { fs.readFileSync('/missing') } catch (err) { console.log(err.code, err.message) }
-try { fs.writeFileSync('/too-big', 'abcdef') } catch (err) { console.log(err.code, err.message) }
-console.log(fs.existsSync('/missing'))
+try { fs.readFileSync('/workspace/missing') } catch (err) { console.log(err.code, err.message) }
+try { fs.writeFileSync('/workspace/too-big', 'abcdef') } catch (err) { console.log(err.code, err.message) }
+console.log(fs.existsSync('/workspace/missing'))
 "#;
 
     let result = sandbox
@@ -1247,12 +1255,12 @@ console.log(fs.existsSync('/missing'))
     assert!(
         result
             .stdout
-            .contains("ENOENT ENOENT: no such file or directory, open '/missing'")
+            .contains("ENOENT ENOENT: no such file or directory, open '/workspace/missing'")
     );
     assert!(
         result
             .stdout
-            .contains("ENOSPC ENOSPC: no space left on device, open '/too-big'")
+            .contains("ENOSPC ENOSPC: no space left on device, open '/workspace/too-big'")
     );
     assert!(result.stdout.ends_with("false\n"));
 }
@@ -1273,7 +1281,7 @@ const h = require('./helper.js')
 console.log(h.fn())
 console.log(require('./helper') === h)
 console.log(require('./sub/child').value)
-console.log(require('/app/dir'))
+console.log(require('/workspace/app/dir'))
 console.log(require('./data').name, require('./data.json').flag)
 console.log(__filename)
 console.log(__dirname)
@@ -1299,16 +1307,16 @@ console.log(require('./sub/main-check'))
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
     let sandbox = Sandbox::builder()
-        .vfs_arc(sandbox_vfs)
-        .cwd("/elsewhere")
+        .mount_arc("workspace", sandbox_vfs)
+        .cwd("/workspace/elsewhere")
         .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
         result.stdout,
-        "help:/app:/app/helper.js\ntrue\nhelp:/app:/app/helper.js\nindexed\ntinysandbox true\n/app/main.js\n/app\ntrue\nfalse\n"
+        "help:/workspace/app:/workspace/app/helper.js\ntrue\nhelp:/workspace/app:/workspace/app/helper.js\nindexed\ntinysandbox true\n/workspace/app/main.js\n/workspace/app\ntrue\nfalse\n"
     );
 }
 
@@ -1328,7 +1336,7 @@ async fn js_commonjs_trailing_slash_uses_directory_resolution_only() {
 console.log(require('./dir/'))
 try { require('./x/') } catch (err) {
   console.log(err.code)
-  console.log(err.message === "Cannot find module './x/'\nRequire stack:\n- /app/main.js")
+  console.log(err.message === "Cannot find module './x/'\nRequire stack:\n- /workspace/app/main.js")
 }
 "#,
             ),
@@ -1338,9 +1346,11 @@ try { require('./x/') } catch (err) {
         ],
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "index\nMODULE_NOT_FOUND\ntrue\n");
@@ -1369,9 +1379,11 @@ console.log(require('./sub/child'))
         ],
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "app-index\napp-index\n");
@@ -1422,9 +1434,11 @@ exports.done = true
         ],
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
@@ -1446,7 +1460,7 @@ async fn js_commonjs_reports_module_not_found_and_bare_specifiers_loudly() {
             r#"
 try { require('./missing') } catch (err) {
   console.log(err.code)
-  console.log(err.message === "Cannot find module './missing'\nRequire stack:\n- /app/main.js")
+  console.log(err.message === "Cannot find module './missing'\nRequire stack:\n- /workspace/app/main.js")
   console.log(err.requireStack.join('|'))
 }
 try { require('left-pad') } catch (err) {
@@ -1457,14 +1471,16 @@ try { require('left-pad') } catch (err) {
         )],
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
         result.stdout,
-        "MODULE_NOT_FOUND\ntrue\n/app/main.js\nMODULE_NOT_FOUND\ntrue\n"
+        "MODULE_NOT_FOUND\ntrue\n/workspace/app/main.js\nMODULE_NOT_FOUND\ntrue\n"
     );
 }
 
@@ -1484,7 +1500,7 @@ console.log(JSON.stringify(require('./alias')))
 console.log(require('./valid.json').nested.value)
 try { require('./bad.json') } catch (err) {
   console.log(err.name)
-  console.log(err.message.includes('/app/bad.json'))
+  console.log(err.message.includes('/workspace/app/bad.json'))
   console.log(err.code === undefined)
 }
 "#,
@@ -1504,9 +1520,11 @@ exports.d = 5
         ],
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "{\"c\":4}\n7\nSyntaxError\ntrue\ntrue\n");
@@ -1534,14 +1552,16 @@ boom()
         ],
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let result = sandbox.exec("js /app/main.js").await;
+    let result = sandbox.exec("js /workspace/app/main.js").await;
 
     assert_eq!(result.exit_code, 1);
     assert!(result.stderr.starts_with("Error: helper boom\n"));
     assert!(
-        result.stderr.contains("/app/helper.js"),
+        result.stderr.contains("/workspace/app/helper.js"),
         "{}",
         result.stderr
     );
@@ -1589,13 +1609,15 @@ async fn js_commonjs_deep_require_chains_are_bounded_cleanly() {
         b"try { require('./m0'); console.log('unexpected') } catch (err) { console.log(err.code); console.log(err.message.includes('256')) }\n",
     );
     let sandbox_vfs: Arc<dyn Vfs> = vfs;
-    let sandbox = Sandbox::builder().vfs_arc(sandbox_vfs).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", sandbox_vfs)
+        .build();
 
-    let successful = sandbox.exec("js /chain/main.js").await;
+    let successful = sandbox.exec("js /workspace/chain/main.js").await;
     assert_eq!(successful.exit_code, 0, "stderr: {}", successful.stderr);
     assert_eq!(successful.stdout, "200\n");
 
-    let capped = sandbox.exec("js /cap/main.js").await;
+    let capped = sandbox.exec("js /workspace/cap/main.js").await;
     assert_eq!(capped.exit_code, 0, "stderr: {}", capped.stderr);
     assert_eq!(capped.stdout, "ERR_REQUIRE_DEPTH\ntrue\n");
     assert!(!capped.stderr.contains("wasm trap"));
@@ -1608,12 +1630,14 @@ async fn js_pipeline_and_redirects_use_command_stdio() {
     let sandbox = Sandbox::builder().build();
     assert_eq!(
         sandbox
-            .exec("js -e 'console.log(\"alpha\"); console.log(\"beta\")' | grep beta > /out")
+            .exec(
+                "js -e 'console.log(\"alpha\"); console.log(\"beta\")' | grep beta > /workspace/out"
+            )
             .await
             .exit_code,
         0
     );
-    assert_eq!(sandbox.exec("cat /out").await.stdout, "beta\n");
+    assert_eq!(sandbox.exec("cat /workspace/out").await.stdout, "beta\n");
 }
 
 #[tokio::test]

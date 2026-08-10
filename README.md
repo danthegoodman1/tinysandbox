@@ -19,7 +19,6 @@ use tinysandbox::sandbox::Sandbox;
 async fn main() {
     let sandbox = Sandbox::builder().build();
 
-    sandbox.exec("mkdir /workspace").await;
     sandbox
         .exec("echo 'hello from the sandbox' > /workspace/greeting.txt")
         .await;
@@ -38,7 +37,6 @@ import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox()
 
-await sandbox.exec('mkdir /workspace')
 await sandbox.exec("echo 'hello from the sandbox' > /workspace/greeting.txt")
 
 const result = await sandbox.exec('cat /workspace/greeting.txt | grep -c sandbox')
@@ -66,6 +64,7 @@ console.assert(result.stdout === '1\n')
   - [JavaScript prelude](#javascript-prelude)
   - [Fetch](#fetch)
 - [Filesystem backends](#filesystem-backends)
+- [Filesystem mounts](#filesystem-mounts)
 - [Local directory VFS](#local-directory-vfs)
   - [Rust](#rust-5)
   - [TypeScript](#typescript-5)
@@ -203,7 +202,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox()
-await sandbox.fs.mkdir('/workspace')
 await sandbox.fs.writeFile('/workspace/report.txt', Buffer.from('direct host access'))
 ```
 
@@ -590,10 +588,51 @@ console.assert(result.stdout === 'echo https://example.test/echo hi\n')
 | `LocalVfs` | Contained host directory | Read/write | Unix |
 | `S3Vfs` | Bucket/key prefix | Read-only | Cargo feature `s3`; included in Node |
 
+## Filesystem mounts
+
+The sandbox root is a read-only mount namespace. Backends are attached at
+static, top-level names such as `/workspace`, `/input`, and `/output`. `/bin`
+is reserved for the synthesized command registry. `ls /` lists both `bin` and
+the configured mounts. Paths outside a mount return `ENOENT`, mount points
+cannot be removed or renamed, and cross-mount renames fail with `EXDEV`.
+Copying between mounts works normally.
+
+By default, a sandbox has one in-memory `workspace` mount and starts with
+`cwd=/workspace`. Rust callers can add or replace mounts through the builder:
+
+```rust ignore
+let sandbox = Sandbox::builder()
+    .mount("workspace", LocalVfs::new("/srv/job/workspace")?)
+    .mount("input", S3Vfs::new(client, "agent-inputs", Some("job-42"))?)
+    .cwd("/workspace")
+    .build();
+```
+
+`clear_mounts()` removes the default workspace and resets the builder cwd to
+`/`. Mount names must be single path components and cannot be `.`, `..`, or
+`bin`. Mounts are fixed after `build()`.
+
+In TypeScript, providing `mounts` replaces the default workspace exactly:
+
+```ts
+const sandbox = new Sandbox({
+  mounts: {
+    workspace: { type: 'memory', quota: { maxBytes: 64 * 1024 * 1024 } },
+    input: { type: 's3', bucket: 'agent-inputs', prefix: 'job-42' },
+    output: { type: 'local', root: '/srv/job/output' }
+  },
+  cwd: '/workspace'
+})
+```
+
+Each mount enforces its own quota. `Sandbox::stats()` reports the checked sum
+of mounts that expose usage statistics. Mounts such as `S3Vfs` that do not
+report usage are skipped.
+
 ## Local directory VFS
 
-On Unix hosts a second built-in filesystem, `LocalVfs`, roots the sandbox in
-a directory on the host disk. Files persist across sandboxes and process
+On Unix hosts, `LocalVfs` roots one mount in a directory on the host disk.
+Files persist across sandboxes and process
 restarts, existing content in the directory is visible inside, and host
 tools can read what the agent writes.
 
@@ -611,8 +650,8 @@ entirely — rebaseline the counters from outside the sandbox: `refresh()`
 rescans the directory, and `set_usage()` pushes externally computed numbers.
 Enforcement then just answers "should this write be blocked" against the
 current baseline, with live operations applying their deltas on top. From
-TypeScript: `await sandbox.refreshLocalVfs()` and
-`sandbox.setLocalVfsUsage({ usedBytes, fileCount })`.
+TypeScript: `await sandbox.refreshLocalVfs('workspace')` and
+`sandbox.setLocalVfsUsage('workspace', { usedBytes, fileCount })`.
 
 #### Rust
 
@@ -621,13 +660,13 @@ use tinysandbox::sandbox::Sandbox;
 use tinysandbox::vfs::{LocalVfs, VfsQuota};
 
 let sandbox = Sandbox::builder()
-    .vfs(LocalVfs::new("/srv/agent-42-workspace")?)
+    .mount("workspace", LocalVfs::new("/srv/agent-42-workspace")?)
     .build();
 
 // Or with quota limits:
 let quota = VfsQuota { max_bytes: 64 << 20, max_files: 4096, max_file_size: 16 << 20 };
 let sandbox = Sandbox::builder()
-    .vfs(LocalVfs::with_quota("/srv/agent-42-workspace", quota)?)
+    .mount("workspace", LocalVfs::with_quota("/srv/agent-42-workspace", quota)?)
     .build();
 ```
 
@@ -637,9 +676,12 @@ let sandbox = Sandbox::builder()
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
-  localVfs: {
-    root: '/srv/agent-42-workspace',
-    quota: { maxBytes: 64 * 1024 * 1024 } // optional; unset limits are unlimited
+  mounts: {
+    workspace: {
+      type: 'local',
+      root: '/srv/agent-42-workspace',
+      quota: { maxBytes: 64 * 1024 * 1024 }
+    }
   }
 })
 ```
@@ -647,8 +689,8 @@ const sandbox = new Sandbox({
 ## Read-only S3 VFS
 
 The optional `s3` Cargo feature provides `S3Vfs`, a read-only view of one S3
-bucket/key prefix. The Node package includes the same backend as the `s3Vfs`
-constructor option. The configured prefix becomes `/`; an empty prefix exposes
+bucket/key prefix. The Node package includes the same backend as the `s3` mount
+type. The configured prefix becomes the backend root. An empty prefix exposes
 the whole bucket, and a prefix with no matching keys is a valid empty virtual
 root. Sandbox path normalization and a fixed prefix boundary prevent access to
 adjacent keys.
@@ -684,9 +726,13 @@ use tinysandbox::vfs::S3Vfs;
 
 async fn run_with_client(client: Client) -> Result<(), Box<dyn std::error::Error>> {
     let vfs = S3Vfs::new(client, "agent-inputs", Some("tenant-42/jobs/current"))?;
-    let sandbox = Sandbox::builder().vfs(vfs).build();
+    let sandbox = Sandbox::builder()
+        .clear_mounts()
+        .mount("input", vfs)
+        .cwd("/input")
+        .build();
 
-    let result = sandbox.exec("grep ERROR /logs/app.log | head").await;
+    let result = sandbox.exec("grep ERROR /input/logs/app.log | head").await;
     println!("{}", result.stdout);
     Ok(())
 }
@@ -707,20 +753,24 @@ fields; `endpointUrl` and `forcePathStyle` support compatible services.
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
-  s3Vfs: {
-    bucket: 'agent-inputs',
-    prefix: 'tenant-42/jobs/current',
-    region: 'us-east-1',
-    endpointUrl: 'http://127.0.0.1:9000', // omit for AWS
-    forcePathStyle: true,                  // commonly needed by compatible APIs
-    credentials: {                        // omit to use the default provider chain
-      accessKeyId: process.env.S3_ACCESS_KEY!,
-      secretAccessKey: process.env.S3_SECRET_KEY!
+  mounts: {
+    input: {
+      type: 's3',
+      bucket: 'agent-inputs',
+      prefix: 'tenant-42/jobs/current',
+      region: 'us-east-1',
+      endpointUrl: 'http://127.0.0.1:9000',
+      forcePathStyle: true,
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY!,
+        secretAccessKey: process.env.S3_SECRET_KEY!
+      }
     }
-  }
+  },
+  cwd: '/input'
 })
 
-const firstLine = await sandbox.exec('cat /logs/app.log | head -n 1')
+const firstLine = await sandbox.exec('cat /input/logs/app.log | head -n 1')
 ```
 
 The minimal IAM shape is `s3:GetObject` on the exposed keys and
@@ -769,12 +819,12 @@ use std::sync::Arc;
 use tinysandbox::sandbox::Sandbox;
 
 let sandbox = Sandbox::builder()
-    .vfs(MyVfs::connect("s3://agent-42-workspace")?)
+    .mount("workspace", MyVfs::connect("s3://agent-42-workspace")?)
     .build();
 
 // Or share one VFS between sandboxes / keep a handle for yourself:
 let vfs = Arc::new(MyVfs::connect("s3://agent-42-workspace")?);
-let sandbox = Sandbox::builder().vfs_arc(Arc::clone(&vfs)).build();
+let sandbox = Sandbox::builder().mount_arc("workspace", Arc::clone(&vfs)).build();
 ```
 
 #### TypeScript
@@ -783,7 +833,9 @@ let sandbox = Sandbox::builder().vfs_arc(Arc::clone(&vfs)).build();
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
-  vfs: MyVfs.connect('s3://agent-42-workspace')
+  mounts: {
+    workspace: { type: 'custom', vfs: MyVfs.connect('s3://agent-42-workspace') }
+  }
 })
 ```
 
@@ -848,8 +900,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The Node binding exposes live VFS operations and JS-backed VFS adapters.
 Snapshot capture/restore/branch is currently Rust-only.
 
-`Sandbox::vfs()` returns `Arc<dyn Vfs>`, so snapshot-aware callers should keep
-their own concrete handle and pass a clone into the builder:
+`Sandbox::vfs()` returns the composite mount namespace as `Arc<dyn Vfs>`, so
+snapshot-aware callers should keep their own concrete backend handle and pass a
+clone into the builder:
 
 #### Rust
 
@@ -861,9 +914,9 @@ use tinysandbox::vfs::{InMemoryVfs, VfsQuota, VfsSnapshot};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vfs = Arc::new(InMemoryVfs::new(VfsQuota::unlimited()));
-    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let sandbox = Sandbox::builder().mount_arc("workspace", vfs.clone()).build();
     let before_turn = vfs.snapshot()?;
-    let result = sandbox.exec("echo draft > /answer.txt").await;
+    let result = sandbox.exec("echo draft > /workspace/answer.txt").await;
     if result.exit_code != 0 {
         vfs.restore(&before_turn)?;
     }
@@ -933,7 +986,8 @@ reports VFS usage and total commands run.
   VFS, quotas, and path containment as everything else.
 - **Resources are bounded** per execution: memory (ResourceLimiter), CPU
   (epoch interruption), wall clock, output size, file quotas.
-- `..` traversal is contained at the VFS root; `/bin` is read-only. With
+- `..` traversal is contained at the virtual root. `/bin` and mount points are
+  read-only. With
   the local directory VFS, containment also refuses symlinks and special
   files, so the sandbox cannot reach outside its host directory.
 

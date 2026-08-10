@@ -20,7 +20,7 @@ async fn main() {
     // separate exec calls, like one long shell session.
     sandbox
         .exec(concat!(
-            "mkdir -p /app && cd /app && ",
+            "mkdir -p /workspace/app && cd /workspace/app && ",
             r#"echo 'exports.stats = (text) => {
   const words = text.split(/\s+/).filter(Boolean)
   return { words: words.length, unique: new Set(words).size }
@@ -34,7 +34,7 @@ const { stats } = require("./helper.js")
 const text = fs.readFileSync(process.argv[2], "utf8")
 const result = stats(text)
 console.log(JSON.stringify(result))
-fs.writeFileSync("/app/stats.json", JSON.stringify(result))' > main.js"#,
+fs.writeFileSync("/workspace/app/stats.json", JSON.stringify(result))' > main.js"#,
         )
         .await;
 
@@ -50,7 +50,7 @@ fs.writeFileSync("/app/stats.json", JSON.stringify(result))' > main.js"#,
     assert_eq!(result.stdout, "{\"words\":9,\"unique\":8}\n");
 
     // Results land in the VFS like any other file.
-    let result = sandbox.exec("cat /app/stats.json | wc -c").await;
+    let result = sandbox.exec("cat /workspace/app/stats.json | wc -c").await;
     print!("stats.json bytes: {}", result.stdout);
 
     // Peak wasm memory for the run is reported in the metrics.

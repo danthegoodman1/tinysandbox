@@ -621,6 +621,7 @@ fn io_error(err: &io::Error) -> VfsError {
         Some(libc::EISDIR) => Errno::EISDIR,
         Some(libc::EEXIST) => Errno::EEXIST,
         Some(libc::ENOTEMPTY) => Errno::ENOTEMPTY,
+        Some(libc::EXDEV) => Errno::EXDEV,
         Some(libc::EACCES | libc::EPERM | libc::ELOOP | libc::EROFS) => Errno::EACCES,
         Some(libc::ENOSPC | libc::EDQUOT | libc::EFBIG) => Errno::ENOSPC,
         Some(libc::EBUSY) => Errno::EBUSY,

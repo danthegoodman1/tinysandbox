@@ -25,9 +25,18 @@ function normalizeOptions(options) {
   else delete normalized.syscalls
   if (options.fetch) normalized.fetch = wrapFetch(options.fetch)
   else delete normalized.fetch
-  if (options.vfs) normalized.vfs = wrapVfs(options.vfs)
-  else delete normalized.vfs
+  if (options.mounts) normalized.mounts = wrapMounts(options.mounts)
+  else delete normalized.mounts
   return normalized
+}
+
+function wrapMounts(mounts) {
+  return Object.fromEntries(
+    Object.entries(mounts).map(([name, mount]) => [
+      name,
+      mount?.type === 'custom' ? { ...mount, vfs: wrapVfs(mount.vfs) } : mount
+    ])
+  )
 }
 
 function wrapCommands(commands) {
@@ -254,6 +263,7 @@ const vfsOperations = [
 const errnos = [
   'EBADF',
   'EBUSY',
+  'EXDEV',
   'EACCES',
   'EEXIST',
   'EIO',

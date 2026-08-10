@@ -4,6 +4,7 @@ pub mod conformance;
 #[cfg(unix)]
 pub mod local;
 pub mod mem;
+pub mod mount;
 #[cfg(feature = "s3")]
 pub mod s3;
 
@@ -15,6 +16,7 @@ use std::fmt;
 #[cfg(unix)]
 pub use local::LocalVfs;
 pub use mem::{InMemoryVfs, InMemoryVfsSnapshot, VfsQuota, VfsStats};
+pub use mount::MountedVfs;
 #[cfg(feature = "s3")]
 pub use s3::S3Vfs;
 
@@ -29,6 +31,8 @@ pub enum Errno {
     EBADF,
     /// Device or resource busy.
     EBUSY,
+    /// Invalid cross-device link.
+    EXDEV,
     /// Permission denied.
     EACCES,
     /// File exists.
@@ -55,6 +59,7 @@ impl Errno {
         match self {
             Self::EBADF => 9,
             Self::EBUSY => 16,
+            Self::EXDEV => 18,
             Self::EACCES => 13,
             Self::EEXIST => 17,
             Self::EIO => 5,
@@ -72,6 +77,7 @@ impl Errno {
         match self {
             Self::EBADF => "EBADF",
             Self::EBUSY => "EBUSY",
+            Self::EXDEV => "EXDEV",
             Self::EACCES => "EACCES",
             Self::EEXIST => "EEXIST",
             Self::EIO => "EIO",
@@ -356,6 +362,7 @@ mod tests {
         assert_eq!(Errno::EIO.code(), 5);
         assert_eq!(Errno::EACCES.code(), 13);
         assert_eq!(Errno::EBUSY.code(), 16);
+        assert_eq!(Errno::EXDEV.code(), 18);
         assert_eq!(Errno::ENOSPC.code(), 28);
         assert_eq!(Errno::ENOTEMPTY.code(), 39);
         assert_eq!(VfsError::new(Errno::EBADF).code(), 9);

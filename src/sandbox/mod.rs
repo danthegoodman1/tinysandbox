@@ -10,7 +10,7 @@
 //! #     .build()
 //! #     .unwrap()
 //! #     .block_on(async {
-//! let sandbox = Sandbox::builder().vfs(InMemoryVfs::new(VfsQuota::unlimited())).build();
+//! let sandbox = Sandbox::builder().mount("workspace", InMemoryVfs::new(VfsQuota::unlimited())).build();
 //!
 //! let result = sandbox.exec("echo hello").await;
 //! assert_eq!(result.exit_code, 0);
@@ -44,7 +44,8 @@ use crate::shell::{
     self, AndOrList, AndOrOp, Command as AstCommand, Pipeline, Redirect, RedirectOp,
     RedirectTarget, Segment, SimpleCommand, Word,
 };
-use crate::vfs::{Errno, FileType, InMemoryVfs, Metadata, Vfs, VfsError, VfsStats};
+use crate::vfs::mount::validate_mount_name;
+use crate::vfs::{Errno, FileType, InMemoryVfs, Metadata, MountedVfs, Vfs, VfsError, VfsStats};
 
 pub use command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult, Limits,
@@ -129,7 +130,7 @@ pub struct Sandbox {
 
 /// Builder for [`Sandbox`].
 pub struct SandboxBuilder {
-    vfs: Arc<dyn Vfs>,
+    mounts: BTreeMap<String, Arc<dyn Vfs>>,
     commands: BTreeMap<String, Arc<dyn Command>>,
     #[cfg(feature = "js")]
     syscalls: Vec<(String, Arc<dyn Syscall>)>,
@@ -181,7 +182,8 @@ impl Sandbox {
     /// operations bounded.
     ///
     /// By default, each exec starts from the sandbox's base session: the
-    /// builder-configured cwd and environment (defaults: `/`, `PWD=/`). Shell mutations
+    /// builder-configured cwd and environment (defaults: `/workspace`,
+    /// `PWD=/workspace`). Shell mutations
     /// such as `cd`, `export`, assignments, and `$?` updates are visible within
     /// that exec and discarded afterward, so concurrent default execs have no
     /// session last-writer-wins hazard. Filesystem mutations always persist.
@@ -788,9 +790,14 @@ impl SandboxBuilder {
         );
 
         let mut env = BTreeMap::new();
-        env.insert("PWD".to_owned(), "/".to_owned());
+        env.insert("PWD".to_owned(), "/workspace".to_owned());
+        let mut mounts = BTreeMap::new();
+        mounts.insert(
+            "workspace".to_owned(),
+            Arc::new(InMemoryVfs::default()) as Arc<dyn Vfs>,
+        );
         Self {
-            vfs: Arc::new(InMemoryVfs::default()),
+            mounts,
             commands,
             #[cfg(feature = "js")]
             syscalls: Vec::new(),
@@ -799,21 +806,39 @@ impl SandboxBuilder {
             #[cfg(feature = "js")]
             js_prelude: None,
             limits: Limits::default(),
-            cwd: "/".to_owned(),
+            cwd: "/workspace".to_owned(),
             env,
             persist_session: false,
         }
     }
 
-    /// Replaces the VFS with a concrete implementation.
-    pub fn vfs(mut self, vfs: impl Vfs + 'static) -> Self {
-        self.vfs = Arc::new(vfs);
+    /// Adds or replaces a top-level mount with a concrete VFS implementation.
+    pub fn mount(mut self, name: impl Into<String>, vfs: impl Vfs + 'static) -> Self {
+        let name = name.into();
+        assert!(
+            validate_mount_name(&name).is_ok(),
+            "SandboxBuilder::mount requires a non-reserved single path component"
+        );
+        self.mounts.insert(name, Arc::new(vfs));
         self
     }
 
-    /// Replaces the VFS with a shared trait object.
-    pub fn vfs_arc(mut self, vfs: Arc<dyn Vfs>) -> Self {
-        self.vfs = vfs;
+    /// Adds or replaces a top-level mount with a shared VFS trait object.
+    pub fn mount_arc(mut self, name: impl Into<String>, vfs: Arc<dyn Vfs>) -> Self {
+        let name = name.into();
+        assert!(
+            validate_mount_name(&name).is_ok(),
+            "SandboxBuilder::mount_arc requires a non-reserved single path component"
+        );
+        self.mounts.insert(name, vfs);
+        self
+    }
+
+    /// Removes all configured mounts.
+    pub fn clear_mounts(mut self) -> Self {
+        self.mounts.clear();
+        self.cwd = "/".to_owned();
+        self.env.insert("PWD".to_owned(), self.cwd.clone());
         self
     }
 
@@ -903,8 +928,11 @@ impl SandboxBuilder {
         #[cfg(feature = "js")]
         let js_prelude = Arc::<str>::from(self.js_prelude.unwrap_or_default());
         let command_names = Arc::new(self.commands.keys().cloned().collect());
+        let vfs = Arc::new(
+            MountedVfs::new(self.mounts).expect("SandboxBuilder validates mount names eagerly"),
+        );
         Sandbox {
-            vfs: self.vfs,
+            vfs,
             commands: Arc::new(self.commands),
             command_names,
             #[cfg(feature = "js")]

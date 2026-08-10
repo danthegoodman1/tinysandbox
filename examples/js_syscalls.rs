@@ -66,11 +66,11 @@ try {
 "#;
     sandbox
         .fs()
-        .write_file("/main.js", script.as_bytes(), false)
+        .write_file("/workspace/main.js", script.as_bytes(), false)
         .await
         .expect("write example script");
 
-    let result = sandbox.exec("js /main.js").await;
+    let result = sandbox.exec("js /workspace/main.js").await;
     print!("{}", result.stdout);
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(

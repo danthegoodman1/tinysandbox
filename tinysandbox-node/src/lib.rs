@@ -17,8 +17,8 @@ use tinysandbox::sandbox::{
     Sandbox as CoreSandbox, SyscallError,
 };
 use tinysandbox::vfs::{
-    DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsQuota, VfsResult,
-    VfsStats,
+    DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
+    VfsQuota, VfsResult, VfsStats,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -70,7 +70,7 @@ pub struct Sandbox {
     // Concrete handle kept alongside the type-erased one in the sandbox so
     // refreshLocalVfs/setLocalVfsUsage can reach the LocalVfs-only API.
     #[cfg(unix)]
-    local_vfs: Option<Arc<tinysandbox::vfs::LocalVfs>>,
+    local_vfs: HashMap<String, Arc<tinysandbox::vfs::LocalVfs>>,
 }
 
 #[napi]
@@ -79,10 +79,17 @@ impl Sandbox {
     pub fn new(options: Option<Object<'_>>) -> Result<Self> {
         let mut builder = CoreSandbox::builder();
         #[cfg(unix)]
-        let mut local_vfs = None;
+        let mut local_vfs = HashMap::new();
 
         if let Some(options) = options {
-            validate_builtin_vfs_selection(&options)?;
+            for removed in ["vfs", "localVfs", "s3Vfs"] {
+                if has_non_nullish_named_property(&options, removed)? {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("Sandbox option '{removed}' was replaced by the mounts option"),
+                    ));
+                }
+            }
             if let Some(limits) = get_optional_object(&options, "limits")? {
                 builder = builder.limits(parse_limits(limits)?);
             }
@@ -134,24 +141,51 @@ impl Sandbox {
                     async move { call_js_fetch(callback, request).await }
                 });
             }
-            if let Some(vfs) = get_optional_object(&options, "vfs")? {
-                builder = builder.vfs_arc(Arc::new(JsVfs::new(vfs)?));
-            }
-            #[cfg(unix)]
-            if let Some(local_vfs_options) = get_optional_object(&options, "localVfs")? {
-                let vfs = build_local_vfs(&local_vfs_options)?;
-                local_vfs = Some(Arc::clone(&vfs));
-                builder = builder.vfs_arc(vfs);
-            }
-            #[cfg(not(unix))]
-            if has_non_nullish_named_property(&options, "localVfs")? {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    "localVfs is only supported on Unix hosts".to_owned(),
-                ));
-            }
-            if let Some(s3_vfs_options) = get_optional_object(&options, "s3Vfs")? {
-                builder = builder.vfs_arc(build_s3_vfs(&s3_vfs_options)?);
+            if let Some(mounts) = get_optional_object(&options, "mounts")? {
+                builder = builder.clear_mounts();
+                for name in Object::keys(&mounts)? {
+                    tinysandbox::vfs::mount::validate_mount_name(&name).map_err(|_| {
+                        Error::new(
+                            Status::InvalidArg,
+                            format!(
+                                "mount name '{name}' must be a non-reserved single path component"
+                            ),
+                        )
+                    })?;
+                    let mount: Object<'_> = mounts.get_named_property(&name)?;
+                    let kind: String = mount.get_named_property("type")?;
+                    let vfs: Arc<dyn Vfs> = match kind.as_str() {
+                        "memory" => Arc::new(InMemoryVfs::new(parse_vfs_quota(
+                            &mount,
+                            &format!("memory mount '{name}'"),
+                        )?)),
+                        "custom" => {
+                            let custom: Object<'_> = mount.get_named_property("vfs")?;
+                            Arc::new(JsVfs::new(custom)?)
+                        }
+                        #[cfg(unix)]
+                        "local" => {
+                            let local = build_local_vfs(&mount, &name)?;
+                            local_vfs.insert(name.clone(), Arc::clone(&local));
+                            local
+                        }
+                        #[cfg(not(unix))]
+                        "local" => {
+                            return Err(Error::new(
+                                Status::InvalidArg,
+                                format!("local mount '{name}' is only supported on Unix hosts"),
+                            ));
+                        }
+                        "s3" => build_s3_vfs(&mount)?,
+                        _ => {
+                            return Err(Error::new(
+                                Status::InvalidArg,
+                                format!("mount '{name}' type must be memory, local, s3, or custom"),
+                            ));
+                        }
+                    };
+                    builder = builder.mount_arc(name, vfs);
+                }
             }
             if let Some(commands) = get_optional_object(&options, "commands")? {
                 for name in Object::keys(&commands)? {
@@ -205,15 +239,17 @@ impl Sandbox {
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
     }
 
-    /// Rescans the localVfs root directory and replaces quota usage with the
-    /// result. Call this after the host mutates the directory outside the
-    /// sandbox. Rejects when the sandbox was not built with the localVfs
-    /// option.
+    /// Rescans a local mount's host directory and replaces its quota usage.
+    /// Call this after the host mutates the directory outside the sandbox.
     #[napi]
-    pub async fn refresh_local_vfs(&self) -> Result<VfsStatsJs> {
+    pub async fn refresh_local_vfs(&self, mount: String) -> Result<VfsStatsJs> {
         #[cfg(unix)]
         {
-            let vfs = self.local_vfs.clone().ok_or_else(local_vfs_missing)?;
+            let vfs = self
+                .local_vfs
+                .get(&mount)
+                .cloned()
+                .ok_or_else(|| local_vfs_missing(&mount))?;
             tokio::task::spawn_blocking(move || {
                 vfs.refresh()
                     .map(VfsStatsJs::from)
@@ -224,24 +260,26 @@ impl Sandbox {
         }
         #[cfg(not(unix))]
         {
-            Err(local_vfs_missing())
+            Err(local_vfs_missing(&mount))
         }
     }
 
-    /// Replaces localVfs quota usage with externally computed numbers, for
-    /// hosts that track usage out of band. Later file operations apply their
-    /// deltas on top of the pushed baseline and quota enforcement blocks
-    /// growth against it. Throws when the sandbox was not built with the
-    /// localVfs option.
+    /// Replaces a local mount's quota usage with externally computed numbers.
+    /// Later file operations apply their deltas on top of the pushed baseline.
     #[napi]
-    pub fn set_local_vfs_usage(&self, usage: VfsStatsJs) -> Result<()> {
+    pub fn set_local_vfs_usage(&self, mount: String, usage: VfsStatsJs) -> Result<()> {
         #[cfg(unix)]
         {
-            let vfs = self.local_vfs.as_ref().ok_or_else(local_vfs_missing)?;
+            let vfs = self
+                .local_vfs
+                .get(&mount)
+                .ok_or_else(|| local_vfs_missing(&mount))?;
             let invalid = |field: &str| {
                 Error::new(
                     Status::InvalidArg,
-                    format!("localVfs usage {field} must be a non-negative safe integer"),
+                    format!(
+                        "local mount '{mount}' usage {field} must be a non-negative safe integer"
+                    ),
                 )
             };
             vfs.set_usage(VfsStats {
@@ -253,15 +291,15 @@ impl Sandbox {
         #[cfg(not(unix))]
         {
             let _ = usage;
-            Err(local_vfs_missing())
+            Err(local_vfs_missing(&mount))
         }
     }
 }
 
-fn local_vfs_missing() -> Error {
+fn local_vfs_missing(mount: &str) -> Error {
     Error::new(
         Status::GenericFailure,
-        "sandbox was not configured with the localVfs option".to_owned(),
+        format!("sandbox mount '{mount}' is not a local filesystem"),
     )
 }
 
@@ -1185,23 +1223,6 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
     Ok(parsed)
 }
 
-fn validate_builtin_vfs_selection(options: &Object<'_>) -> Result<()> {
-    let mut configured = Vec::new();
-    for name in ["vfs", "localVfs", "s3Vfs"] {
-        if has_non_nullish_named_property(options, name)? {
-            configured.push(name);
-        }
-    }
-    if configured.len() > 1 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            "Sandbox constructor accepts either vfs or localVfs or s3Vfs, not more than one"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 struct S3ClientOptions {
     region: Option<String>,
     endpoint_url: Option<String>,
@@ -1216,10 +1237,10 @@ struct S3Credentials {
 }
 
 fn build_s3_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::S3Vfs>> {
-    let bucket = required_nonempty_string(options, "bucket", "s3Vfs")?;
+    let bucket = required_nonempty_string(options, "bucket", "S3 mount")?;
     let prefix = get_optional::<String>(options, "prefix")?;
-    let region = optional_nonempty_string(options, "region", "s3Vfs")?;
-    let endpoint_url = optional_nonempty_string(options, "endpointUrl", "s3Vfs")?;
+    let region = optional_nonempty_string(options, "region", "S3 mount")?;
+    let endpoint_url = optional_nonempty_string(options, "endpointUrl", "S3 mount")?;
     let force_path_style = get_optional::<bool>(options, "forcePathStyle")?;
     let credentials = get_optional_object(options, "credentials")?
         .map(|credentials| parse_s3_credentials(&credentials))
@@ -1234,7 +1255,7 @@ fn build_s3_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::S3Vfs>> {
     let vfs = tinysandbox::vfs::S3Vfs::new(client, bucket, prefix.as_deref()).map_err(|err| {
         Error::new(
             Status::InvalidArg,
-            format!("invalid s3Vfs bucket or prefix: {err}"),
+            format!("invalid S3 mount bucket or prefix: {err}"),
         )
     })?;
     Ok(Arc::new(vfs))
@@ -1242,13 +1263,21 @@ fn build_s3_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::S3Vfs>> {
 
 fn parse_s3_credentials(credentials: &Object<'_>) -> Result<S3Credentials> {
     Ok(S3Credentials {
-        access_key_id: required_nonempty_string(credentials, "accessKeyId", "s3Vfs credentials")?,
+        access_key_id: required_nonempty_string(
+            credentials,
+            "accessKeyId",
+            "S3 mount credentials",
+        )?,
         secret_access_key: required_nonempty_string(
             credentials,
             "secretAccessKey",
-            "s3Vfs credentials",
+            "S3 mount credentials",
         )?,
-        session_token: optional_nonempty_string(credentials, "sessionToken", "s3Vfs credentials")?,
+        session_token: optional_nonempty_string(
+            credentials,
+            "sessionToken",
+            "S3 mount credentials",
+        )?,
     })
 }
 
@@ -1302,7 +1331,7 @@ fn build_s3_client(options: S3ClientOptions) -> Result<aws_sdk_s3::Client> {
                         credentials.secret_access_key,
                         credentials.session_token,
                         None,
-                        "tinysandbox-node-s3Vfs",
+                        "tinysandbox-node-s3-mount",
                     ));
                 }
                 let shared_config = loader.load().await;
@@ -1319,7 +1348,7 @@ fn build_s3_client(options: S3ClientOptions) -> Result<aws_sdk_s3::Client> {
         .map_err(|err| {
             Error::new(
                 Status::GenericFailure,
-                format!("could not start s3Vfs configuration: {err}"),
+                format!("could not start S3 mount configuration: {err}"),
             )
         })?;
 
@@ -1327,42 +1356,50 @@ fn build_s3_client(options: S3ClientOptions) -> Result<aws_sdk_s3::Client> {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(message)) => Err(Error::new(
             Status::GenericFailure,
-            format!("could not configure s3Vfs: {message}"),
+            format!("could not configure S3 mount: {message}"),
         )),
         Err(_) => Err(Error::new(
             Status::GenericFailure,
-            "could not configure s3Vfs: configuration worker panicked".to_owned(),
+            "could not configure S3 mount: configuration worker panicked".to_owned(),
         )),
     }
 }
 
 #[cfg(unix)]
-fn build_local_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::LocalVfs>> {
+fn build_local_vfs(options: &Object<'_>, mount: &str) -> Result<Arc<tinysandbox::vfs::LocalVfs>> {
     let root: String = options.get_named_property("root")?;
-    let mut quota = VfsQuota::unlimited();
-    if let Some(limits) = get_optional_object(options, "quota")? {
-        if let Some(value) = get_optional::<f64>(&limits, "maxBytes")? {
-            quota.max_bytes = quota_value(value, "maxBytes")?;
-        }
-        if let Some(value) = get_optional::<f64>(&limits, "maxFiles")? {
-            quota.max_files = quota_value(value, "maxFiles")?;
-        }
-        if let Some(value) = get_optional::<f64>(&limits, "maxFileSize")? {
-            quota.max_file_size = quota_value(value, "maxFileSize")?;
-        }
-    }
+    let quota = parse_vfs_quota(options, &format!("local mount '{mount}'"))?;
 
-    let vfs = tinysandbox::vfs::LocalVfs::with_quota(&root, quota)
-        .map_err(|err| Error::new(Status::InvalidArg, format!("localVfs root '{root}': {err}")))?;
+    let vfs = tinysandbox::vfs::LocalVfs::with_quota(&root, quota).map_err(|err| {
+        Error::new(
+            Status::InvalidArg,
+            format!("local mount '{mount}' root '{root}': {err}"),
+        )
+    })?;
     Ok(Arc::new(vfs))
 }
 
-#[cfg(unix)]
-fn quota_value(value: f64, name: &str) -> Result<u64> {
+fn parse_vfs_quota(options: &Object<'_>, context: &str) -> Result<VfsQuota> {
+    let mut quota = VfsQuota::unlimited();
+    if let Some(limits) = get_optional_object(options, "quota")? {
+        if let Some(value) = get_optional::<f64>(&limits, "maxBytes")? {
+            quota.max_bytes = quota_value(value, context, "maxBytes")?;
+        }
+        if let Some(value) = get_optional::<f64>(&limits, "maxFiles")? {
+            quota.max_files = quota_value(value, context, "maxFiles")?;
+        }
+        if let Some(value) = get_optional::<f64>(&limits, "maxFileSize")? {
+            quota.max_file_size = quota_value(value, context, "maxFileSize")?;
+        }
+    }
+    Ok(quota)
+}
+
+fn quota_value(value: f64, context: &str, name: &str) -> Result<u64> {
     u64_from_js(value).map_err(|_| {
         Error::new(
             Status::InvalidArg,
-            format!("localVfs quota {name} must be a non-negative safe integer"),
+            format!("{context} quota {name} must be a non-negative safe integer"),
         )
     })
 }
@@ -1466,6 +1503,7 @@ fn errno_from_code(code: Option<&str>) -> Errno {
     match code {
         Some("EBADF") => Errno::EBADF,
         Some("EBUSY") => Errno::EBUSY,
+        Some("EXDEV") => Errno::EXDEV,
         Some("EACCES") => Errno::EACCES,
         Some("EEXIST") => Errno::EEXIST,
         Some("EIO") => Errno::EIO,

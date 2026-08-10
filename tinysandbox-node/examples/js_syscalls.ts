@@ -54,9 +54,9 @@ try {
   console.log(\`\${response.status}:\${await response.text()}\`)
 })()
 `
-  await sandbox.fs.writeFile('/main.js', Buffer.from(script))
+  await sandbox.fs.writeFile('/workspace/main.js', Buffer.from(script))
 
-  const result = await sandbox.exec('js /main.js')
+  const result = await sandbox.exec('js /workspace/main.js')
   process.stdout.write(result.stdout)
   console.assert(result.exitCode === 0, result.stderr)
   console.assert(result.stdout === 'answer=42\nE_KEY:key is required\n200:echo:ping\n')

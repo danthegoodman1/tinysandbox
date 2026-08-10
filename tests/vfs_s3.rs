@@ -268,11 +268,11 @@ async fn s3_compatible_adapter_vfs_and_sandbox_end_to_end() {
 
     let sandbox_vfs =
         S3Vfs::new(client, &config.bucket, Some(&config.prefix)).expect("construct sandbox S3 VFS");
-    let sandbox = Sandbox::builder().vfs(sandbox_vfs).build();
+    let sandbox = Sandbox::builder().mount("workspace", sandbox_vfs).build();
     assert_eq!(
         sandbox
             .fs()
-            .read_file("/nested/data.txt")
+            .read_file("/workspace/nested/data.txt")
             .await
             .expect("Sandbox::fs read"),
         NESTED
@@ -280,30 +280,30 @@ async fn s3_compatible_adapter_vfs_and_sandbox_end_to_end() {
     let first_fs = sandbox.fs();
     let second_fs = sandbox.fs();
     let (first, second) = tokio::join!(
-        first_fs.read_file("/alpha.txt"),
-        second_fs.read_file("/nested/data.txt")
+        first_fs.read_file("/workspace/alpha.txt"),
+        second_fs.read_file("/workspace/nested/data.txt")
     );
     assert_eq!(first.expect("first simultaneous read"), ALPHA);
     assert_eq!(second.expect("second simultaneous read"), NESTED);
 
-    let head = sandbox.exec("cat /large.txt | head -n 1").await;
+    let head = sandbox.exec("cat /workspace/large.txt | head -n 1").await;
     assert_eq!(head.exit_code, 0, "{}", head.stderr);
     assert_eq!(head.stdout, "first record\n");
-    let grep = sandbox.exec("grep needle /nested/data.txt").await;
+    let grep = sandbox.exec("grep needle /workspace/nested/data.txt").await;
     assert_eq!(grep.exit_code, 0, "{}", grep.stderr);
     assert_eq!(grep.stdout, "nested needle\n");
-    let wc = sandbox.exec("wc -c < /large.txt").await;
+    let wc = sandbox.exec("wc -c < /workspace/large.txt").await;
     assert_eq!(wc.exit_code, 0, "{}", wc.stderr);
     assert_eq!(wc.stdout.trim(), large.len().to_string());
 
-    let redirect = sandbox.exec("echo forbidden > /new.txt").await;
+    let redirect = sandbox.exec("echo forbidden > /workspace/new.txt").await;
     assert_ne!(redirect.exit_code, 0);
     assert!(
         redirect.stderr.contains("Permission denied"),
         "{}",
         redirect.stderr
     );
-    let touch = sandbox.exec("touch /new.txt").await;
+    let touch = sandbox.exec("touch /workspace/new.txt").await;
     assert_ne!(touch.exit_code, 0);
     assert!(
         touch.stderr.contains("Permission denied"),
@@ -315,7 +315,7 @@ async fn s3_compatible_adapter_vfs_and_sandbox_end_to_end() {
     {
         let js = sandbox
             .exec(
-                r#"js -e "const fs=require('fs'); console.log(fs.readFileSync('/alpha.txt','utf8').trim())""#,
+                r#"js -e "const fs=require('fs'); console.log(fs.readFileSync('/workspace/alpha.txt','utf8').trim())""#,
             )
             .await;
         assert_eq!(js.exit_code, 0, "{}", js.stderr);

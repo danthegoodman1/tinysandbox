@@ -17,11 +17,13 @@ async fn head_stops_generated_vfs_after_small_prefix() {
     // Proves early downstream exit closes the pipe before the virtual GiB-scale
     // input is fully read.
     let vfs = Arc::new(GeneratingVfs::new(4 * 1024 * 1024 * 1024));
-    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .build();
 
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        sandbox.exec("cat /huge | head -n 1"),
+        sandbox.exec("cat /workspace/huge | head -n 1"),
     )
     .await
     .expect("pipeline should not deadlock");
@@ -54,18 +56,23 @@ async fn full_scan_streams_data_larger_than_pipe_capacity() {
     // whole-file materialization in the VFS.
     let size = 64 * 1024 * 1024;
     let vfs = Arc::new(GeneratingVfs::new(size));
-    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .build();
 
-    let wc = tokio::time::timeout(Duration::from_secs(5), sandbox.exec("wc -c < /huge"))
-        .await
-        .expect("wc should finish");
+    let wc = tokio::time::timeout(
+        Duration::from_secs(5),
+        sandbox.exec("wc -c < /workspace/huge"),
+    )
+    .await
+    .expect("wc should finish");
     assert_eq!(wc.exit_code, 0);
     assert_eq!(wc.stdout.trim(), size.to_string());
 
     vfs.reset_served();
     let grep = tokio::time::timeout(
         Duration::from_secs(5),
-        sandbox.exec("grep -c pattern /huge"),
+        sandbox.exec("grep -c pattern /workspace/huge"),
     )
     .await
     .expect("grep should finish");
@@ -80,11 +87,16 @@ async fn redirect_write_streams_to_vfs_file() {
     // runs, not accumulated as a command-sized buffer first.
     let size = 8 * 1024 * 1024;
     let vfs = Arc::new(GeneratingVfs::new(size));
-    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .build();
 
-    let result = tokio::time::timeout(Duration::from_secs(5), sandbox.exec("cat /huge > /out"))
-        .await
-        .expect("redirect should finish");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        sandbox.exec("cat /workspace/huge > /workspace/out"),
+    )
+    .await
+    .expect("redirect should finish");
     assert_eq!(result.exit_code, 0);
     assert!(result.stdout.is_empty());
     assert_eq!(vfs.stat("/out").expect("out stat").len, size);
@@ -105,11 +117,13 @@ async fn deadlock_regressions_complete_under_timeout() {
     // Covers fast producer with slow/early consumers, a middle stage exiting
     // immediately, and command-budget rejection before a pipeline is spawned.
     let vfs = Arc::new(GeneratingVfs::new(16 * 1024 * 1024));
-    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .build();
 
     let head = tokio::time::timeout(
         Duration::from_secs(2),
-        sandbox.exec("cat /huge | head -n 10"),
+        sandbox.exec("cat /workspace/huge | head -n 10"),
     )
     .await
     .expect("head pipeline should not deadlock");
@@ -117,7 +131,7 @@ async fn deadlock_regressions_complete_under_timeout() {
 
     let fail_mid = tokio::time::timeout(
         Duration::from_secs(2),
-        sandbox.exec("cat /huge | false | wc -c"),
+        sandbox.exec("cat /workspace/huge | false | wc -c"),
     )
     .await
     .expect("failed middle stage should not deadlock");
@@ -125,15 +139,18 @@ async fn deadlock_regressions_complete_under_timeout() {
     assert_eq!(fail_mid.stdout.trim(), "0");
 
     let limited = Sandbox::builder()
-        .vfs_arc(vfs)
+        .mount_arc("workspace", vfs)
         .limits(Limits {
             max_commands: 1,
             ..Limits::default()
         })
         .build();
-    let limit = tokio::time::timeout(Duration::from_secs(2), limited.exec("cat /huge | wc -c"))
-        .await
-        .expect("limit hit should not spawn a stuck pipeline");
+    let limit = tokio::time::timeout(
+        Duration::from_secs(2),
+        limited.exec("cat /workspace/huge | wc -c"),
+    )
+    .await
+    .expect("limit hit should not spawn a stuck pipeline");
     assert_eq!(limit.exit_code, 125);
     assert!(limit.stderr.contains("maximum command count exceeded"));
 }
@@ -144,14 +161,14 @@ async fn output_cap_truncates_while_draining_stream() {
     let size = 8 * 1024 * 1024;
     let vfs = Arc::new(GeneratingVfs::new(size));
     let sandbox = Sandbox::builder()
-        .vfs_arc(vfs.clone())
+        .mount_arc("workspace", vfs.clone())
         .limits(Limits {
             stdout_bytes: 1024,
             ..Limits::default()
         })
         .build();
 
-    let result = tokio::time::timeout(Duration::from_secs(5), sandbox.exec("cat /huge"))
+    let result = tokio::time::timeout(Duration::from_secs(5), sandbox.exec("cat /workspace/huge"))
         .await
         .expect("capped output should finish");
     assert_eq!(result.exit_code, 0);
@@ -167,11 +184,11 @@ async fn redirected_stdin_in_later_stage_closes_upstream_pipe() {
     // upstream pipe reader must close instead of keeping the producer blocked.
     let vfs = Arc::new(GeneratingVfs::new(16 * 1024 * 1024));
     vfs.write_inner("/small", b"abc");
-    let sandbox = Sandbox::builder().vfs_arc(vfs).build();
+    let sandbox = Sandbox::builder().mount_arc("workspace", vfs).build();
 
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        sandbox.exec("cat /huge | wc -c < /small"),
+        sandbox.exec("cat /workspace/huge | wc -c < /workspace/small"),
     )
     .await
     .expect("redirected later stage should not deadlock");
@@ -194,10 +211,10 @@ async fn pipeline_shell_builtins_do_not_mutate_session_but_still_write_stdout() 
     // but builtins like `export` still execute and can feed the pipe.
     let sandbox = Sandbox::builder().build();
 
-    assert_eq!(sandbox.exec("mkdir /sub").await.exit_code, 0);
-    let cd = sandbox.exec("cd /sub | cat; pwd").await;
+    assert_eq!(sandbox.exec("mkdir /workspace/sub").await.exit_code, 0);
+    let cd = sandbox.exec("cd /workspace/sub | cat; pwd").await;
     assert_eq!(cd.exit_code, 0);
-    assert_eq!(cd.stdout, "/\n");
+    assert_eq!(cd.stdout, "/workspace\n");
 
     let assignment = sandbox.exec("FOO=bar | cat; echo $FOO").await;
     assert_eq!(assignment.exit_code, 0);
@@ -227,14 +244,14 @@ async fn per_stage_redirect_failure_does_not_abort_pipeline() {
     // EOF on their pipe and determine the pipeline status.
     let sandbox = Sandbox::builder().build();
 
-    let result = sandbox.exec("cat < /missing | wc -l").await;
+    let result = sandbox.exec("cat < /workspace/missing | wc -l").await;
 
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stdout.trim(), "0");
     assert!(
         result
             .stderr
-            .contains("cat: /missing: No such file or directory")
+            .contains("cat: /workspace/missing: No such file or directory")
     );
 }
 
@@ -244,7 +261,7 @@ async fn timeout_aborts_spawned_pipeline_tasks() {
     // timeout returns; abort-on-drop prevents that late mutation.
     let vfs = Arc::new(InMemoryVfs::default());
     let sandbox = Sandbox::builder()
-        .vfs_arc(vfs.clone())
+        .mount_arc("workspace", vfs.clone())
         .limits(Limits {
             wall_time: Duration::from_millis(50),
             ..Limits::default()
@@ -252,7 +269,7 @@ async fn timeout_aborts_spawned_pipeline_tasks() {
         .command("latewrite", |ctx| async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             ctx.fs
-                .write_file("/late", b"too late", false)
+                .write_file("/workspace/late", b"too late", false)
                 .await
                 .expect("late write");
             tinysandbox::sandbox::CommandResult::success()
@@ -276,15 +293,20 @@ async fn mid_stream_vfs_read_errors_are_reported() {
     // The reader must surface failures after already returning some bytes; EOF
     // would make these commands falsely succeed with truncated input.
     let vfs = Arc::new(GeneratingVfs::new(4 * 1024 * 1024).fail_after(128 * 1024));
-    let sandbox = Sandbox::builder().vfs_arc(vfs.clone()).build();
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .build();
 
-    let wc = sandbox.exec("wc -c < /huge").await;
+    let wc = sandbox.exec("wc -c < /workspace/huge").await;
     assert_eq!(wc.exit_code, 1);
     assert!(wc.stderr.contains("wc: -: Invalid argument"));
 
-    let cat = sandbox.exec("cat /huge > /out").await;
+    let cat = sandbox.exec("cat /workspace/huge > /workspace/out").await;
     assert_eq!(cat.exit_code, 1);
-    assert!(cat.stderr.contains("cat: /huge: Invalid argument"));
+    assert!(
+        cat.stderr
+            .contains("cat: /workspace/huge: Invalid argument")
+    );
     assert!(vfs.stat("/out").expect("partial out exists").len < 4 * 1024 * 1024);
 }
 
@@ -293,28 +315,37 @@ async fn line_tools_report_mid_stream_vfs_read_errors() {
     // Line-oriented commands must report read errors that happen after partial
     // input, not silently treat the stream as EOF.
     let vfs = Arc::new(GeneratingVfs::new(4 * 1024 * 1024).fail_after(128 * 1024));
-    let sandbox = Sandbox::builder().vfs_arc(vfs).build();
+    let sandbox = Sandbox::builder().mount_arc("workspace", vfs).build();
 
-    let sed = sandbox.exec("sed 's/p/q/' /huge").await;
+    let sed = sandbox.exec("sed 's/p/q/' /workspace/huge").await;
     assert_eq!(sed.exit_code, 2);
-    assert!(sed.stderr.contains("sed: /huge: Invalid argument"));
+    assert!(
+        sed.stderr
+            .contains("sed: /workspace/huge: Invalid argument")
+    );
 
-    let head = sandbox.exec("head -n 100000 /huge").await;
+    let head = sandbox.exec("head -n 100000 /workspace/huge").await;
     assert_eq!(head.exit_code, 1);
-    assert!(head.stderr.contains("head: /huge: Invalid argument"));
+    assert!(
+        head.stderr
+            .contains("head: /workspace/huge: Invalid argument")
+    );
 
-    let tail = sandbox.exec("tail /huge").await;
+    let tail = sandbox.exec("tail /workspace/huge").await;
     assert_eq!(tail.exit_code, 1);
-    assert!(tail.stderr.contains("tail: /huge: Invalid argument"));
+    assert!(
+        tail.stderr
+            .contains("tail: /workspace/huge: Invalid argument")
+    );
 }
 
 #[tokio::test]
 async fn grep_closed_pipe_stops_without_stderr() {
     // GNU grep exits silently on SIGPIPE when a downstream command stops early.
     let vfs = Arc::new(GeneratingVfs::new(8 * 1024 * 1024));
-    let sandbox = Sandbox::builder().vfs_arc(vfs).build();
+    let sandbox = Sandbox::builder().mount_arc("workspace", vfs).build();
 
-    let result = sandbox.exec("grep p /huge | head -n 1").await;
+    let result = sandbox.exec("grep p /workspace/huge | head -n 1").await;
 
     assert_eq!(result.exit_code, 0);
     assert!(result.stderr.is_empty());
@@ -385,16 +416,16 @@ async fn long_no_newline_streams_are_bounded() {
     // commands reject the same input before buffering it all.
     let size = 2 * 1024 * 1024;
     let vfs = Arc::new(GeneratingVfs::new_without_newlines(size));
-    let sandbox = Sandbox::builder().vfs_arc(vfs).build();
+    let sandbox = Sandbox::builder().mount_arc("workspace", vfs).build();
 
-    let cat = sandbox.exec("cat /huge | wc -c").await;
+    let cat = sandbox.exec("cat /workspace/huge | wc -c").await;
     assert_eq!(cat.exit_code, 0);
     assert_eq!(cat.stdout.trim(), size.to_string());
     assert!(cat.stderr.is_empty());
 
-    let grep = sandbox.exec("grep z /huge").await;
+    let grep = sandbox.exec("grep z /workspace/huge").await;
     assert_eq!(grep.exit_code, 2);
-    assert!(grep.stderr.contains("grep: /huge: line too long"));
+    assert!(grep.stderr.contains("grep: /workspace/huge: line too long"));
 }
 
 #[tokio::test]
@@ -405,11 +436,20 @@ async fn wc_word_count_uses_c_locale_ascii_separators() {
     write_file(vfs.as_ref(), "/nbsp", "a\u{00a0}b\n".as_bytes());
     write_file(vfs.as_ref(), "/u2028", "a\u{2028}b\n".as_bytes());
     write_file(vfs.as_ref(), "/space", b"a b\n");
-    let sandbox = Sandbox::builder().vfs_arc(vfs).build();
+    let sandbox = Sandbox::builder().mount_arc("workspace", vfs).build();
 
-    assert_eq!(sandbox.exec("wc -w /nbsp").await.stdout.trim(), "1 /nbsp");
-    assert_eq!(sandbox.exec("wc -w /u2028").await.stdout.trim(), "1 /u2028");
-    assert_eq!(sandbox.exec("wc -w /space").await.stdout.trim(), "2 /space");
+    assert_eq!(
+        sandbox.exec("wc -w /workspace/nbsp").await.stdout.trim(),
+        "1 /workspace/nbsp"
+    );
+    assert_eq!(
+        sandbox.exec("wc -w /workspace/u2028").await.stdout.trim(),
+        "1 /workspace/u2028"
+    );
+    assert_eq!(
+        sandbox.exec("wc -w /workspace/space").await.stdout.trim(),
+        "2 /workspace/space"
+    );
 }
 
 fn write_file(vfs: &dyn Vfs, path: &str, data: &[u8]) {
