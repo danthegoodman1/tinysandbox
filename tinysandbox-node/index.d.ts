@@ -37,35 +37,44 @@ export interface SandboxOptions {
   syscalls?: Record<string, JsSyscall>
   jsPrelude?: string
   fetch?: JsFetch
-  /** Custom VFS implemented in JavaScript. Mutually exclusive with localVfs and s3Vfs. */
-  vfs?: JsVfs
-  /** Persist the sandbox filesystem under a host directory. Mutually exclusive with vfs and s3Vfs. */
-  localVfs?: LocalVfsOptions
-  /** Read-only S3 bucket/prefix filesystem. Mutually exclusive with vfs and localVfs. */
-  s3Vfs?: S3VfsOptions
+  /** Static top-level filesystem mounts. Replaces the default in-memory workspace when present. */
+  mounts?: Record<string, MountOptions>
+}
+
+export type MountOptions =
+  | ({ type: 'memory' } & MemoryVfsOptions)
+  | ({ type: 'local' } & LocalVfsOptions)
+  | ({ type: 's3' } & S3VfsOptions)
+  | { type: 'custom', vfs: JsVfs }
+
+export interface MemoryVfsOptions {
+  /** Storage limits. Unset fields are unlimited. */
+  quota?: VfsQuotaOptions
+}
+
+export interface VfsQuotaOptions {
+  maxBytes?: number
+  maxFiles?: number
+  maxFileSize?: number
 }
 
 /**
  * Backs the sandbox filesystem with a directory on the host (Unix only).
  *
- * Sandbox paths resolve strictly beneath the root: `..` is clamped at the
- * sandbox root and symlinks are never followed. The directory must exist and
+ * Paths within the mount resolve strictly beneath the root: `..` is clamped at
+ * the virtual sandbox root and symlinks are never followed. The directory must exist and
  * should be dedicated to the sandbox; existing regular files and directories
  * are visible inside and count toward the quota.
  */
 export interface LocalVfsOptions {
-  /** Existing host directory that becomes the sandbox root `/`. */
+  /** Existing host directory that becomes this mount's root. */
   root: string
   /** Storage limits. Unset fields are unlimited. */
-  quota?: {
-    maxBytes?: number
-    maxFiles?: number
-    maxFileSize?: number
-  }
+  quota?: VfsQuotaOptions
 }
 
 /**
- * Exposes one S3 bucket/key prefix as the read-only sandbox root `/`.
+ * Exposes one S3 bucket/key prefix as a read-only mount root.
  *
  * Region and credentials use the AWS SDK default provider chains when they
  * are omitted. Endpoint and path-style overrides support compatible services.
@@ -73,7 +82,7 @@ export interface LocalVfsOptions {
 export interface S3VfsOptions {
   /** Bucket containing the exposed objects. */
   bucket: string
-  /** Key prefix exposed as `/`; leading/trailing slashes are normalized. */
+  /** Key prefix exposed at the mount root. Leading/trailing slashes are normalized. */
   prefix?: string
   /** AWS region override. */
   region?: string
@@ -194,6 +203,7 @@ export interface VfsCallbackError {
 export type VfsErrno =
   | 'EBADF'
   | 'EBUSY'
+  | 'EXDEV'
   | 'EACCES'
   | 'EEXIST'
   | 'EIO'

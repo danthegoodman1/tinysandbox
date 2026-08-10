@@ -5,8 +5,9 @@ async function main() {
   const conformance = await runConformance((quota) => createMemoryVfs(quota))
   console.log('conformance:', conformance)
 
-  const sandbox = new Sandbox({ vfs: createMemoryVfs() })
-  await sandbox.fs.mkdir('/workspace')
+  const sandbox = new Sandbox({
+    mounts: { workspace: { type: 'custom', vfs: createMemoryVfs() } }
+  })
   await sandbox.fs.writeFile('/workspace/input.txt', Buffer.from('one\ntwo\nthree\n'))
 
   const result = await sandbox.exec('cat /workspace/input.txt | wc -l')

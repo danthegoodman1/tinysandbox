@@ -13,20 +13,15 @@ export declare class NativeSandbox {
   get fs(): SandboxFs
   stats(): Promise<SandboxStats>
   /**
-   * Rescans the localVfs root directory and replaces quota usage with the
-   * result. Call this after the host mutates the directory outside the
-   * sandbox. Rejects when the sandbox was not built with the localVfs
-   * option.
+   * Rescans a local mount's host directory and replaces its quota usage.
+   * Call this after the host mutates the directory outside the sandbox.
    */
-  refreshLocalVfs(): Promise<VfsStatsJs>
+  refreshLocalVfs(mount: string): Promise<VfsStatsJs>
   /**
-   * Replaces localVfs quota usage with externally computed numbers, for
-   * hosts that track usage out of band. Later file operations apply their
-   * deltas on top of the pushed baseline and quota enforcement blocks
-   * growth against it. Throws when the sandbox was not built with the
-   * localVfs option.
+   * Replaces a local mount's quota usage with externally computed numbers.
+   * Later file operations apply their deltas on top of the pushed baseline.
    */
-  setLocalVfsUsage(usage: VfsStatsJs): void
+  setLocalVfsUsage(mount: string, usage: VfsStatsJs): void
 }
 export type Sandbox = NativeSandbox
 

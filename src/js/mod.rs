@@ -1253,6 +1253,7 @@ fn libuv_errno(errno: Errno) -> i32 {
     match errno {
         Errno::EBADF => -9,
         Errno::EBUSY => -16,
+        Errno::EXDEV => -18,
         Errno::EACCES => -13,
         Errno::EEXIST => -17,
         Errno::EIO => -5,
@@ -1269,6 +1270,7 @@ fn node_errno_message(errno: Errno) -> &'static str {
     match errno {
         Errno::EBADF => "bad file descriptor",
         Errno::EBUSY => "resource busy or locked",
+        Errno::EXDEV => "cross-device link not permitted",
         Errno::EACCES => "permission denied",
         Errno::EEXIST => "file already exists",
         Errno::EIO => "i/o error",

@@ -19,7 +19,7 @@ END
 
 CASE ls all long shape
 COMMAND
-mkdir -p /d; touch /d/.hidden /d/file; ls -a -l /d
+mkdir -p /workspace/d; touch /workspace/d/.hidden /workspace/d/file; ls -a -l /workspace/d
 END_COMMAND
 EXIT 0
 STDOUT
@@ -34,13 +34,13 @@ END
 
 CASE cp mv rm mkdir touch
 COMMAND
-mkdir -p /a; echo data > /a/src; cp /a/src /a/copy; mkdir /b; mv /a/copy /b/moved; rm /a/src; ls /a /b
+mkdir -p /workspace/a; echo data > /workspace/a/src; cp /workspace/a/src /workspace/a/copy; mkdir /workspace/b; mv /workspace/a/copy /workspace/b/moved; rm /workspace/a/src; ls /workspace/a /workspace/b
 END_COMMAND
 EXIT 0
 STDOUT
-/a:
+/workspace/a:
 
-/b:
+/workspace/b:
 moved
 END_STDOUT
 STDERR
@@ -62,11 +62,11 @@ END
 
 CASE pwd after cd
 COMMAND
-mkdir -p /work; cd /work; pwd
+mkdir -p /workspace/work; cd /workspace/work; pwd
 END_COMMAND
 EXIT 0
 STDOUT
-/work
+/workspace/work
 END_STDOUT
 STDERR
 END_STDERR
@@ -74,7 +74,7 @@ END
 
 CASE grep flags and no match
 COMMAND
-echo -e 'Alpha\nbeta\nALPHA' > /g; grep -i -n alpha /g; grep -c -v beta /g; grep zzz /g
+echo -e 'Alpha\nbeta\nALPHA' > /workspace/g; grep -i -n alpha /workspace/g; grep -c -v beta /workspace/g; grep zzz /workspace/g
 END_COMMAND
 EXIT 1
 STDOUT
@@ -88,25 +88,25 @@ END
 
 CASE grep read error exits two
 COMMAND
-echo ok > /g; grep ok /g /missing
+echo ok > /workspace/g; grep ok /workspace/g /workspace/missing
 END_COMMAND
 EXIT 2
 STDOUT
-/g:ok
+/workspace/g:ok
 END_STDOUT
 STDERR
-grep: /missing: No such file or directory
+grep: /workspace/missing: No such file or directory
 END_STDERR
 END
 
 CASE grep recursive prefixes paths
 COMMAND
-mkdir -p /r; echo one > /r/a; echo two > /r/b; grep -r o /r
+mkdir -p /workspace/r; echo one > /workspace/r/a; echo two > /workspace/r/b; grep -r o /workspace/r
 END_COMMAND
 EXIT 0
 STDOUT
-/r/a:one
-/r/b:two
+/workspace/r/a:one
+/workspace/r/b:two
 END_STDOUT
 STDERR
 END_STDERR
@@ -114,14 +114,14 @@ END
 
 CASE head tail headers and plus count
 COMMAND
-echo -e 'a\nb\nc' > /h1; echo -e 'd\ne\nf' > /h2; head -n 1 /h1 /h2; tail -n +2 /h1
+echo -e 'a\nb\nc' > /workspace/h1; echo -e 'd\ne\nf' > /workspace/h2; head -n 1 /workspace/h1 /workspace/h2; tail -n +2 /workspace/h1
 END_COMMAND
 EXIT 0
 STDOUT
-==> /h1 <==
+==> /workspace/h1 <==
 a
 
-==> /h2 <==
+==> /workspace/h2 <==
 d
 b
 c
@@ -174,7 +174,7 @@ END
 
 CASE uniq count repeated unique
 COMMAND
-echo -e 'a\na\nb\nc\nc' > /u; uniq -c /u; uniq -d /u; uniq -u /u
+echo -e 'a\na\nb\nc\nc' > /workspace/u; uniq -c /workspace/u; uniq -d /workspace/u; uniq -u /workspace/u
 END_COMMAND
 EXIT 0
 STDOUT
@@ -191,14 +191,14 @@ END
 
 CASE wc width rules
 COMMAND
-echo -e -n 'one two\n' | wc; echo -e 'a b\nc' > /w; wc -l /w; wc -l -w -c /w /w
+echo -e -n 'one two\n' | wc; echo -e 'a b\nc' > /workspace/w; wc -l /workspace/w; wc -l -w -c /workspace/w /workspace/w
 END_COMMAND
 EXIT 0
 STDOUT
       1       2       8
-2 /w
- 2  3  6 /w
- 2  3  6 /w
+2 /workspace/w
+ 2  3  6 /workspace/w
+ 2  3  6 /workspace/w
  4  6 12 total
 END_STDOUT
 STDERR
@@ -238,7 +238,7 @@ END
 
 CASE cat numbering squeeze and marks
 COMMAND
-echo -e 'a\tx\n\n\n\nb' > /f; cat -n /f; cat -b /f; cat -sn /f; cat -ET /f
+echo -e 'a\tx\n\n\n\nb' > /workspace/f; cat -n /workspace/f; cat -b /workspace/f; cat -sn /workspace/f; cat -ET /workspace/f
 END_COMMAND
 EXIT 0
 STDOUT
@@ -267,7 +267,7 @@ END
 
 CASE cat numbering continues across files
 COMMAND
-echo -e 'p\nq' > /g; cat -n /g /g
+echo -e 'p\nq' > /workspace/g; cat -n /workspace/g /workspace/g
 END_COMMAND
 EXIT 0
 STDOUT
@@ -282,7 +282,7 @@ END
 
 CASE cat unsupported flag
 COMMAND
-cat -z /g
+cat -z /workspace/g
 END_COMMAND
 EXIT 1
 STDOUT
@@ -330,7 +330,7 @@ END
 
 CASE jq raw output files and dash
 COMMAND
-echo '{"x":1}' > /a; echo '{"x":3}' > /c; echo '{"x":2}' | jq -r '.x' /a - /c
+echo '{"x":1}' > /workspace/a; echo '{"x":3}' > /workspace/c; echo '{"x":2}' | jq -r '.x' /workspace/a - /workspace/c
 END_COMMAND
 EXIT 0
 STDOUT

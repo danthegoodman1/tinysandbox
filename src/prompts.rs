@@ -24,7 +24,7 @@
 //! depending on the builder's `persist_session` setting.
 
 /// What the environment is and its hard boundaries.
-pub const OVERVIEW: &str = "You are working in a minimal Linux-like sandbox: a bash-compatible shell over a virtual filesystem. Files persist across commands. There is no host filesystem, no other processes, no package manager, and no network access beyond capabilities described here.";
+pub const OVERVIEW: &str = "You are working in a minimal Linux-like sandbox: a bash-compatible shell over a virtual filesystem. Files persist across commands. `ls /` shows the static filesystem mounts and `/bin`. The virtual root and mount points are read-only. There is no host filesystem, no other processes, no package manager, and no network access beyond capabilities described here.";
 
 /// The supported shell subset and what fails to parse.
 pub const SHELL: &str = "The shell supports the common bash subset: pipelines, `&&`/`||`/`;`, redirects (`>`, `>>`, `<`, `2>`, `2>>`, `2>&1`), single/double quotes, backslash escapes, and variables (`$VAR`, `${VAR}`, `$?`, `VAR=x cmd`, `export`, `unset`). Behavior inside this subset matches bash. Globs, command substitution (`$(...)`, backticks), heredocs, `&`, subshells, and brace/tilde expansion are not supported and fail with a clear parse error.";

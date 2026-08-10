@@ -177,26 +177,29 @@ async fn jq_builtin_matches_supported_cli_surface() {
 
     assert_eq!(
         sandbox
-            .exec(r#"echo '{"x":1}' > /a; echo '{"x":2}' > /b; jq -r '.x' /a /b"#)
+            .exec(r#"echo '{"x":1}' > /workspace/a; echo '{"x":2}' > /workspace/b; jq -r '.x' /workspace/a /workspace/b"#)
             .await
             .stdout,
         "1\n2\n"
     );
 
     let fs = sandbox.fs();
-    fs.write_file("/jq-one", b"1", false)
+    fs.write_file("/workspace/jq-one", b"1", false)
         .await
         .expect("write jq-one");
-    fs.write_file("/jq-three", b"3", false)
+    fs.write_file("/workspace/jq-three", b"3", false)
         .await
         .expect("write jq-three");
     assert_eq!(
-        sandbox.exec("jq -r '.' /jq-one /jq-three").await.stdout,
+        sandbox
+            .exec("jq -r '.' /workspace/jq-one /workspace/jq-three")
+            .await
+            .stdout,
         "1\n3\n"
     );
     assert_eq!(
         sandbox
-            .exec("echo -n 2 | jq -r '.' /jq-one - /jq-three")
+            .exec("echo -n 2 | jq -r '.' /workspace/jq-one - /workspace/jq-three")
             .await
             .stdout,
         "1\n2\n3\n"
@@ -263,10 +266,10 @@ async fn jq_builtin_reports_status_errors_and_limits() {
     let deep_json = format!("{}0{}", "[".repeat(1100), "]".repeat(1100));
     sandbox
         .fs()
-        .write_file("/deep.json", deep_json.as_bytes(), false)
+        .write_file("/workspace/deep.json", deep_json.as_bytes(), false)
         .await
         .expect("write deep jq input");
-    let deep_input = sandbox.exec("jq -c '.' /deep.json").await;
+    let deep_input = sandbox.exec("jq -c '.' /workspace/deep.json").await;
     assert_eq!(deep_input.exit_code, 2);
     assert!(deep_input.stderr.contains("JSON nesting exceeds"));
 
@@ -328,6 +331,32 @@ async fn bin_is_synthesized_and_read_only() {
     let denied = sandbox.exec("echo x > /bin/cat").await;
     assert_ne!(denied.exit_code, 0);
     assert!(denied.stderr.contains("Permission denied"));
+
+    assert_eq!(sandbox.exec("ls /").await.stdout, "bin\nworkspace\n");
+}
+
+#[tokio::test]
+async fn multiple_mounts_are_listed_routed_and_cross_copied() {
+    let sandbox = Sandbox::builder()
+        .clear_mounts()
+        .mount("input", InMemoryVfs::default())
+        .mount("output", InMemoryVfs::default())
+        .cwd("/input")
+        .build();
+
+    assert_eq!(sandbox.exec("ls /").await.stdout, "bin\ninput\noutput\n");
+    assert_eq!(
+        sandbox
+            .exec("echo mounted > /input/source; cp /input/source /output/copied")
+            .await
+            .exit_code,
+        0
+    );
+    assert_eq!(sandbox.exec("cat /output/copied").await.stdout, "mounted\n");
+
+    let rename = sandbox.exec("mv /input/source /output/moved").await;
+    assert_eq!(rename.exit_code, 1);
+    assert!(rename.stderr.contains("Invalid cross-device link"));
 }
 
 #[tokio::test]
@@ -336,14 +365,29 @@ async fn file_basenames_are_used_for_ls_cp_and_mv_directory_targets() {
     // including paths with trailing slashes after normalization.
     let sandbox = Sandbox::builder().build();
 
-    assert_eq!(sandbox.exec("mkdir /dir; touch /leaf").await.exit_code, 0);
-    assert_eq!(sandbox.exec("ls /leaf///").await.stdout, "leaf\n");
-    assert_eq!(sandbox.exec("cp /leaf/// /dir").await.exit_code, 0);
     assert_eq!(
-        sandbox.exec("mv /dir/leaf/// /dir/moved").await.exit_code,
+        sandbox
+            .exec("mkdir /workspace/dir; touch /workspace/leaf")
+            .await
+            .exit_code,
         0
     );
-    assert_eq!(sandbox.exec("ls /dir").await.stdout, "moved\n");
+    assert_eq!(sandbox.exec("ls /workspace/leaf///").await.stdout, "leaf\n");
+    assert_eq!(
+        sandbox
+            .exec("cp /workspace/leaf/// /workspace/dir")
+            .await
+            .exit_code,
+        0
+    );
+    assert_eq!(
+        sandbox
+            .exec("mv /workspace/dir/leaf/// /workspace/dir/moved")
+            .await
+            .exit_code,
+        0
+    );
+    assert_eq!(sandbox.exec("ls /workspace/dir").await.stdout, "moved\n");
 }
 
 #[tokio::test]
@@ -360,13 +404,16 @@ async fn limits_truncate_output_and_surface_vfs_quota_errors() {
     assert!(result.stdout.contains("output truncated"));
 
     let tiny = Sandbox::builder()
-        .vfs(InMemoryVfs::new(VfsQuota {
-            max_bytes: 3,
-            max_files: 4,
-            max_file_size: 3,
-        }))
+        .mount(
+            "workspace",
+            InMemoryVfs::new(VfsQuota {
+                max_bytes: 3,
+                max_files: 4,
+                max_file_size: 3,
+            }),
+        )
         .build();
-    let quota = tiny.exec("echo abcdef > /file").await;
+    let quota = tiny.exec("echo abcdef > /workspace/file").await;
     assert_ne!(quota.exit_code, 0);
     assert!(quota.stderr.contains("No space left on device"));
 }
@@ -409,28 +456,36 @@ async fn redirects_follow_bash_fd_order_and_preflight_timing() {
         })
         .build();
 
-    let split = sandbox.exec("both 2>&1 > /out").await;
+    let split = sandbox.exec("both 2>&1 > /workspace/out").await;
     assert_eq!(split.exit_code, 0);
     assert_eq!(split.stdout, "err\n");
-    assert_eq!(sandbox.exec("cat /out").await.stdout, "out\n");
+    assert_eq!(sandbox.exec("cat /workspace/out").await.stdout, "out\n");
 
-    let joined = sandbox.exec("both > /joined 2>&1").await;
+    let joined = sandbox.exec("both > /workspace/joined 2>&1").await;
     assert_eq!(joined.exit_code, 0);
     assert_eq!(joined.stdout, "");
-    assert_eq!(sandbox.exec("cat /joined").await.stdout, "out\nerr\n");
+    assert_eq!(
+        sandbox.exec("cat /workspace/joined").await.stdout,
+        "out\nerr\n"
+    );
 
-    assert_eq!(sandbox.exec("both 2> /err").await.exit_code, 0);
-    assert_eq!(sandbox.exec("both 2>> /err").await.exit_code, 0);
-    assert_eq!(sandbox.exec("cat /err").await.stdout, "err\nerr\n");
+    assert_eq!(sandbox.exec("both 2> /workspace/err").await.exit_code, 0);
+    assert_eq!(sandbox.exec("both 2>> /workspace/err").await.exit_code, 0);
+    assert_eq!(
+        sandbox.exec("cat /workspace/err").await.stdout,
+        "err\nerr\n"
+    );
 
-    let unsupported_fd = sandbox.exec("both 3> /bad").await;
+    let unsupported_fd = sandbox.exec("both 3> /workspace/bad").await;
     assert_eq!(unsupported_fd.exit_code, 1);
     assert!(unsupported_fd.stderr.contains("Invalid argument"));
 
-    let missing_input = sandbox.exec("echo ran > /preflight < /missing").await;
+    let missing_input = sandbox
+        .exec("echo ran > /workspace/preflight < /workspace/missing")
+        .await;
     assert_eq!(missing_input.exit_code, 1);
     assert!(missing_input.stderr.contains("No such file or directory"));
-    assert_eq!(sandbox.exec("cat /preflight").await.stdout, "");
+    assert_eq!(sandbox.exec("cat /workspace/preflight").await.stdout, "");
 }
 
 #[tokio::test]
@@ -438,16 +493,20 @@ async fn redirect_setup_failures_close_opened_handles() {
     // A later redirect failure must clean up earlier input handles and output sinks.
     let input_vfs = Arc::new(TrackingVfs::default());
     input_vfs.write_seed("/input", b"hello\n");
-    let input_sandbox = Sandbox::builder().vfs_arc(input_vfs.clone()).build();
+    let input_sandbox = Sandbox::builder()
+        .mount_arc("workspace", input_vfs.clone())
+        .build();
 
-    let input_failure = input_sandbox.exec("cat < /input > /missing/out").await;
+    let input_failure = input_sandbox
+        .exec("cat < /workspace/input > /workspace/missing/out")
+        .await;
     assert_ne!(input_failure.exit_code, 0);
     assert_eq!(input_vfs.live_handles(), 0);
 
     let output_vfs = Arc::new(TrackingVfs::default());
     output_vfs.fail_second_open_for("/stderr");
     let output_sandbox = Sandbox::builder()
-        .vfs_arc(output_vfs.clone())
+        .mount_arc("workspace", output_vfs.clone())
         .command("both", |mut ctx| async move {
             ctx.stdout.write_all(b"out\n").await.expect("write stdout");
             ctx.stderr.write_all(b"err\n").await.expect("write stderr");
@@ -455,7 +514,9 @@ async fn redirect_setup_failures_close_opened_handles() {
         })
         .build();
 
-    let output_failure = output_sandbox.exec("both > /stdout 2> /stderr").await;
+    let output_failure = output_sandbox
+        .exec("both > /workspace/stdout 2> /workspace/stderr")
+        .await;
     assert_ne!(output_failure.exit_code, 0);
     assert_eq!(output_vfs.live_handles(), 0);
 }
@@ -469,9 +530,12 @@ async fn shell_field_splitting_redirect_expansion_and_env_persist() {
     assert_eq!(sandbox.exec("X=' '").await.exit_code, 0);
     assert_eq!(sandbox.exec("echo \"1\"$X\"2\"").await.stdout, "1 2\n");
 
-    assert_eq!(sandbox.exec("OUT=/var-target").await.exit_code, 0);
+    assert_eq!(sandbox.exec("OUT=/workspace/var-target").await.exit_code, 0);
     assert_eq!(sandbox.exec("echo redirected > $OUT").await.exit_code, 0);
-    assert_eq!(sandbox.exec("cat /var-target").await.stdout, "redirected\n");
+    assert_eq!(
+        sandbox.exec("cat /workspace/var-target").await.stdout,
+        "redirected\n"
+    );
 
     assert_eq!(sandbox.exec("export KEEP=1").await.exit_code, 0);
     assert_eq!(sandbox.exec("echo $KEEP").await.stdout, "1\n");
@@ -490,17 +554,23 @@ async fn shell_field_splitting_redirect_expansion_and_env_persist() {
 async fn cd_updates_session_pwd_and_uses_home() {
     // Persistent mode keeps cwd/PWD updates between exec calls.
     let sandbox = Sandbox::builder()
-        .env("HOME", "/home")
+        .env("HOME", "/workspace/home")
         .persist_session(true)
         .build();
 
-    assert_eq!(sandbox.exec("mkdir -p /home /tmp").await.exit_code, 0);
-    assert_eq!(sandbox.exec("cd /tmp").await.exit_code, 0);
-    assert_eq!(sandbox.exec("echo $PWD").await.stdout, "/tmp\n");
+    assert_eq!(
+        sandbox
+            .exec("mkdir -p /workspace/home /workspace/tmp")
+            .await
+            .exit_code,
+        0
+    );
+    assert_eq!(sandbox.exec("cd /workspace/tmp").await.exit_code, 0);
+    assert_eq!(sandbox.exec("echo $PWD").await.stdout, "/workspace/tmp\n");
     assert_eq!(sandbox.exec("cd").await.exit_code, 0);
     assert_eq!(
         sandbox.exec("pwd; echo $PWD").await.stdout,
-        "/home\n/home\n"
+        "/workspace/home\n/workspace/home\n"
     );
 
     let no_home = Sandbox::builder().build();
@@ -510,7 +580,7 @@ async fn cd_updates_session_pwd_and_uses_home() {
 
     let after_failed_cd = sandbox.exec("cd /missing; pwd; echo $PWD").await;
     assert_eq!(after_failed_cd.exit_code, 0);
-    assert_eq!(after_failed_cd.stdout, "/home\n/home\n");
+    assert_eq!(after_failed_cd.stdout, "/workspace/home\n/workspace/home\n");
 }
 
 #[tokio::test]
@@ -519,9 +589,12 @@ async fn default_execs_discard_session_mutations_but_keep_vfs_changes() {
     // shared so files created by one exec are visible to later execs.
     let sandbox = Sandbox::builder().build();
 
-    assert_eq!(sandbox.exec("mkdir /work").await.exit_code, 0);
-    assert_eq!(sandbox.exec("cd /work").await.exit_code, 0);
-    assert_eq!(sandbox.exec("pwd; echo $PWD").await.stdout, "/\n/\n");
+    assert_eq!(sandbox.exec("mkdir /workspace/work").await.exit_code, 0);
+    assert_eq!(sandbox.exec("cd /workspace/work").await.exit_code, 0);
+    assert_eq!(
+        sandbox.exec("pwd; echo $PWD").await.stdout,
+        "/workspace\n/workspace\n"
+    );
 
     assert_eq!(sandbox.exec("export FOO=bar").await.exit_code, 0);
     assert_eq!(sandbox.exec("FOO=baz").await.exit_code, 0);
@@ -530,8 +603,17 @@ async fn default_execs_discard_session_mutations_but_keep_vfs_changes() {
     assert_eq!(sandbox.exec("false").await.exit_code, 1);
     assert_eq!(sandbox.exec("echo status=$?").await.stdout, "status=0\n");
 
-    assert_eq!(sandbox.exec("echo persisted > /file").await.exit_code, 0);
-    assert_eq!(sandbox.exec("cat /file").await.stdout, "persisted\n");
+    assert_eq!(
+        sandbox
+            .exec("echo persisted > /workspace/file")
+            .await
+            .exit_code,
+        0
+    );
+    assert_eq!(
+        sandbox.exec("cat /workspace/file").await.stdout,
+        "persisted\n"
+    );
 }
 
 #[tokio::test]
@@ -540,8 +622,14 @@ async fn persist_session_opt_in_keeps_cwd_env_and_status() {
     // want one logical shell across multiple exec calls.
     let sandbox = Sandbox::builder().persist_session(true).build();
 
-    assert_eq!(sandbox.exec("mkdir /work && cd /work").await.exit_code, 0);
-    assert_eq!(sandbox.exec("pwd").await.stdout, "/work\n");
+    assert_eq!(
+        sandbox
+            .exec("mkdir /workspace/work && cd /workspace/work")
+            .await
+            .exit_code,
+        0
+    );
+    assert_eq!(sandbox.exec("pwd").await.stdout, "/workspace/work\n");
     assert_eq!(sandbox.exec("export FOO=bar").await.exit_code, 0);
     assert_eq!(sandbox.exec("echo $FOO").await.stdout, "bar\n");
     assert_eq!(sandbox.exec("false").await.exit_code, 1);
@@ -572,16 +660,21 @@ async fn slow_vfs_dispatch_uses_blocking_threads() {
     // On a current-thread runtime, inline sleeping VFS calls would serialize
     // concurrent execs; spawn_blocking lets both touch operations overlap.
     let vfs = Arc::new(SleepingVfs::new(Duration::from_millis(75)));
-    let sandbox = Arc::new(Sandbox::builder().vfs_arc(vfs).build());
+    let sandbox = Arc::new(Sandbox::builder().mount_arc("workspace", vfs).build());
 
     let start = Instant::now();
-    let tasks: Vec<_> = ["/a", "/b", "/c", "/d"]
-        .into_iter()
-        .map(|path| {
-            let sandbox = Arc::clone(&sandbox);
-            tokio::spawn(async move { sandbox.exec(&format!("touch {path}")).await })
-        })
-        .collect();
+    let tasks: Vec<_> = [
+        "/workspace/a",
+        "/workspace/b",
+        "/workspace/c",
+        "/workspace/d",
+    ]
+    .into_iter()
+    .map(|path| {
+        let sandbox = Arc::clone(&sandbox);
+        tokio::spawn(async move { sandbox.exec(&format!("touch {path}")).await })
+    })
+    .collect();
     for task in tasks {
         assert_eq!(task.await.expect("touch task").exit_code, 0);
     }

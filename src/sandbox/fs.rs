@@ -46,6 +46,18 @@ impl Fs {
     /// Reads directory entries for a path resolved relative to the current directory.
     pub async fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
         let path = self.resolve(path);
+        if path == "/" {
+            let mut entries = self.dispatch(move |vfs| vfs.readdir("/")).await?;
+            entries.push(DirEntry {
+                name: "bin".to_owned(),
+                metadata: Metadata {
+                    file_type: FileType::Directory,
+                    len: 0,
+                },
+            });
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok(entries);
+        }
         if path == "/bin" {
             return Ok(self
                 .bin_commands
@@ -360,6 +372,7 @@ pub(crate) fn errno_message(errno: Errno) -> &'static str {
     match errno {
         Errno::EBADF => "Bad file descriptor",
         Errno::EBUSY => "Device or resource busy",
+        Errno::EXDEV => "Invalid cross-device link",
         Errno::EACCES => "Permission denied",
         Errno::EEXIST => "File exists",
         Errno::EIO => "Input/output error",

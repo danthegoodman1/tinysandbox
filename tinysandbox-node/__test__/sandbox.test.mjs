@@ -36,6 +36,12 @@ test('wall-clock limit validation rejects invalid numbers without aborting Node'
   assert.throws(() => new Sandbox({ limits: { wallTimeMs: -5 } }), /wallTimeMs/)
 })
 
+test('removed single-root VFS selectors fail loudly', () => {
+  for (const option of ['vfs', 'localVfs', 's3Vfs']) {
+    assert.throws(() => new Sandbox({ [option]: {} }), /replaced by the mounts option/)
+  }
+})
+
 test('numeric validation rejects unsafe byte counts and VFS lengths', async () => {
   // Oversized lengths must fail before native code allocates a Vec for the read.
   const unsafeInteger = Number.MAX_SAFE_INTEGER + 1
@@ -43,8 +49,8 @@ test('numeric validation rejects unsafe byte counts and VFS lengths', async () =
   assert.throws(() => new Sandbox({ limits: { jqInputBytes: unsafeInteger } }), /EINVAL/)
 
   const sandbox = new Sandbox()
-  await sandbox.fs.writeFile('/x', Buffer.from('abc'))
-  const handle = await sandbox.fs.open('/x', { read: true })
+  await sandbox.fs.writeFile('/workspace/x', Buffer.from('abc'))
+  const handle = await sandbox.fs.open('/workspace/x', { read: true })
   try {
     await assert.rejects(
       () => sandbox.fs.readAt(handle, 0, unsafeInteger),
@@ -90,8 +96,8 @@ test('jq builtin and jqInputBytes limit are available through Node options', asy
   }
 
   const deepJson = `${'['.repeat(1100)}0${']'.repeat(1100)}`
-  await sandbox.fs.writeFile('/deep.json', Buffer.from(deepJson))
-  const deepInput = await sandbox.exec("jq -c '.' /deep.json")
+  await sandbox.fs.writeFile('/workspace/deep.json', Buffer.from(deepJson))
+  const deepInput = await sandbox.exec("jq -c '.' /workspace/deep.json")
   assert.equal(deepInput.exitCode, 2)
   assert.match(deepInput.stderr, /JSON nesting exceeds/)
 })
@@ -100,22 +106,22 @@ test('direct VFS calls read, write, stat, readdir, and unlink', async () => {
   // Host-side VFS calls should work without shelling through exec.
   const sandbox = new Sandbox()
   assert.equal(sandbox.fs, sandbox.fs)
-  await sandbox.fs.mkdir('/work')
-  await sandbox.fs.writeFile('/work/a.txt', Buffer.from('alpha'))
-  assert.equal(String(await sandbox.fs.readFile('/work/a.txt')), 'alpha')
-  assert.deepEqual(await sandbox.fs.stat('/work/a.txt'), {
+  await sandbox.fs.mkdir('/workspace/work')
+  await sandbox.fs.writeFile('/workspace/work/a.txt', Buffer.from('alpha'))
+  assert.equal(String(await sandbox.fs.readFile('/workspace/work/a.txt')), 'alpha')
+  assert.deepEqual(await sandbox.fs.stat('/workspace/work/a.txt'), {
     fileType: 'file',
     len: 5,
     isFile: true,
     isDir: false
   })
-  assert.deepEqual((await sandbox.fs.readdir('/work')).map((entry) => entry.name), ['a.txt'])
-  await sandbox.fs.unlink('/work/a.txt')
+  assert.deepEqual((await sandbox.fs.readdir('/workspace/work')).map((entry) => entry.name), ['a.txt'])
+  await sandbox.fs.unlink('/workspace/work/a.txt')
   await assert.rejects(
-    () => sandbox.fs.stat('/work/a.txt'),
+    () => sandbox.fs.stat('/workspace/work/a.txt'),
     (err) => {
       assert.equal(err.code, 'ENOENT')
-      assert.match(err.message, /\/work\/a\.txt/)
+      assert.match(err.message, /\/workspace\/work\/a\.txt/)
       return true
     }
   )
@@ -125,10 +131,10 @@ test('cached direct VFS calls use the current persistent session cwd', async () 
   // The JS facade stays stable while native path resolution follows later cd calls.
   const sandbox = new Sandbox({ persistSession: true })
   const fs = sandbox.fs
-  await fs.mkdir('/a')
-  await sandbox.exec('cd /a')
+  await fs.mkdir('/workspace/a')
+  await sandbox.exec('cd /workspace/a')
   await fs.writeFile('y.txt', Buffer.from('cwd-aware'))
-  assert.equal(String(await fs.readFile('/a/y.txt')), 'cwd-aware')
+  assert.equal(String(await fs.readFile('/workspace/a/y.txt')), 'cwd-aware')
   await assert.rejects(() => fs.stat('/y.txt'), { code: 'ENOENT' })
 })
 
@@ -154,17 +160,37 @@ test('JS VFS conformance runner accepts callback implementations', async () => {
 
 test('Sandbox can execute against a JS VFS adapter', async () => {
   // Exercises the Rust sync Vfs trait backed by async JS callbacks through TSFN.
-  const sandbox = new Sandbox({ vfs: createMemoryVfs() })
-  await sandbox.fs.mkdir('/app')
-  await sandbox.fs.writeFile('/app/input.txt', Buffer.from('one\ntwo\n'))
-  const result = await sandbox.exec('cat /app/input.txt | wc -l')
+  const sandbox = new Sandbox({ mounts: { workspace: { type: 'custom', vfs: createMemoryVfs() } } })
+  await sandbox.fs.mkdir('/workspace/app')
+  await sandbox.fs.writeFile('/workspace/app/input.txt', Buffer.from('one\ntwo\n'))
+  const result = await sandbox.exec('cat /workspace/app/input.txt | wc -l')
   assert.equal(result.stdout, '      2\n')
+})
+
+test('static mounts are listed at root and route operations independently', async () => {
+  const sandbox = new Sandbox({
+    mounts: {
+      input: { type: 'custom', vfs: createMemoryVfs() },
+      output: { type: 'custom', vfs: createMemoryVfs() }
+    },
+    cwd: '/input'
+  })
+
+  assert.deepEqual((await sandbox.fs.readdir('/')).map((entry) => entry.name), ['bin', 'input', 'output'])
+  await sandbox.fs.writeFile('/input/source.txt', Buffer.from('mounted'))
+  const copied = await sandbox.exec('cp /input/source.txt /output/copied.txt')
+  assert.equal(copied.exitCode, 0, copied.stderr)
+  assert.equal(String(await sandbox.fs.readFile('/output/copied.txt')), 'mounted')
+  await assert.rejects(
+    () => sandbox.fs.rename('/input/source.txt', '/output/moved.txt'),
+    { code: 'EXDEV' }
+  )
 })
 
 test('Sandbox stats can call a JS VFS stats callback without deadlocking', async () => {
   // stats() is async because JS VFS callbacks need the main thread to keep pumping promises.
-  const sandbox = new Sandbox({ vfs: createMemoryVfs() })
-  await sandbox.fs.writeFile('/stats.txt', Buffer.from('abc'))
+  const sandbox = new Sandbox({ mounts: { workspace: { type: 'custom', vfs: createMemoryVfs() } } })
+  await sandbox.fs.writeFile('/workspace/stats.txt', Buffer.from('abc'))
   const stats = await Promise.race([
     sandbox.stats(),
     new Promise((_, reject) => setTimeout(() => reject(new Error('deadlocked')), 1000))
@@ -175,9 +201,9 @@ test('Sandbox stats can call a JS VFS stats callback without deadlocking', async
 test('Node e2e pipeline can cat into the sandboxed js command', async () => {
   // Direct host writes and the built-in Wasmtime QuickJS command share the same VFS.
   const sandbox = new Sandbox()
-  await sandbox.fs.writeFile('/x', Buffer.from('abc'))
-  await sandbox.fs.writeFile('/t.js', Buffer.from('const fs = require("fs")\nconsole.log(fs.readFileSync("/x", "utf8").toUpperCase())\n'))
-  const result = await sandbox.exec('cat /x | js /t.js')
+  await sandbox.fs.writeFile('/workspace/x', Buffer.from('abc'))
+  await sandbox.fs.writeFile('/workspace/t.js', Buffer.from('const fs = require("fs")\nconsole.log(fs.readFileSync("/workspace/x", "utf8").toUpperCase())\n'))
+  const result = await sandbox.exec('cat /workspace/x | js /workspace/t.js')
   assert.equal(result.exitCode, 0)
   assert.equal(result.stdout, 'ABC\n')
 })
@@ -323,8 +349,8 @@ test('direct VFS calls proceed while exec is in flight', async () => {
     }
   })
   const running = sandbox.exec('wait')
-  await sandbox.fs.writeFile('/during.txt', Buffer.from('ok'))
-  assert.equal(String(await sandbox.fs.readFile('/during.txt')), 'ok')
+  await sandbox.fs.writeFile('/workspace/during.txt', Buffer.from('ok'))
+  assert.equal(String(await sandbox.fs.readFile('/workspace/during.txt')), 'ok')
   assert.equal((await running).stdout, 'done\n')
 })
 
@@ -336,10 +362,10 @@ test('JS VFS callbacks do not deadlock on the same event loop', async () => {
     await Promise.resolve()
     return originalReadAt(request)
   }
-  const sandbox = new Sandbox({ vfs })
-  await sandbox.fs.writeFile('/x', Buffer.from('deadlock-free'))
+  const sandbox = new Sandbox({ mounts: { workspace: { type: 'custom', vfs } } })
+  await sandbox.fs.writeFile('/workspace/x', Buffer.from('deadlock-free'))
   const result = await Promise.race([
-    sandbox.exec('cat /x'),
+    sandbox.exec('cat /workspace/x'),
     new Promise((_, reject) => setTimeout(() => reject(new Error('deadlocked')), 1000))
   ])
   assert.equal(result.stdout, 'deadlock-free')
@@ -350,9 +376,9 @@ test('unknown JS VFS error text collapses to EINVAL instead of substring matchin
   vfs.stat = async () => {
     throw new Error('file ENOENT-ish not really')
   }
-  const sandbox = new Sandbox({ vfs })
+  const sandbox = new Sandbox({ mounts: { workspace: { type: 'custom', vfs } } })
   await assert.rejects(
-    () => sandbox.fs.stat('/x'),
+    () => sandbox.fs.stat('/workspace/x'),
     (err) => {
       assert.equal(err.code, 'EINVAL')
       return true
@@ -367,18 +393,18 @@ test('JS VFS request data is delivered as a Buffer', async () => {
     assert.equal(Buffer.isBuffer(request.data), true)
     return originalWriteAt(request)
   }
-  const sandbox = new Sandbox({ vfs })
-  await sandbox.fs.writeFile('/buffer.txt', Buffer.from('buffered'))
-  assert.equal(String(await sandbox.fs.readFile('/buffer.txt')), 'buffered')
+  const sandbox = new Sandbox({ mounts: { workspace: { type: 'custom', vfs } } })
+  await sandbox.fs.writeFile('/workspace/buffer.txt', Buffer.from('buffered'))
+  assert.equal(String(await sandbox.fs.readFile('/workspace/buffer.txt')), 'buffered')
 })
 
 test('JS VFS adapters do not keep child processes alive', async () => {
   const script = `
     import { Sandbox } from './index.js'
     import { createMemoryVfs } from './__test__/helpers.mjs'
-    const sandbox = new Sandbox({ vfs: createMemoryVfs() })
-    await sandbox.fs.writeFile('/x', Buffer.from('ok'))
-    const result = await sandbox.exec('cat /x')
+    const sandbox = new Sandbox({ mounts: { workspace: { type: 'custom', vfs: createMemoryVfs() } } })
+    await sandbox.fs.writeFile('/workspace/x', Buffer.from('ok'))
+    const result = await sandbox.exec('cat /workspace/x')
     if (result.stdout !== 'ok') process.exit(2)
   `
 

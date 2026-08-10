@@ -5,7 +5,7 @@
 Build `tinysandbox`: a Rust crate providing an ultra-minimal, Linux-like agent
 sandbox — a VFS behind a trait, a bash-compatible shell subset, native
 coreutils builtins, and a Wasmtime-hosted QuickJS runtime — that other Rust
-projects embed via `Sandbox::builder().vfs(...).command(...).build()`. Built-in
+projects embed via `Sandbox::builder().mount("workspace", ...).command(...).build()`. Built-in
 VFS choices include memory, a local directory, and a prefix-rooted read-only S3
 view. Node.js bindings (napi-rs) expose the same sandbox and built-in backends,
 including custom JS-implemented VFS backends.
