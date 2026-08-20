@@ -68,7 +68,8 @@ console.assert(result.stdout === '1\n')
 - [Local directory VFS](#local-directory-vfs)
   - [Rust](#rust-5)
   - [TypeScript](#typescript-5)
-- [Read-only S3 VFS](#read-only-s3-vfs)
+- [S3 VFS](#s3-vfs)
+  - [Writes](#writes)
   - [Rust](#rust-6)
   - [TypeScript](#typescript-6)
 - [Bring your own VFS](#bring-your-own-vfs)
@@ -586,7 +587,7 @@ console.assert(result.stdout === 'echo https://example.test/echo hi\n')
 | --- | --- | --- | --- |
 | `InMemoryVfs` | Process memory | Read/write | Default |
 | `LocalVfs` | Contained host directory | Read/write | Unix |
-| `S3Vfs` | Bucket/key prefix | Read-only | Cargo feature `s3`; included in Node |
+| `S3Vfs` | Bucket/key prefix | Read/write, or read-only by config | Cargo feature `s3`; included in Node |
 
 ## Filesystem mounts
 
@@ -686,9 +687,9 @@ const sandbox = new Sandbox({
 })
 ```
 
-## Read-only S3 VFS
+## S3 VFS
 
-The optional `s3` Cargo feature provides `S3Vfs`, a read-only view of one S3
+The optional `s3` Cargo feature provides `S3Vfs`, a read-write view of one S3
 bucket/key prefix. The Node package includes the same backend as the `s3` mount
 type. The configured prefix becomes the backend root. An empty prefix exposes
 the whole bucket, and a prefix with no matching keys is a valid empty virtual
@@ -700,14 +701,58 @@ downloads. Shell and embedded-JavaScript streams use 64 KiB chunks, so an
 early-exit pipeline such as `cat /large.log | head -n 1` only fetches the
 needed prefix. Open handles pin the object's ETag with `If-Match`; replacement
 during a read fails with `EIO` instead of combining revisions. Object bodies
-and directory listings are not cached; each open handle retains only its key,
-length, and ETag.
+and directory listings are not cached.
 
 Directories are virtual: both implicit prefixes and zero-byte marker objects
 ending in `/` appear as directories. If an object `a` and descendants under
 `a/` both exist, directory identity wins and the colliding object is hidden.
-All writes and path mutations fail with `EACCES`; VFS quotas/stats, snapshots,
-version-history browsing, S3 Express, and access points are not supported.
+`mkdir` writes a marker object, and emptying a directory rewrites its marker so
+the directory does not disappear with its last child. VFS quotas/stats,
+snapshots, version-history browsing, S3 Express, and access points are not
+supported.
+
+### Writes
+
+S3 has no partial-object update, so a writable handle stages its contents and
+lands them as one object operation when the handle closes. Writes become
+visible to other handles and other readers at that point, not before, and
+`close` is the call that reports a write failure. Two handles open on one path
+stage independently, so the last close wins.
+
+How a handle stages depends on whether it needs the object's existing bytes:
+
+| Open mode | Staging | Size limit |
+| --- | --- | --- |
+| Write-only, creating or truncating (`>`, `w`, `wx`) | Forward-only writes flush through a multipart upload | None |
+| Append to an existing object (`>>`, `a`) | Whole body in memory | `max_edit_bytes` |
+| Read-write (`r+`, `w+`) | Whole body in memory | `max_edit_bytes` |
+
+Modifying an object means reading it, applying the writes, and putting it back,
+so its whole body is held in memory. `max_edit_bytes` caps that at 32 MiB by
+default; a longer object fails with `EFBIG` and has to be rewritten rather than
+edited. Setting it to zero removes the limit. A forward-only write is not
+capped: it uploads 8 MiB parts and frees them as it goes, so a new object of
+any size costs bounded memory. Seeking back below what a stream has already
+uploaded also reports `EFBIG`, since those bytes are no longer in memory.
+
+Handles that never write cost nothing extra: `touch` on an existing object and
+a read-write open that is only read never download or replace it.
+
+Writes carry preconditions so a concurrent replacement fails instead of being
+silently overwritten: `If-None-Match: *` makes `create_new` a real exclusive
+create, and `If-Match` on a read-modify-write turns a lost update into an
+error. Set `conditional_writes` to false for a compatible service that rejects
+them, which gives up both protections.
+
+S3 has no atomic directory rename. Renaming a directory copies and then deletes
+every key beneath it: two requests per key, and an interrupted rename leaves
+keys under both prefixes. Set `directory_rename` to false to reject it with
+`EXDEV` instead.
+
+Read-only mounts stay available through `S3VfsConfig::read_only()`, which
+refuses every write and path mutation with `EACCES` before issuing a request.
+Credentials remain the enforcing boundary; the flag only stops the VFS from
+issuing mutating requests with a client that would accept them.
 
 #### Rust
 
@@ -722,20 +767,48 @@ cargo add tokio --features macros,rt-multi-thread
 ```rust no_run
 use aws_sdk_s3::Client;
 use tinysandbox::sandbox::Sandbox;
-use tinysandbox::vfs::S3Vfs;
+use tinysandbox::vfs::{S3Vfs, S3VfsConfig};
 
 async fn run_with_client(client: Client) -> Result<(), Box<dyn std::error::Error>> {
-    let vfs = S3Vfs::new(client, "agent-inputs", Some("tenant-42/jobs/current"))?;
+    let vfs = S3Vfs::new(client, "agent-workspaces", Some("tenant-42/jobs/current"))?;
     let sandbox = Sandbox::builder()
         .clear_mounts()
-        .mount("input", vfs)
-        .cwd("/input")
+        .mount("workspace", vfs)
+        .cwd("/workspace")
         .build();
 
-    let result = sandbox.exec("grep ERROR /input/logs/app.log | head").await;
+    let result = sandbox
+        .exec("grep ERROR /workspace/logs/app.log | head > /workspace/errors.txt")
+        .await;
     println!("{}", result.stdout);
     Ok(())
 }
+
+async fn run_read_only(client: Client) -> Result<(), Box<dyn std::error::Error>> {
+    let vfs = S3Vfs::with_config(
+        client,
+        "agent-inputs",
+        Some("tenant-42/jobs/current"),
+        S3VfsConfig::read_only(),
+    )?;
+    let sandbox = Sandbox::builder().clear_mounts().mount("input", vfs).build();
+    println!("{}", sandbox.exec("cat /input/spec.md").await.stdout);
+    Ok(())
+}
+```
+
+Tune the write policy with `S3Vfs::with_config`:
+
+```rust no_run
+use tinysandbox::vfs::S3VfsConfig;
+
+let config = S3VfsConfig {
+    // Stage up to 128 MiB in memory to modify an existing object.
+    max_edit_bytes: 128 * 1024 * 1024,
+    // Reject `mv` on a directory instead of copying every key beneath it.
+    directory_rename: false,
+    ..S3VfsConfig::default()
+};
 ```
 
 `S3Vfs` accepts an already configured `aws_sdk_s3::Client`; endpoint,
@@ -765,15 +838,25 @@ const sandbox = new Sandbox({
         accessKeyId: process.env.S3_ACCESS_KEY!,
         secretAccessKey: process.env.S3_SECRET_KEY!
       }
+    },
+    // Writes are on by default; opt a mount out explicitly.
+    reference: {
+      type: 's3',
+      bucket: 'agent-reference',
+      readOnly: true
     }
   },
   cwd: '/input'
 })
 
 const firstLine = await sandbox.exec('cat /input/logs/app.log | head -n 1')
+await sandbox.exec('grep ERROR /input/logs/app.log > /input/errors.txt')
 ```
 
-The minimal IAM shape is `s3:GetObject` on the exposed keys and
+`maxEditBytes`, `directoryRename`, and `conditionalWrites` mirror the Rust
+configuration fields.
+
+A read-only mount needs only `s3:GetObject` on the exposed keys and
 prefix-restricted `s3:ListBucket` on the bucket:
 
 ```json
@@ -794,6 +877,13 @@ prefix-restricted `s3:ListBucket` on the bucket:
   ]
 }
 ```
+
+A writable mount also needs `s3:PutObject`, `s3:DeleteObject`, and
+`s3:AbortMultipartUpload` on the same key scope. Multipart uploads use
+`s3:PutObject`; `s3:AbortMultipartUpload` lets a failed or abandoned write
+clean up its parts instead of leaving them billable. Because IAM is the
+enforcing boundary, granting only read permissions keeps a mount effectively
+read-only even at the default configuration.
 
 Compatibility tests use a loopback-only, pinned S3-compatible container with
 throwaway credentials; the project test suite never contacts AWS or another
@@ -1067,7 +1157,7 @@ RSS includes runtime and allocator overhead for that process.
 | Feature | Default | Effect |
 | --- | --- | --- |
 | `js` | on | The `js` command, Wasmtime, and the embedded QuickJS module (~600 KB). Disable with `default-features = false` for a shell-and-coreutils-only sandbox with a much smaller dependency tree. |
-| `s3` | off | The read-only, prefix-rooted `S3Vfs` and AWS S3 SDK client adapter. The Node package enables this feature. |
+| `s3` | off | The prefix-rooted `S3Vfs` and AWS S3 SDK client adapter. The Node package enables this feature. |
 
 ## Examples
 

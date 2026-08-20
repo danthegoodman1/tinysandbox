@@ -1245,6 +1245,7 @@ fn build_s3_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::S3Vfs>> {
     let credentials = get_optional_object(options, "credentials")?
         .map(|credentials| parse_s3_credentials(&credentials))
         .transpose()?;
+    let config = parse_s3_config(options)?;
 
     let client = build_s3_client(S3ClientOptions {
         region,
@@ -1252,13 +1253,36 @@ fn build_s3_vfs(options: &Object<'_>) -> Result<Arc<tinysandbox::vfs::S3Vfs>> {
         force_path_style,
         credentials,
     })?;
-    let vfs = tinysandbox::vfs::S3Vfs::new(client, bucket, prefix.as_deref()).map_err(|err| {
-        Error::new(
-            Status::InvalidArg,
-            format!("invalid S3 mount bucket or prefix: {err}"),
-        )
-    })?;
+    let vfs = tinysandbox::vfs::S3Vfs::with_config(client, bucket, prefix.as_deref(), config)
+        .map_err(|err| {
+            Error::new(
+                Status::InvalidArg,
+                format!("invalid S3 mount bucket or prefix: {err}"),
+            )
+        })?;
     Ok(Arc::new(vfs))
+}
+
+fn parse_s3_config(options: &Object<'_>) -> Result<tinysandbox::vfs::S3VfsConfig> {
+    let mut config = tinysandbox::vfs::S3VfsConfig::default();
+    if let Some(read_only) = get_optional::<bool>(options, "readOnly")? {
+        config.read_only = read_only;
+    }
+    if let Some(directory_rename) = get_optional::<bool>(options, "directoryRename")? {
+        config.directory_rename = directory_rename;
+    }
+    if let Some(conditional_writes) = get_optional::<bool>(options, "conditionalWrites")? {
+        config.conditional_writes = conditional_writes;
+    }
+    if let Some(max_edit_bytes) = get_optional::<f64>(options, "maxEditBytes")? {
+        config.max_edit_bytes = u64_from_js(max_edit_bytes).map_err(|_| {
+            Error::new(
+                Status::InvalidArg,
+                "S3 mount maxEditBytes must be a non-negative safe integer".to_owned(),
+            )
+        })?;
+    }
+    Ok(config)
 }
 
 fn parse_s3_credentials(credentials: &Object<'_>) -> Result<S3Credentials> {
@@ -1506,6 +1530,7 @@ fn errno_from_code(code: Option<&str>) -> Errno {
         Some("EXDEV") => Errno::EXDEV,
         Some("EACCES") => Errno::EACCES,
         Some("EEXIST") => Errno::EEXIST,
+        Some("EFBIG") => Errno::EFBIG,
         Some("EIO") => Errno::EIO,
         Some("EINVAL") => Errno::EINVAL,
         Some("EISDIR") => Errno::EISDIR,

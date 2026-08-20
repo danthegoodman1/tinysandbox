@@ -266,6 +266,7 @@ const errnos = [
   'EXDEV',
   'EACCES',
   'EEXIST',
+  'EFBIG',
   'EIO',
   'EINVAL',
   'EISDIR',

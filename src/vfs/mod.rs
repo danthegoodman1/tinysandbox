@@ -18,7 +18,7 @@ pub use local::LocalVfs;
 pub use mem::{InMemoryVfs, InMemoryVfsSnapshot, VfsQuota, VfsStats};
 pub use mount::MountedVfs;
 #[cfg(feature = "s3")]
-pub use s3::S3Vfs;
+pub use s3::{S3Vfs, S3VfsConfig};
 
 /// Result type returned by VFS operations.
 pub type VfsResult<T> = Result<T, VfsError>;
@@ -37,6 +37,8 @@ pub enum Errno {
     EACCES,
     /// File exists.
     EEXIST,
+    /// File too large.
+    EFBIG,
     /// Input/output error.
     EIO,
     /// Invalid argument.
@@ -62,6 +64,7 @@ impl Errno {
             Self::EXDEV => 18,
             Self::EACCES => 13,
             Self::EEXIST => 17,
+            Self::EFBIG => 27,
             Self::EIO => 5,
             Self::EINVAL => 22,
             Self::EISDIR => 21,
@@ -80,6 +83,7 @@ impl Errno {
             Self::EXDEV => "EXDEV",
             Self::EACCES => "EACCES",
             Self::EEXIST => "EEXIST",
+            Self::EFBIG => "EFBIG",
             Self::EIO => "EIO",
             Self::EINVAL => "EINVAL",
             Self::EISDIR => "EISDIR",

@@ -6,7 +6,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use tinysandbox::sandbox::Sandbox;
-use tinysandbox::vfs::{Errno, FileType, OpenMode, S3Vfs, Vfs};
+use tinysandbox::vfs::{Errno, FileType, OpenMode, S3Vfs, S3VfsConfig, Vfs};
 
 const ALPHA: &[u8] = b"alpha\n";
 const NESTED: &[u8] = b"nested needle\nanother line\n";
@@ -128,6 +128,39 @@ async fn seed_fixture(config: &TestConfig, client: &Client, large: &[u8]) {
 
 fn assert_errno<T: std::fmt::Debug>(result: Result<T, tinysandbox::vfs::VfsError>, errno: Errno) {
     assert_eq!(result.expect_err("operation must fail").errno(), errno);
+}
+
+fn write_file(vfs: &S3Vfs, path: &str, data: &[u8]) -> Result<(), tinysandbox::vfs::VfsError> {
+    let handle = vfs.open(path, OpenMode::write_only().create().truncate())?;
+    let mut written = 0;
+    let result = loop {
+        if written >= data.len() {
+            break Ok(());
+        }
+        match vfs.write_at(handle, written as u64, &data[written..]) {
+            Ok(count) => written += count,
+            Err(err) => break Err(err),
+        }
+    };
+    result.and(vfs.close(handle))
+}
+
+fn read_file(vfs: &S3Vfs, path: &str) -> Result<Vec<u8>, tinysandbox::vfs::VfsError> {
+    let handle = vfs.open(path, OpenMode::read_only())?;
+    let mut out = Vec::new();
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        match vfs.read_at(handle, out.len() as u64, &mut buf) {
+            Ok(0) => break,
+            Ok(count) => out.extend_from_slice(&buf[..count]),
+            Err(err) => {
+                vfs.close(handle)?;
+                return Err(err);
+            }
+        }
+    }
+    vfs.close(handle)?;
+    Ok(out)
 }
 
 #[test]
@@ -253,18 +286,160 @@ async fn s3_compatible_adapter_vfs_and_sandbox_end_to_end() {
     assert_errno(vfs.read_at(handle, 0, &mut tail), Errno::EBADF);
     assert_errno(vfs.close(handle), Errno::EBADF);
 
+    // Writes: a new object lands with one put and reads back through the VFS.
+    write_file(&vfs, "/created.txt", b"created payload\n").expect("create object");
+    assert_eq!(
+        read_file(&vfs, "/created.txt").expect("read created object"),
+        b"created payload\n"
+    );
+    assert_eq!(
+        vfs.stat("/created.txt").expect("stat created object").len,
+        16
+    );
+
+    // Exclusive creation is enforced when the object lands.
     assert_errno(
-        vfs.open("/alpha.txt", OpenMode::write_only()),
+        vfs.open("/created.txt", OpenMode::write_only().create_new()),
+        Errno::EEXIST,
+    );
+
+    // Editing reads, modifies, and writes back the whole object.
+    let edit = vfs
+        .open("/created.txt", OpenMode::read_write())
+        .expect("open for editing");
+    vfs.write_at(edit, 0, b"EDITED").expect("overwrite prefix");
+    vfs.close(edit).expect("write back edit");
+    assert_eq!(
+        read_file(&vfs, "/created.txt").expect("read edited object"),
+        b"EDITEDd payload\n"
+    );
+
+    // Appending extends the object.
+    let append = vfs
+        .open("/created.txt", OpenMode::write_only().create().append())
+        .expect("open for append");
+    vfs.write_at(append, 0, b"appended\n").expect("append");
+    vfs.close(append).expect("write back append");
+    assert_eq!(
+        read_file(&vfs, "/created.txt").expect("read appended object"),
+        b"EDITEDd payload\nappended\n"
+    );
+
+    // A touch of an existing object must not truncate it.
+    let touched = vfs
+        .open("/created.txt", OpenMode::write_only().create())
+        .expect("touch existing object");
+    vfs.close(touched).expect("close touch");
+    assert_eq!(
+        read_file(&vfs, "/created.txt").expect("read touched object"),
+        b"EDITEDd payload\nappended\n"
+    );
+
+    // A forward-only write longer than the part size streams through a
+    // multipart upload instead of staging the whole body.
+    let streamed: Vec<u8> = (0..12 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    write_file(&vfs, "/streamed.bin", &streamed).expect("stream large object");
+    assert_eq!(
+        vfs.stat("/streamed.bin").expect("stat streamed object").len,
+        streamed.len() as u64
+    );
+    assert_eq!(
+        read_file(&vfs, "/streamed.bin").expect("read streamed object"),
+        streamed,
+        "multipart parts reassemble in order"
+    );
+
+    // Directories are markers, and removing the last child keeps the directory.
+    vfs.mkdir("/made-dir").expect("mkdir");
+    assert!(vfs.stat("/made-dir").expect("stat new directory").is_dir());
+    assert_errno(vfs.mkdir("/made-dir"), Errno::EEXIST);
+    write_file(&vfs, "/made-dir/child.txt", b"child\n").expect("create nested object");
+    assert_errno(vfs.rmdir("/made-dir"), Errno::ENOTEMPTY);
+    vfs.unlink("/made-dir/child.txt").expect("unlink child");
+    assert!(
+        vfs.stat("/made-dir")
+            .expect("emptied directory survives")
+            .is_dir()
+    );
+    assert!(vfs.readdir("/made-dir").expect("listing").is_empty());
+
+    // Renaming moves a file, then a whole directory tree.
+    write_file(&vfs, "/made-dir/moved.txt", b"moved\n").expect("create for rename");
+    vfs.rename("/made-dir/moved.txt", "/made-dir/renamed.txt")
+        .expect("rename file");
+    assert_errno(vfs.stat("/made-dir/moved.txt"), Errno::ENOENT);
+    assert_eq!(
+        read_file(&vfs, "/made-dir/renamed.txt").expect("read renamed object"),
+        b"moved\n"
+    );
+    vfs.rename("/made-dir", "/moved-dir")
+        .expect("rename directory");
+    assert_errno(vfs.stat("/made-dir"), Errno::ENOENT);
+    assert_eq!(
+        read_file(&vfs, "/moved-dir/renamed.txt").expect("read moved tree"),
+        b"moved\n"
+    );
+
+    // Cleanup leaves the fixture as the read assertions found it.
+    vfs.unlink("/moved-dir/renamed.txt").expect("unlink moved");
+    vfs.rmdir("/moved-dir").expect("rmdir");
+    assert_errno(vfs.stat("/moved-dir"), Errno::ENOENT);
+    vfs.unlink("/streamed.bin").expect("unlink streamed object");
+    vfs.unlink("/created.txt").expect("unlink created object");
+
+    // A configured edit ceiling rejects staging a longer object.
+    let capped = S3Vfs::with_config(
+        config.client(),
+        &config.bucket,
+        Some(&config.prefix),
+        S3VfsConfig {
+            max_edit_bytes: 16,
+            ..S3VfsConfig::default()
+        },
+    )
+    .expect("construct edit-capped S3 VFS");
+    let capped_handle = capped
+        .open("/large.txt", OpenMode::read_write())
+        .expect("open large object without staging it");
+    assert_errno(capped.read_at(capped_handle, 0, &mut [0; 8]), Errno::EFBIG);
+    capped.close(capped_handle).expect("close unstaged handle");
+    assert_eq!(
+        capped
+            .stat("/large.txt")
+            .expect("large object untouched")
+            .len,
+        large.len() as u64
+    );
+
+    // A read-only mount refuses every mutation.
+    let read_only = S3Vfs::with_config(
+        config.client(),
+        &config.bucket,
+        Some(&config.prefix),
+        S3VfsConfig::read_only(),
+    )
+    .expect("construct read-only S3 VFS");
+    assert_errno(
+        read_only.open("/alpha.txt", OpenMode::write_only()),
         Errno::EACCES,
     );
     assert_errno(
-        vfs.open("/new", OpenMode::write_only().create()),
+        read_only.open("/new", OpenMode::write_only().create()),
         Errno::EACCES,
     );
-    assert_errno(vfs.mkdir("/new-dir"), Errno::EACCES);
-    assert_errno(vfs.rename("/alpha.txt", "/renamed"), Errno::EACCES);
-    assert_errno(vfs.unlink("/alpha.txt"), Errno::EACCES);
-    assert_errno(vfs.rmdir("/nested"), Errno::EACCES);
+    assert_errno(read_only.mkdir("/new-dir"), Errno::EACCES);
+    assert_errno(read_only.rename("/alpha.txt", "/renamed"), Errno::EACCES);
+    assert_errno(read_only.unlink("/alpha.txt"), Errno::EACCES);
+    assert_errno(read_only.rmdir("/nested"), Errno::EACCES);
+    assert_eq!(
+        read_only
+            .stat("/alpha.txt")
+            .expect("read-only mount still reads")
+            .len,
+        ALPHA.len() as u64
+    );
 
     let sandbox_vfs =
         S3Vfs::new(client, &config.bucket, Some(&config.prefix)).expect("construct sandbox S3 VFS");
@@ -296,14 +471,43 @@ async fn s3_compatible_adapter_vfs_and_sandbox_end_to_end() {
     assert_eq!(wc.exit_code, 0, "{}", wc.stderr);
     assert_eq!(wc.stdout.trim(), large.len().to_string());
 
-    let redirect = sandbox.exec("echo forbidden > /workspace/new.txt").await;
-    assert_ne!(redirect.exit_code, 0);
-    assert!(
-        redirect.stderr.contains("Permission denied"),
-        "{}",
-        redirect.stderr
+    let redirect = sandbox.exec("echo written > /workspace/shell.txt").await;
+    assert_eq!(redirect.exit_code, 0, "{}", redirect.stderr);
+    assert_eq!(
+        sandbox.exec("cat /workspace/shell.txt").await.stdout,
+        "written\n"
     );
-    let touch = sandbox.exec("touch /workspace/new.txt").await;
+    let appended = sandbox.exec("echo more >> /workspace/shell.txt").await;
+    assert_eq!(appended.exit_code, 0, "{}", appended.stderr);
+    assert_eq!(
+        sandbox.exec("cat /workspace/shell.txt").await.stdout,
+        "written\nmore\n"
+    );
+    let removed = sandbox.exec("rm /workspace/shell.txt").await;
+    assert_eq!(removed.exit_code, 0, "{}", removed.stderr);
+
+    let read_only_sandbox = Sandbox::builder()
+        .mount(
+            "workspace",
+            S3Vfs::with_config(
+                config.client(),
+                &config.bucket,
+                Some(&config.prefix),
+                S3VfsConfig::read_only(),
+            )
+            .expect("construct read-only sandbox S3 VFS"),
+        )
+        .build();
+    let denied = read_only_sandbox
+        .exec("echo forbidden > /workspace/new.txt")
+        .await;
+    assert_ne!(denied.exit_code, 0);
+    assert!(
+        denied.stderr.contains("Permission denied"),
+        "{}",
+        denied.stderr
+    );
+    let touch = read_only_sandbox.exec("touch /workspace/new.txt").await;
     assert_ne!(touch.exit_code, 0);
     assert!(
         touch.stderr.contains("Permission denied"),
