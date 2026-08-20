@@ -28,7 +28,8 @@ export function run(args, options = {}) {
   if (command === "next") {
     const explicitBump = readOption(commandArgs, "--bump")
     const message = readOption(commandArgs, "--message") ?? ""
-    stdout(nextVersion(readCurrentVersion(repoRoot), releaseBump(explicitBump, message)))
+    const currentVersion = readCurrentVersion(repoRoot)
+    stdout(nextVersion(currentVersion, releaseBump(explicitBump, message, currentVersion)))
   } else if (command === "apply") {
     applyVersion(requiredVersionArg(command, commandArgs), repoRoot)
   } else if (command === "check") {
@@ -44,7 +45,7 @@ export function readCurrentVersion(repoRoot = defaultRepoRoot) {
   return rootVersion
 }
 
-export function releaseBump(explicitBump, message) {
+export function releaseBump(explicitBump, message, currentVersion = "0.0.0") {
   if (explicitBump && explicitBump !== "auto") {
     if (!["current", "patch", "minor", "major"].includes(explicitBump)) {
       fail(`unsupported release bump ${explicitBump}`)
@@ -57,7 +58,27 @@ export function releaseBump(explicitBump, message) {
   if (message.includes("#minor")) {
     return "minor"
   }
+  if (hasBreakingChange(message)) {
+    // A breaking change below 1.0 raises the minor, which is how semver
+    // expresses it while the major is still zero. Reaching 1.0 stays a
+    // deliberate `#major` or a dispatch input.
+    return parseVersion(currentVersion).major === 0 ? "minor" : "major"
+  }
   return "patch"
+}
+
+/**
+ * Detects the two Conventional Commits breaking-change markers: a `!` before
+ * the colon of a `type(scope)!:` subject, and a `BREAKING CHANGE:` footer.
+ */
+export function hasBreakingChange(message) {
+  return message
+    .split("\n")
+    .some(
+      (line) =>
+        /^[a-z]+(?:\([^)]*\))?!:/u.test(line.trim()) ||
+        /^BREAKING[ -]CHANGE:/u.test(line.trim())
+    )
 }
 
 export function nextVersion(version, bump) {
@@ -278,9 +299,13 @@ function updateNpmLockfile(repoRoot, lockfilePath, version) {
   lockfile.packages[""].optionalDependencies ??= {}
   for (const { packageName } of nativeNpmPackages) {
     lockfile.packages[""].optionalDependencies[packageName] = version
-    // The release version does not exist on npm yet, so a package-lock refresh
-    // cannot resolve it. Keep an unresolved optional entry: npm ci accepts it,
-    // while a missing or stale entry makes the clean install fail before build.
+    // The release version does not exist on npm yet, so nothing here can carry
+    // a real resolved/integrity pair. Both an unresolved entry and a missing
+    // one fail `npm ci` once the version publishes ("does not satisfy" and
+    // "Missing: ... from lock file" respectively), so the release workflow
+    // refreshes this lockfile again after the native packages are published.
+    // Until that refresh lands, this placeholder only survives `npm ci`
+    // because the version is still absent from the registry.
     lockfile.packages[`node_modules/${packageName}`] = { optional: true }
   }
   writeJson(repoRoot, lockfilePath, lockfile)
