@@ -12,6 +12,7 @@ import {
   parseVersion,
   readCurrentVersion,
   hasBreakingChange,
+  hasReleaseMarker,
   releaseBump,
   run
 } from "./release-version.mjs"
@@ -57,6 +58,23 @@ test("hasBreakingChange matches only real Conventional Commits markers", () => {
   ]) {
     assert.equal(hasBreakingChange(message), false, message)
   }
+})
+
+test("release markers are recognized only as standalone tokens", () => {
+  assert.equal(hasReleaseMarker("ship it #minor", "minor"), true)
+  assert.equal(hasReleaseMarker("#major", "major"), true)
+  assert.equal(hasReleaseMarker("subject\n\n#major\n", "major"), true)
+  assert.equal(hasReleaseMarker("cut it #minor.", "minor"), true)
+
+  // A commit that documents the markers must not request the bump it names.
+  // The 0.4.9 release computed 1.0.0 from a commit body that wrote `#major`.
+  assert.equal(hasReleaseMarker("uses literal `#major`/`#minor` markers", "major"), false)
+  assert.equal(hasReleaseMarker("uses literal `#major`/`#minor` markers", "minor"), false)
+  assert.equal(hasReleaseMarker("foo#minor", "minor"), false)
+  assert.equal(hasReleaseMarker("#minority report", "minor"), false)
+
+  assert.equal(releaseBump("auto", "docs: explain `#major` handling", "0.4.8"), "patch")
+  assert.equal(releaseBump("auto", "chore: cut it #major", "0.4.8"), "major")
 })
 
 test("releaseBump uses dispatch input before commit-message markers", () => {

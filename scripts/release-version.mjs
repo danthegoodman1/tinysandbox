@@ -52,10 +52,10 @@ export function releaseBump(explicitBump, message, currentVersion = "0.0.0") {
     }
     return explicitBump
   }
-  if (message.includes("#major")) {
+  if (hasReleaseMarker(message, "major")) {
     return "major"
   }
-  if (message.includes("#minor")) {
+  if (hasReleaseMarker(message, "minor")) {
     return "minor"
   }
   if (hasBreakingChange(message)) {
@@ -65,6 +65,14 @@ export function releaseBump(explicitBump, message, currentVersion = "0.0.0") {
     return parseVersion(currentVersion).major === 0 ? "minor" : "major"
   }
   return "patch"
+}
+
+/**
+ * Matches `#major`/`#minor` only as a standalone token, so a commit that writes
+ * about the markers does not request the bump it is describing.
+ */
+export function hasReleaseMarker(message, marker) {
+  return new RegExp(String.raw`(?:^|\s)#${marker}(?=[\s.,;:!?)]|$)`, "mu").test(message)
 }
 
 /**
