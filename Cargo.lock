@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "tinysandbox"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "aws-sdk-s3",
  "base64",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "tinysandbox-node"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
