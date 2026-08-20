@@ -11,9 +11,53 @@ import {
   nextVersion,
   parseVersion,
   readCurrentVersion,
+  hasBreakingChange,
   releaseBump,
   run
 } from "./release-version.mjs"
+
+test("releaseBump treats Conventional Commits breaking markers as a version bump", () => {
+  // Below 1.0 a breaking change raises the minor; at or above 1.0 it raises the major.
+  assert.equal(releaseBump("auto", "feat(s3)!: make S3Vfs read-write", "0.4.8"), "minor")
+  assert.equal(releaseBump("auto", "feat(s3)!: make S3Vfs read-write", "1.2.3"), "major")
+  assert.equal(releaseBump("auto", "feat!: bare type", "0.4.8"), "minor")
+  assert.equal(releaseBump("auto", "feat: add thing\n\nBREAKING CHANGE: it moved", "0.4.8"), "minor")
+  assert.equal(releaseBump("auto", "feat: add thing\n\nBREAKING-CHANGE: it moved", "0.4.8"), "minor")
+
+  // A merge commit that hides the marker still falls back to patch, which is
+  // why the workflow feeds in every commit since the last release.
+  assert.equal(releaseBump("auto", "Merge pull request #12\n\nMake S3Vfs read-write", "0.4.8"), "patch")
+  assert.equal(releaseBump("auto", "fix: ordinary change", "0.4.8"), "patch")
+
+  // A footer marker must start its line, so prose naming it is not a bump.
+  assert.equal(releaseBump("auto", "docs: explain BREAKING CHANGE: footers", "0.4.8"), "patch")
+  assert.equal(releaseBump("auto", "fix: guard a!: token mid-sentence", "0.4.8"), "patch")
+
+  // Explicit markers and dispatch inputs still win.
+  assert.equal(releaseBump("auto", "feat!: x #major", "0.4.8"), "major")
+  assert.equal(releaseBump("patch", "feat!: x", "0.4.8"), "patch")
+})
+
+test("hasBreakingChange matches only real Conventional Commits markers", () => {
+  for (const message of [
+    "feat!: x",
+    "fix(scope)!: x",
+    "chore(deps)!: x",
+    "feat: x\n\nBREAKING CHANGE: y",
+    "feat: x\n\nBREAKING-CHANGE: y"
+  ]) {
+    assert.equal(hasBreakingChange(message), true, message)
+  }
+  for (const message of [
+    "feat: x",
+    "Merge pull request #12\n\nMake S3Vfs read-write",
+    "docs: describe BREAKING CHANGE: footers",
+    "fix: token a!: mid-sentence",
+    ""
+  ]) {
+    assert.equal(hasBreakingChange(message), false, message)
+  }
+})
 
 test("releaseBump uses dispatch input before commit-message markers", () => {
   // Manual releases must be deterministic even if the triggering commit carries a bump marker.
@@ -75,17 +119,27 @@ test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) =
   }
 })
 
-test("release-versioned optional packages support a clean npm install before publication", (t) => {
+test("placeholder optional entries only survive npm ci while the version is unpublished", (t) => {
   const repoRoot = createFixtureRepo(t)
   const nodeRoot = join(repoRoot, "tinysandbox-node")
 
+  // 1.4.0 does not exist on npm, so the placeholder entries `applyVersion`
+  // writes are accepted: npm cannot resolve the optional packages at all.
   applyVersion("1.4.0", repoRoot)
-
   execFileSync(
     process.platform === "win32" ? "npm.cmd" : "npm",
     ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", join(repoRoot, ".npm-cache")],
     { cwd: nodeRoot, stdio: "pipe" }
   )
+
+  // This is the whole reason the release workflow refreshes the lockfile after
+  // publishing. Once the version resolves, the same placeholders fail the
+  // clean install, which is what broke CI after 0.4.7 and 0.4.8 shipped.
+  const lockfilePath = join(nodeRoot, "package-lock.json")
+  const lockfile = JSON.parse(readFileSync(lockfilePath, "utf8"))
+  for (const name of nativePackageNames) {
+    assert.deepEqual(lockfile.packages[`node_modules/${name}`], { optional: true })
+  }
 })
 
 test("checkVersion rejects lockstep disagreement", (t) => {

@@ -52,18 +52,28 @@ jobs:
       - name: Check release eligibility
         id: eligibility
         run: |
-          message="$(git log -1 --format=%B)"
+          set -euo pipefail
+          head_message="$(git log -1 --format=%B)"
           release=true
           if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            if [[ "$message" == *"[skip release]"* || "$message" == chore\(release\):* ]]; then
+            if [[ "$head_message" == *"[skip release]"* || "$head_message" == chore\(release\):* ]]; then
               release=false
             fi
           fi
+          # Eligibility reads only the head commit, but version selection reads
+          # every commit since the last release so a Conventional Commits
+          # breaking marker is not hidden behind a merge commit subject.
+          previous_release="$(git log -1 --format=%H --grep '^chore(release): ' HEAD || true)"
+          if [ -n "$previous_release" ] && [ "$previous_release" != "$(git rev-parse HEAD)" ]; then
+            message="$(git log --format=%B "${previous_release}..HEAD")"
+          else
+            message="$head_message"
+          fi
           echo "release=$release" >> "$GITHUB_OUTPUT"
           {
-            echo "message<<EOF"
+            echo "message<<RELEASE_MESSAGE_EOF"
             echo "$message"
-            echo "EOF"
+            echo "RELEASE_MESSAGE_EOF"
           } >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
@@ -424,3 +434,31 @@ jobs:
           else
             npm publish --access public
           fi
+
+      - name: Refresh lockfile with published native packages
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `release-version.mjs apply` can only leave placeholder entries for
+          # the native packages, because the version does not exist on npm when
+          # the release commit is built. They resolve now that publishing is
+          # done, and `npm ci` rejects the placeholders until they do.
+          npm install --package-lock-only --no-audit --no-fund --prefix tinysandbox-node
+          if git diff --quiet -- tinysandbox-node/package-lock.json; then
+            echo "lockfile already resolves ${VERSION}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tinysandbox-node/package-lock.json
+          git commit -m "chore(release): resolve ${VERSION} lockfile entries [skip release]"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main advanced before the lockfile refresh could be pushed; rebasing (attempt ${attempt})"
+            git fetch origin main
+            git rebase origin/main
+          done
+          git push origin HEAD:main
