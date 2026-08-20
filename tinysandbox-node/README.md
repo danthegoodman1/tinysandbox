@@ -24,33 +24,34 @@ console.log(result.stdout)
 - Built-in commands such as `cat`, `grep`, `head`, `tail`, `sort`, `uniq`, `wc`, `sed`, `jq`, `ls`, `cp`, `mv`, `rm`, and `mkdir`.
 - Static top-level filesystem mounts backed by memory, local directories, S3, or JavaScript VFS adapters. The default is an in-memory `/workspace`. `ls /` lists every mount plus `/bin`.
 - Local directory mounts (Unix only) with strict path containment and per-mount quotas. Usage can be rebaselined with `sandbox.refreshLocalVfs(mount)` or `sandbox.setLocalVfsUsage(mount, usage)`.
-- Read-only S3 mounts that expose bucket/key prefixes and perform bounded range reads instead of downloading whole objects.
+- S3 mounts that expose bucket/key prefixes, perform bounded range reads instead of downloading whole objects, and write back through staged object operations.
 - A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`; expose JS-facing custom host functionality as syscalls.
 - Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes and JSON nesting are capped before evaluation, and the jq filter program text (not input data) is capped on size, nesting, and syntax complexity; jq filter evaluation has the limitations documented in the repository README.
 
-## Read-only S3 filesystem
+## S3 filesystem
 
 ```ts
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
   mounts: {
-    workspace: { type: 'memory' },
-    input: {
+    workspace: {
       type: 's3',
-      bucket: 'agent-inputs',
+      bucket: 'agent-workspaces',
       prefix: 'tenant-42/current',
       region: 'us-east-1',
       // Optional for S3-compatible APIs:
       // endpointUrl: 'http://127.0.0.1:9000',
       // forcePathStyle: true,
       // credentials: { accessKeyId: '...', secretAccessKey: '...' }
-    }
+    },
+    // Writes are on by default; opt a mount out explicitly.
+    reference: { type: 's3', bucket: 'agent-reference', readOnly: true }
   },
   cwd: '/workspace'
 })
 
-const result = await sandbox.exec('cat /input/large.log | head -n 1')
+const result = await sandbox.exec('cat /workspace/large.log | head -n 1 > /workspace/first.txt')
 ```
 
 When region or credentials are omitted, the AWS SDK default provider chains
@@ -61,11 +62,22 @@ name collisions.
 
 Reads use ETag-pinned S3 ranges (64 KiB for normal sandbox streaming), so an
 externally replaced object fails with `EIO` rather than mixing revisions.
-Writes, redirects, and path mutations fail with `EACCES`; there is no object
-cache, quota/stat accounting, snapshot support, or version browsing. Grant
-only `s3:GetObject` for exposed keys and prefix-restricted `s3:ListBucket`.
-See the repository README for Rust client configuration, S3-compatible endpoint
-details, IAM JSON, and the complete semantics.
+
+S3 has no partial-object update, so a writable handle stages its contents and
+lands them as one object operation when the handle closes; writes become
+visible then, not before. A forward-only write streams through a multipart
+upload at any size, while modifying an existing object holds its whole body in
+memory, capped by `maxEditBytes` (32 MiB by default, zero for no limit).
+Exceeding it fails with `EFBIG`, meaning the object has to be rewritten rather
+than edited. `readOnly` refuses every mutation with `EACCES`, `directoryRename`
+governs the copy-and-delete walk that renames a directory, and
+`conditionalWrites` guards writes against concurrent replacement.
+
+There is no object cache, quota/stat accounting, snapshot support, or version
+browsing. Grant `s3:GetObject` plus prefix-restricted `s3:ListBucket` for
+reads, adding `s3:PutObject`, `s3:DeleteObject`, and `s3:AbortMultipartUpload`
+for writes. See the repository README for Rust client configuration,
+S3-compatible endpoint details, IAM JSON, and the complete semantics.
 
 ## Platform Support
 

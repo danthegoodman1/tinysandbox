@@ -375,6 +375,7 @@ pub(crate) fn errno_message(errno: Errno) -> &'static str {
         Errno::EXDEV => "Invalid cross-device link",
         Errno::EACCES => "Permission denied",
         Errno::EEXIST => "File exists",
+        Errno::EFBIG => "File too large",
         Errno::EIO => "Input/output error",
         Errno::EINVAL => "Invalid argument",
         Errno::EISDIR => "Is a directory",

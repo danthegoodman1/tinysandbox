@@ -6,7 +6,7 @@ Build `tinysandbox`: a Rust crate providing an ultra-minimal, Linux-like agent
 sandbox — a VFS behind a trait, a bash-compatible shell subset, native
 coreutils builtins, and a Wasmtime-hosted QuickJS runtime — that other Rust
 projects embed via `Sandbox::builder().mount("workspace", ...).command(...).build()`. Built-in
-VFS choices include memory, a local directory, and a prefix-rooted read-only S3
+VFS choices include memory, a local directory, and a prefix-rooted S3
 view. Node.js bindings (napi-rs) expose the same sandbox and built-in backends,
 including custom JS-implemented VFS backends.
 
@@ -626,3 +626,81 @@ Status ledger:
 | Complete | Test | local S3-compatible interoperability suite | Pinned MinIO gate passes Rust 1/1 and Node 9/9 with strict per-request loopback guards and exact container/network/volume cleanup. Coverage includes explicit and default-provider configuration, seeded adjacent-prefix secret, direct middle/tail/EOF ranges, concurrent VFS/Sandbox reads, shell and embedded-JS streaming, mutations, bucket-root and missing-prefix semantics, and Node error shapes. Phase-1 fakes remain authoritative for standards-shaped exact-object/descendant collisions because MinIO collapses that delimiter-list edge case. Separate Linux CI job runs the combined gate. |
 | Complete | Test | full workspace regression and feature matrix | From committed `57fc370`: `cargo fmt --all --check`; locked workspace all-features tests (164 passed plus 14 compiled doctests, 3 ignored); locked workspace no-default build/tests; Clippy all targets/features with `-D warnings`; and rustdoc with `-D warnings` all pass. `npm test` passes 35 with 5 loopback-only skips, and all 5 Node examples pass. Cargo publish dry-run packages/verifies 51 files; npm pack dry-run verifies the 7-file, 12.2 MB tarball. npm publish dry-run produces the identical manifest before the expected refusal to overwrite already-published `0.4.4`. |
 | Complete | Gate | read-only S3 VFS complete without real AWS access | Fake-backed semantics, Rust/Node surfaces, documentation, regression gates, and the compatibility gate are complete. Final `scripts/test-s3-compat.sh` run passes Rust 1/1 and Node 9/9 using only strict `http://127.0.0.1:<port>` guards and throwaway credentials. It removes its container, network, and volume; independent filtered Docker queries for project `tinysandbox-s3-dangoodman-15052` returned empty. No AWS or other public object-store endpoint was contacted. |
+
+## Phase 10: Writable S3 VFS
+
+Goal:
+Make `S3Vfs` read-write by default, with read-only, edit-size, directory-rename,
+and conditional-write policy under configuration. Land writes as whole-object
+operations that match POSIX semantics closely enough for the shell, `Sandbox::fs`,
+and embedded JavaScript to use an S3 prefix as a workspace.
+
+Scope:
+- Add `S3VfsConfig` (`read_only`, `max_edit_bytes`, `directory_rename`,
+  `conditional_writes`) and `S3Vfs::with_config`. `S3Vfs::new` keeps its
+  signature and becomes read-write, matching every other backend in the crate.
+- Stage each writable handle and land it when the handle closes. A forward-only
+  write flushes 8 MiB multipart parts and frees them, so a new object of any
+  size costs bounded memory; a handle that needs the object's existing bytes
+  holds the whole body in memory under `max_edit_bytes`. Handles that never
+  write issue no request, so `touch` and unwritten read-write opens are free.
+- Guard writes with `If-None-Match: *` for exclusive creation and `If-Match`
+  for read-modify-write, and abort multipart uploads on failure or drop so a
+  failed write leaves no billable parts.
+- Implement `mkdir`, `rmdir`, `unlink`, and `rename` over marker objects, copy,
+  and delete, recreating a directory marker when a removal empties it.
+- Add `Errno::EFBIG` and wire it through the shell strerror table, the libuv
+  and Node message maps, the N-API code parser, and the TypeScript union.
+- Expose `readOnly`, `maxEditBytes`, `directoryRename`, and `conditionalWrites`
+  as Node mount options with synchronous validation.
+
+Out of scope:
+- Atomic directory rename, batched multi-key deletes, and `UploadPartCopy`
+  append that would avoid staging a large object being appended to.
+- VFS quotas/stats and snapshots for `S3Vfs`, so the shared conformance suite
+  still does not apply; `S3Vfs` keeps a purpose-built suite.
+- Caching object bodies or directory listings.
+
+Correctness invariants:
+- Every emitted request key is either the configured prefix marker or begins
+  with the configured prefix plus its `/` boundary, for mutations as well as
+  reads.
+- A handle that performs no write never replaces or deletes an object.
+- A staged write lands exactly once, at close, or fails and leaves the prior
+  revision intact with no multipart upload left open.
+- `stat`, `readdir`, and `open` agree on file-versus-directory identity across
+  markers, implicit directories, and collisions, before and after a mutation.
+- Errors stay a stable errno and never panic, hang on a nested runtime, or
+  mutate S3 outside the requested path.
+
+Completion gate:
+The fake-backed suite proves staging, streaming, preconditions, directory
+semantics, and rename behavior; an isolated local S3-compatible container
+proves the AWS SDK wire path for conditional writes, multipart upload, copy,
+and delete; Rust and Node end-to-end writes pass; the full feature matrix,
+clippy, rustdoc, and npm tests are green without any AWS credentials.
+
+Testing plan:
+- Unit tests in `src/vfs/s3.rs` pin exact mutating requests against the scripted
+  fake and round-trip behavior against an in-memory bucket fake with S3-shaped
+  listing, precondition, and multipart semantics.
+- Integration tests in `tests/vfs_s3.rs` and `__test__/s3_vfs.test.mjs` cover
+  create, edit, append, touch, multipart streaming, directory lifecycle, file
+  and directory rename, `EFBIG`, and read-only refusal through `Sandbox::fs`,
+  the shell, and embedded JavaScript.
+- Re-run `cargo test --workspace --all-features --locked`, the no-default-features
+  build/tests, clippy with warnings denied, rustdoc with warnings denied,
+  `scripts/test-s3-compat.sh`, `npm test`, and the examples.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 10A: `S3VfsConfig` policy and read-write default | `src/vfs/s3.rs` adds `S3VfsConfig` with `read_only`, `max_edit_bytes` (32 MiB default, zero unlimited), `directory_rename`, and `conditional_writes`, plus `S3Vfs::with_config` and `S3VfsConfig::read_only()`. `S3Vfs::new` is unchanged in signature and read-write. A read-only mount refuses mutating opens before issuing any request. |
+| Complete | Work | 10B: staged handles, multipart streaming, and close-time landing | Forward-only write-only handles stream 8 MiB parts with a doubling size class every 1,000 parts; handles needing existing bytes materialize lazily under `max_edit_bytes`; unwritten handles issue no request. Rewriting flushed bytes reports `EFBIG`. `Drop` and every commit failure abort open uploads. |
+| Complete | Work | 10C: preconditioned writes and path mutations | `If-None-Match: *` for exclusive creation, `If-Match` for read-modify-write, delete, and copy source; 409/`ConditionalRequestConflict` joins 412 as a precondition class. `mkdir`/`rmdir`/`unlink`/`rename` operate over markers, copy, and delete, and a removal that empties a directory rewrites its marker. |
+| Complete | Work | 10D: `Errno::EFBIG` across every surface | `src/vfs/mod.rs` (27/`EFBIG`), `src/sandbox/fs.rs` strerror, `src/js/mod.rs` libuv `-27` (verified against Node v24.15.0) and message map, `tinysandbox-node/src/lib.rs` code parser, `index.js` errno list, and the `index.d.ts` union. |
+| Complete | Work | 10E: Node write policy options | `tinysandbox-node/src/lib.rs` parses `readOnly`, `maxEditBytes`, `directoryRename`, and `conditionalWrites` with nullish handling and non-negative safe-integer validation; `index.d.ts` documents each. |
+| Complete | Doc | Rust/TypeScript usage, staging model, and IAM documentation | `README.md` replaces the read-only section with an S3 VFS section carrying a staging table, the edit-limit rule, precondition and directory-rename semantics, read-only configuration, and the added `s3:PutObject`/`s3:DeleteObject`/`s3:AbortMultipartUpload` IAM scope. `tinysandbox-node/README.md`, the backend table, and the feature table match. |
+| Complete | Test | deterministic fake-backed writable S3 suite | `src/vfs/s3.rs`: 41 tests covering staging modes, streaming, preconditions, directory lifecycle, rename conflicts, prefix containment, and `EFBIG`. `cargo test --features s3 vfs::s3::tests` passes 41/41. |
+| Complete | Test | local S3-compatible interoperability suite | `scripts/test-s3-compat.sh` against pinned MinIO passes Rust 1/1 and Node 12/12, exercising conditional writes, a 12 MiB multipart upload, copy, delete, directory rename, `EFBIG`, and read-only refusal on a real wire. Container, network, and volume are removed on exit. |

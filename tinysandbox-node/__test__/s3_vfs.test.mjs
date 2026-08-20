@@ -181,8 +181,8 @@ test('S3 mount reads a prefix through host, shell, and embedded JS APIs', { skip
   assert.equal(embedded.stdout, 'alpha\n')
 })
 
-test('S3 mount rejects mutations and contains its configured prefix', { skip: !live }, async () => {
-  const sandbox = sandboxWithS3(liveOptions())
+test('read-only S3 mount rejects mutations and contains its configured prefix', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3({ ...liveOptions(), readOnly: true })
 
   await assert.rejects(() => sandbox.fs.writeFile('/input/new.txt', Buffer.from('forbidden')), { code: 'EACCES' })
   await assert.rejects(() => sandbox.fs.mkdir('/input/new-dir'), { code: 'EACCES' })
@@ -192,6 +192,83 @@ test('S3 mount rejects mutations and contains its configured prefix', { skip: !l
   const redirect = await sandbox.exec('echo forbidden > /input/new.txt')
   assert.notEqual(redirect.exitCode, 0)
   assert.match(redirect.stderr, /Permission denied/)
+})
+
+test('S3 mount writes through host, shell, and embedded JS APIs', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3({ ...liveOptions(), prefix: `${requiredEnv('TINYSANDBOX_S3_TEST_PREFIX')}-writes` })
+
+  await sandbox.fs.writeFile('/input/created.txt', Buffer.from('created\n'))
+  assert.equal(String(await sandbox.fs.readFile('/input/created.txt')), 'created\n')
+  assert.deepEqual(await sandbox.fs.stat('/input/created.txt'), {
+    fileType: 'file',
+    len: 8,
+    isFile: true,
+    isDir: false
+  })
+
+  await sandbox.fs.mkdir('/input/dir')
+  assert.ok((await sandbox.fs.stat('/input/dir')).isDir)
+  await sandbox.fs.writeFile('/input/dir/nested.txt', Buffer.from('nested\n'))
+  assert.deepEqual(
+    (await sandbox.fs.readdir('/input/dir')).map(({ name }) => name),
+    ['nested.txt']
+  )
+
+  const redirect = await sandbox.exec('echo shell > /input/shell.txt')
+  assert.equal(redirect.exitCode, 0, redirect.stderr)
+  assert.equal((await sandbox.exec('cat /input/shell.txt')).stdout, 'shell\n')
+  const appended = await sandbox.exec('echo more >> /input/shell.txt')
+  assert.equal(appended.exitCode, 0, appended.stderr)
+  assert.equal((await sandbox.exec('cat /input/shell.txt')).stdout, 'shell\nmore\n')
+
+  const embedded = await sandbox.exec(`js -e 'const fs=require("fs"); fs.writeFileSync("/input/js.txt","from js"); console.log(fs.readFileSync("/input/js.txt","utf8").trim())'`)
+  assert.equal(embedded.exitCode, 0, embedded.stderr)
+  assert.equal(embedded.stdout, 'from js\n')
+
+  await sandbox.fs.rename('/input/created.txt', '/input/renamed.txt')
+  assert.equal(String(await sandbox.fs.readFile('/input/renamed.txt')), 'created\n')
+  await assert.rejects(() => sandbox.fs.stat('/input/created.txt'), { code: 'ENOENT' })
+
+  for (const path of ['/input/renamed.txt', '/input/shell.txt', '/input/js.txt', '/input/dir/nested.txt']) {
+    await sandbox.fs.unlink(path)
+  }
+  await sandbox.fs.rmdir('/input/dir')
+  assert.deepEqual(await sandbox.fs.readdir('/input'), [])
+})
+
+test('S3 mount reports an oversized edit as EFBIG', { skip: !live }, async () => {
+  const sandbox = sandboxWithS3({ ...liveOptions(), maxEditBytes: 16 })
+  const handle = await sandbox.fs.open('/input/large.txt', { read: true, write: true })
+  try {
+    await assert.rejects(() => sandbox.fs.readAt(handle, 0, 8), { code: 'EFBIG' })
+  } finally {
+    await sandbox.fs.close(handle)
+  }
+  assert.ok((await sandbox.fs.stat('/input/large.txt')).len > 16)
+})
+
+test('s3 mount validates write policy option shapes synchronously', () => {
+  assert.throws(
+    () => sandboxWithS3({ bucket: 'bucket', region: 'us-east-1', maxEditBytes: -1 }),
+    /maxEditBytes must be a non-negative safe integer/
+  )
+  assert.throws(() => sandboxWithS3({ bucket: 'bucket', region: 'us-east-1', readOnly: 'yes' }), /boolean|Boolean/i)
+  assert.doesNotThrow(() => sandboxWithS3({
+    bucket: 'bucket',
+    region: 'us-east-1',
+    readOnly: null,
+    maxEditBytes: null,
+    directoryRename: null,
+    conditionalWrites: null
+  }))
+  assert.doesNotThrow(() => sandboxWithS3({
+    bucket: 'bucket',
+    region: 'us-east-1',
+    readOnly: true,
+    maxEditBytes: 0,
+    directoryRename: false,
+    conditionalWrites: false
+  }))
 })
 
 test('S3 mount makes real reads from an explicitly empty bucket-root prefix', { skip: !live }, async () => {

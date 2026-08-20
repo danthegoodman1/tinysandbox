@@ -74,16 +74,48 @@ export interface LocalVfsOptions {
 }
 
 /**
- * Exposes one S3 bucket/key prefix as a read-only mount root.
+ * Exposes one S3 bucket/key prefix as a read-write mount root.
  *
  * Region and credentials use the AWS SDK default provider chains when they
  * are omitted. Endpoint and path-style overrides support compatible services.
+ *
+ * S3 has no partial-object update, so a writable handle stages its contents
+ * and lands them as one object operation when the handle closes. Writes become
+ * visible to other handles and other readers at that point, not before.
  */
 export interface S3VfsOptions {
   /** Bucket containing the exposed objects. */
   bucket: string
   /** Key prefix exposed at the mount root. Leading/trailing slashes are normalized. */
   prefix?: string
+  /**
+   * Rejects every write and path mutation with EACCES. Defaults to false.
+   *
+   * Credentials remain the enforcing boundary; this only stops the mount from
+   * issuing mutating requests with a client that would accept them.
+   */
+  readOnly?: boolean
+  /**
+   * Ceiling on bytes staged in memory to modify an existing object, 32 MiB by
+   * default. Modifying an object reads it, applies the writes, and puts it
+   * back, so its whole body is held in memory. Longer objects fail with EFBIG
+   * and must be rewritten instead. Zero removes the limit. Forward-only writes
+   * that replace an object stream through a multipart upload and ignore it.
+   */
+  maxEditBytes?: number
+  /**
+   * Allows renaming a directory by copying and deleting every key beneath it,
+   * enabled by default. S3 has no atomic directory rename: it costs two
+   * requests per key, and an interrupted rename leaves keys under both
+   * prefixes. When false, renaming a directory fails with EXDEV.
+   */
+  directoryRename?: boolean
+  /**
+   * Guards writes with If-Match and If-None-Match preconditions so a concurrent
+   * replacement fails instead of being silently overwritten. Enabled by
+   * default; disable only for a service that rejects conditional writes.
+   */
+  conditionalWrites?: boolean
   /** AWS region override. */
   region?: string
   /** S3-compatible service endpoint override. */
@@ -206,6 +238,7 @@ export type VfsErrno =
   | 'EXDEV'
   | 'EACCES'
   | 'EEXIST'
+  | 'EFBIG'
   | 'EIO'
   | 'EINVAL'
   | 'EISDIR'
