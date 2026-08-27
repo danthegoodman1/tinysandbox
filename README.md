@@ -1254,11 +1254,10 @@ machine code for the crate's target and the binary embeds the result, so the
 first `js` command loads an artifact that is already executable. Doing that work
 during the build is worth about 425 ms and 29 MiB per process.
 
-Measured on Linux x86_64 with `wasmtime` 46:
+What a process pays, measured on Linux x86_64 with `wasmtime` 46:
 
 | Step | When | Cost |
 | --- | --- | --- |
-| Compiling `quickjs.wasm` to machine code | once, during `cargo build` | 425 ms, 2.7 MB embedded in the binary |
 | First `js` command in a process | loads the artifact | ~9 ms, ~9.5 MiB RSS |
 | The same first command, on the fallback path | only when the artifact is refused | ~430 ms, ~31 MiB RSS |
 | One in-flight `js` command | every run | ~3.4 ms, ~0.5 MiB RSS |
