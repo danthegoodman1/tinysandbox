@@ -1,5 +1,6 @@
 #![cfg(feature = "js")]
 
+use tinysandbox::js::RuntimeSource;
 use tinysandbox::sandbox::Sandbox;
 
 #[tokio::test]
@@ -13,6 +14,10 @@ async fn precompiled_runtime_replaces_the_cranelift_compile() {
     assert!(bogus.is_err(), "a foreign artifact must be refused");
 
     tinysandbox::js::use_precompiled(&artifact).expect("install precompiled runtime");
+    assert_eq!(
+        tinysandbox::js::runtime_source().expect("runtime source"),
+        RuntimeSource::Precompiled
+    );
 
     let sandbox = Sandbox::builder()
         .js_global("tools.answer", |_args| async { Ok(serde_json::json!(42)) })

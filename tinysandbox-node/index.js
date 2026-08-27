@@ -387,6 +387,7 @@ const prompts = Object.freeze({
 
 exports.precompileJs = () => native.precompileJs()
 exports.usePrecompiledJs = (artifact) => native.usePrecompiledJs(artifact)
+exports.jsRuntimeSource = () => native.jsRuntimeSource()
 exports.NativeSandbox = native.NativeSandbox
 exports.SandboxFs = SandboxFs
 exports.Sandbox = Sandbox

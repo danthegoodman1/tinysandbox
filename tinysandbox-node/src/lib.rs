@@ -73,6 +73,17 @@ pub fn use_precompiled_js(artifact: Buffer) -> Result<()> {
     tinysandbox::js::use_precompiled(&artifact)
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
 }
+
+/// Reports where this process's JavaScript machine code came from.
+#[napi]
+pub fn js_runtime_source() -> Result<String> {
+    tinysandbox::js::runtime_source()
+        .map(|source| match source {
+            tinysandbox::js::RuntimeSource::Precompiled => "precompiled".to_owned(),
+            tinysandbox::js::RuntimeSource::Compiled => "compiled".to_owned(),
+        })
+        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
+}
 #[napi]
 pub const PROMPT_FETCH: &str = tinysandbox::prompts::FETCH;
 #[napi]

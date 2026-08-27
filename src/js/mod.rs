@@ -16,11 +16,12 @@
 //! prefixes leave a line-1 column offset, method frames are named like `at boom`,
 //! and visible `<tinysandbox>` glue frames can appear below user frames.
 //!
-//! Cranelift compiles the embedded `quickjs.wasm` into machine code on the
-//! first `js` command in the process, and the result is cached process-wide for
-//! every later command. A process that never runs `js` never compiles it. Use
-//! [`precompile`] in a build step and [`use_precompiled`] before the first `js`
-//! command to move that work out of the process.
+//! `quickjs.wasm` is machine code by the time a script runs. The build script
+//! compiles it for this crate's target and the module embeds the result, so the
+//! first `js` command loads it rather than running Cranelift. [`precompile`]
+//! and [`use_precompiled`] produce and install an artifact by hand, for a
+//! different machine or a differently built process, and
+//! [`runtime_source`] reports which path a process ended up on.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -33,8 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use wasmtime::{
-    Caller, Config, Engine, Extern, InstancePre, Linker, Memory, Module, ResourceLimiter, Store,
-    Trap,
+    Caller, Engine, Extern, InstancePre, Linker, Memory, Module, ResourceLimiter, Store, Trap,
 };
 
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
@@ -42,11 +42,15 @@ use crate::sandbox::fs::{Fs, join_path};
 use crate::sandbox::host::{Fetch, FetchRequest, FetchResponse, HostError, JsGlobal};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
+include!("engine_config.rs");
+
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
+/// Machine code for [`QUICKJS_WASM`], produced by `build.rs` for this target.
+#[cfg(quickjs_precompiled)]
+const QUICKJS_CWASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quickjs.cwasm"));
 const EPOCH_TICK: Duration = Duration::from_millis(5);
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
-const QUICKJS_WASMTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Registers the `js` command in a sandbox command registry.
 pub fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
@@ -330,6 +334,7 @@ fn epoch_ticks(wall_time: Duration) -> u64 {
 struct CompiledRuntime {
     engine: Engine,
     pre: InstancePre<HostState>,
+    source: RuntimeSource,
 }
 
 static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
@@ -337,21 +342,63 @@ static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
 fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
     RUNTIME
         .get_or_init(|| {
-            let engine = Engine::new(&runtime_config())?;
-            // Cranelift compiles the embedded QuickJS module here, on the first
-            // `js` command in the process.
-            let module = Module::new(&engine, QUICKJS_WASM)?;
-            link_runtime(engine, module)
+            let engine = Engine::new(&quickjs_engine_config(None)?)?;
+            let (module, source) = load_module(&engine)?;
+            let mut runtime = link_runtime(engine, module)?;
+            runtime.source = source;
+            Ok(runtime)
         })
         .as_ref()
         .map_err(|err| wasmtime::Error::msg(err.to_string()))
 }
 
-fn runtime_config() -> Config {
-    let mut config = Config::new();
-    config.epoch_interruption(true);
-    config.max_wasm_stack(QUICKJS_WASMTIME_STACK_BYTES);
-    config
+/// Where the machine code backing the JavaScript runtime came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSource {
+    /// Loaded from the artifact the build script precompiled, or from one
+    /// installed with [`use_precompiled`].
+    Precompiled,
+    /// Compiled in this process by Cranelift.
+    Compiled,
+}
+
+/// Reports where this process's JavaScript runtime came from, initializing it
+/// if no `js` command has run yet.
+///
+/// [`RuntimeSource::Compiled`] means the process paid for compilation: the
+/// build script produced no artifact, or the one it produced was rejected by
+/// this engine.
+pub fn runtime_source() -> Result<RuntimeSource, PrecompileError> {
+    compiled_runtime()
+        .map(|runtime| runtime.source)
+        .map_err(|err| PrecompileError::new(err.to_string()))
+}
+
+/// Loads the module, preferring the build script's artifact.
+///
+/// A rejected artifact is not an error: an engine or CPU the build did not
+/// target falls back to compiling, which is slower but correct.
+fn load_module(engine: &Engine) -> wasmtime::Result<(Module, RuntimeSource)> {
+    #[cfg(quickjs_precompiled)]
+    if let Ok(module) = deserialize_module(engine, QUICKJS_CWASM) {
+        return Ok((module, RuntimeSource::Precompiled));
+    }
+    Module::new(engine, QUICKJS_WASM).map(|module| (module, RuntimeSource::Compiled))
+}
+
+/// # Safety
+///
+/// Wasmtime trusts these bytes as its own output. Callers pass either the
+/// build script's artifact or bytes the embedder vouches for.
+fn deserialize_module(engine: &Engine, artifact: &[u8]) -> wasmtime::Result<Module> {
+    // SAFETY: Wasmtime validates its own header and rejects artifacts from a
+    // different version or for CPU features this machine lacks; the remaining
+    // contract, that the bytes came from `precompile`, is documented on the
+    // public entry points.
+    #[allow(unsafe_code)]
+    unsafe {
+        Module::deserialize(engine, artifact)
+    }
 }
 
 fn link_runtime(engine: Engine, module: Module) -> wasmtime::Result<CompiledRuntime> {
@@ -360,7 +407,11 @@ fn link_runtime(engine: Engine, module: Module) -> wasmtime::Result<CompiledRunt
     define_tinysandbox_imports(&mut linker)?;
     define_wasi_imports(&mut linker)?;
     let pre = linker.instantiate_pre(&module)?;
-    Ok(CompiledRuntime { engine, pre })
+    Ok(CompiledRuntime {
+        engine,
+        pre,
+        source: RuntimeSource::Compiled,
+    })
 }
 
 /// Error from the precompiled-runtime APIs.
@@ -387,15 +438,18 @@ impl std::error::Error for PrecompileError {}
 
 /// Compiles the embedded QuickJS module and returns the machine-code artifact.
 ///
-/// This runs Cranelift, the step the first `js` command otherwise pays for, and
-/// is meant for a build script or a packaging step. Pass the bytes to
-/// [`use_precompiled`] in a later process to skip compilation there.
+/// The `js-precompiled` feature, on by default, already does this during the
+/// build for the crate's own target, so a normal build never runs Cranelift at
+/// runtime. Use this to produce an artifact yourself: to target a different
+/// machine, to share one across processes that build separately, or when the
+/// feature is off.
 ///
 /// The artifact is tied to this Wasmtime version and to the CPU features of the
 /// machine it targets; Wasmtime rejects a mismatched artifact rather than
 /// running it, so treat it as a build output, never as a portable asset.
 pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
-    let engine = Engine::new(&runtime_config())
+    let engine = quickjs_engine_config(None)
+        .and_then(|config| Engine::new(&config))
         .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))?;
     engine
         .precompile_module(QUICKJS_WASM)
@@ -403,8 +457,7 @@ pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
 }
 
 /// Installs an artifact from [`precompile`] as this process's JavaScript
-/// runtime, replacing the Cranelift compile that the first `js` command would
-/// otherwise run.
+/// runtime, in place of the one the build script embedded.
 ///
 /// Call it before the first `js` command: the runtime is initialized once per
 /// process, so a later call fails and leaves the existing runtime in place. A
@@ -416,17 +469,14 @@ pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
 /// Wasmtime trusts these bytes as its own output. Load only an artifact your
 /// build produced with [`precompile`], from a location you control.
 pub fn use_precompiled(artifact: &[u8]) -> Result<(), PrecompileError> {
-    let engine = Engine::new(&runtime_config())
+    let engine = quickjs_engine_config(None)
+        .and_then(|config| Engine::new(&config))
         .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))?;
-    // SAFETY: `Module::deserialize` requires bytes produced by `precompile` on a
-    // compatible Wasmtime and CPU. That contract is documented above and is the
-    // caller's to uphold; Wasmtime still validates its own header and rejects
-    // artifacts built by a different version or for different CPU features.
-    #[allow(unsafe_code)]
-    let module = unsafe { Module::deserialize(&engine, artifact) }
+    let module = deserialize_module(&engine, artifact)
         .map_err(|err| PrecompileError::new(format!("deserialize quickjs module: {err}")))?;
-    let runtime = link_runtime(engine, module)
+    let mut runtime = link_runtime(engine, module)
         .map_err(|err| PrecompileError::new(format!("link quickjs runtime: {err}")))?;
+    runtime.source = RuntimeSource::Precompiled;
     RUNTIME.set(Ok(runtime)).map_err(|_| {
         PrecompileError::new("the JavaScript runtime is already initialized in this process")
     })

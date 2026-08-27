@@ -1230,32 +1230,42 @@ RSS includes runtime and allocator overhead for that process.
 
 ### JavaScript runtime startup
 
-The embedded `quickjs.wasm` is machine code by the time a script runs:
-Wasmtime's compiler, Cranelift, translates it to native code on the **first
-`js` command in a process**, not at startup and not per sandbox. The result is
-cached process-wide, so every later `js` command in that process reuses it, and
-a process that never runs `js` never compiles anything.
+The embedded `quickjs.wasm` is machine code by the time a script runs. Turning
+wasm into machine code is Cranelift's job, and it costs about 425 ms and 29 MiB,
+so the build script does it: it compiles the module for the crate's target and
+the binary embeds the result. No process runs Cranelift, and the first `js`
+command loads the artifact instead.
 
 Measured on Linux x86_64 with `wasmtime` 46:
 
 | Step | When | Cost |
 | --- | --- | --- |
-| Cranelift compile of `quickjs.wasm` | first `js` command in the process | 425 ms, ~29 MiB RSS |
-| `precompile()` artifact loaded instead | before the first `js` command | ~1 ms, ~1.3 MiB RSS |
+| Precompiling `quickjs.wasm` | once, during `cargo build` | 425 ms, 2.7 MB embedded in the binary |
+| First `js` command in a process | loads the artifact | ~9 ms, ~9.5 MiB RSS |
+| The same first command, compiling instead | fallback only | ~430 ms, ~31 MiB RSS |
 | One in-flight `js` command | every run | ~3.4 ms, ~0.5 MiB RSS |
 | Sandbox with no `js` command running | — | no runtime cost |
 
-`js::precompile` runs Cranelift in a build step and returns the machine code;
-`js::use_precompiled` loads that artifact in a later process. The artifact is
-tied to this Wasmtime version and to the target's CPU features, so produce it
-per target and keep it a build output rather than a checked-in asset. A stale
-or foreign artifact is rejected, which is the signal to fall back to the normal
-path.
+The artifact is pinned to the target triple with that architecture's baseline
+CPU features, so it runs on any CPU of that architecture rather than only one as
+new as the build machine. It is also tied to this Wasmtime version. When either
+check fails — a cross-built binary Cranelift could not target, an artifact from
+a different Wasmtime — the runtime compiles the module itself and keeps working;
+`js::runtime_source()` reports which happened.
+
+Two costs come with this. Wasmtime is now a build dependency as well as a
+runtime one, so a cold `cargo build` compiles it twice; and the binary carries
+the 2.7 MB artifact alongside the 0.6 MB wasm.
+
+To produce an artifact yourself — for another machine, or to share one across
+processes that build separately — `js::precompile` returns the machine code and
+`js::use_precompiled` installs it before the first `js` command, replacing the
+embedded one:
 
 **Rust**
 
 ```rust no_run
-// Build step, for example in build.rs or a packaging job.
+// Build step, for example in a packaging job.
 let artifact = tinysandbox::js::precompile().expect("precompile quickjs");
 std::fs::write("target/quickjs.cwasm", &artifact).expect("write artifact");
 
@@ -1267,19 +1277,22 @@ if let Ok(artifact) = std::fs::read("target/quickjs.cwasm") {
 
 **TypeScript**
 
+The native package already embeds an artifact for its platform. To install your
+own:
+
 ```ts
 import { readFileSync, writeFileSync } from 'node:fs'
-import { precompileJs, usePrecompiledJs } from '@tinysandbox/tinysandbox'
+import { jsRuntimeSource, precompileJs, usePrecompiledJs } from '@tinysandbox/tinysandbox'
 
-// Build step.
 writeFileSync('quickjs.cwasm', precompileJs())
 
-// Later process, before the first `js` command runs.
 try {
   usePrecompiledJs(readFileSync('quickjs.cwasm'))
 } catch {
-  // Stale or foreign artifact: the next `js` command compiles the module.
+  // Stale or foreign artifact: the embedded runtime still serves.
 }
+
+console.log(jsRuntimeSource()) // 'precompiled'
 ```
 
 ## Feature flags

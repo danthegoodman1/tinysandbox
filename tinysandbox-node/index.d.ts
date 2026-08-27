@@ -284,18 +284,27 @@ export declare const prompts: {
 
 /**
  * Compiles the embedded QuickJS module and returns the machine-code artifact.
- * Cranelift otherwise runs on the first `js` command in a process; this moves
- * that work to a build step. The artifact is tied to this package's Wasmtime
- * version and to the target CPU features, so treat it as a build output.
+ * The native package already embeds one for its platform, so this is for
+ * producing an artifact yourself — for another machine, or to share one across
+ * processes. It is tied to this package's Wasmtime version and to the target
+ * CPU features, so treat it as a build output.
  */
 export declare function precompileJs(): Buffer
 
 /**
- * Installs a `precompileJs` artifact as this process's JavaScript runtime.
- * Call it before the first `js` command; a second call, or a stale or foreign
- * artifact, throws and leaves the normal compile path in place.
+ * Installs a `precompileJs` artifact as this process's JavaScript runtime, in
+ * place of the embedded one. Call it before the first `js` command; a second
+ * call, or a stale or foreign artifact, throws and leaves the embedded runtime
+ * in place.
  */
 export declare function usePrecompiledJs(artifact: Buffer | Uint8Array): void
+
+/**
+ * Reports where this process's JavaScript machine code came from:
+ * `'precompiled'` when it was loaded from an artifact, `'compiled'` when this
+ * process had to compile the module itself.
+ */
+export declare function jsRuntimeSource(): 'precompiled' | 'compiled'
 
 export declare function runConformance(
   vfsFactory: (quota: VfsQuota) => JsVfs | Promise<JsVfs>

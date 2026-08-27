@@ -121,6 +121,9 @@ export interface JsGlobalCallbackResponse {
   error?: HostCallbackError
 }
 
+/** Reports where this process's JavaScript machine code came from. */
+export declare function jsRuntimeSource(): string
+
 export interface OpenModeJs {
   read?: boolean
   write?: boolean

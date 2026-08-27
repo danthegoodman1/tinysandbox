@@ -1960,3 +1960,15 @@ async fn js_globals_extend_adds_without_dropping_the_rest() {
         .expect("replace surface");
     assert_eq!(sandbox.js_global_names(), vec!["only".to_owned()]);
 }
+
+#[tokio::test]
+async fn js_runs_on_machine_code_built_ahead_of_time() {
+    // The build script precompiles the module for this target, so no process
+    // pays Cranelift's compile on its first `js` command.
+    let sandbox = Sandbox::builder().build();
+    assert_eq!(sandbox.exec("js -e 'console.log(1)'").await.stdout, "1\n");
+    assert_eq!(
+        tinysandbox::js::runtime_source().expect("runtime source"),
+        tinysandbox::js::RuntimeSource::Precompiled
+    );
+}

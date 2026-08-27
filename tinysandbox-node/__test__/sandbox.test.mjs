@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Sandbox, prompts, runConformance } from '../index.js'
+import { Sandbox, jsRuntimeSource, prompts, runConformance } from '../index.js'
 import { createMemoryVfs } from './helpers.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -433,6 +433,15 @@ test('JS VFS adapters do not keep child processes alive', async () => {
   })
   const result = await waitForChild(child, 2000)
   assert.equal(result.code, 0, result.stderr)
+})
+
+test('the js runtime runs on machine code built ahead of time', async () => {
+  // The native package embeds a precompiled artifact, so no process compiles
+  // the QuickJS module on its first `js` command.
+  const sandbox = new Sandbox()
+  const result = await sandbox.exec("js -e 'console.log(1)'")
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(jsRuntimeSource(), 'precompiled')
 })
 
 test('prompt chunks map to the matching native constants', async () => {

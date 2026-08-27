@@ -1,20 +1,15 @@
-//! Precompiling the QuickJS module once and loading it in a later process.
+//! Where the JavaScript runtime's machine code comes from.
 //!
-//! The first `js` command in a process asks Cranelift to compile the embedded
-//! `quickjs.wasm` into machine code, which costs roughly 400 ms and 29 MiB of
-//! resident memory. A build step can pay that instead: `precompile` returns the
-//! machine code, and `use_precompiled` loads it in later processes.
-//!
-//! The artifact is the compiled QuickJS interpreter, nothing else. Host
-//! globals are per-command configuration, not part of the module, so one
-//! artifact serves every sandbox and every tool surface in the process — the
-//! `run` half below binds globals to show that.
+//! Running wasm means turning it into machine code, and Cranelift takes about
+//! 400 ms and 29 MiB to do it. The build script does that work for this crate's
+//! target and embeds the result, so no process compiles anything: the first
+//! `js` command loads the artifact instead.
 //!
 //! Run with: cargo run --example js_precompiled
 //!
-//! With no arguments the example writes an artifact to the system temp
-//! directory and re-runs itself to show the load path. The halves also run on
-//! their own:
+//! The `precompile` and `use_precompiled` APIs shown below are for producing an
+//! artifact yourself — to target another machine, or to share one across
+//! processes that build separately. The halves also run on their own:
 //!
 //! ```sh
 //! cargo run --example js_precompiled -- build /tmp/quickjs.cwasm
@@ -22,10 +17,10 @@
 //! ```
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
 
 use serde_json::json;
+use tinysandbox::js::RuntimeSource;
 use tinysandbox::sandbox::Sandbox;
 
 #[tokio::main]
@@ -34,24 +29,14 @@ async fn main() {
     let default_path = std::env::temp_dir().join("tinysandbox-quickjs.cwasm");
     match args.first().map(String::as_str) {
         Some("build") => build(path_arg(&args, default_path)),
-        Some("run") => run(path_arg(&args, default_path)).await,
-        None => {
-            build(default_path.clone());
-            // A fresh process is the point: compilation is cached per process,
-            // so the saving shows up in the next one.
-            let exe = std::env::current_exe().expect("current exe");
-            let status = Command::new(exe)
-                .arg("run")
-                .arg(&default_path)
-                .status()
-                .expect("re-run example");
-            assert!(status.success());
-        }
+        Some("run") => run(Some(path_arg(&args, default_path))).await,
+        None => run(None).await,
         Some(other) => panic!("unknown mode '{other}'; expected 'build' or 'run'"),
     }
 }
 
 fn build(path: PathBuf) {
+    // This is what build.rs already did for the crate's own target.
     let started = Instant::now();
     let artifact = tinysandbox::js::precompile().expect("precompile quickjs");
     let compile_ms = started.elapsed().as_millis();
@@ -63,26 +48,31 @@ fn build(path: PathBuf) {
     );
 }
 
-async fn run(path: PathBuf) {
-    // A missing, stale, or foreign artifact is not fatal: report it and let the
-    // first `js` command compile the module the usual way.
-    match std::fs::read(&path) {
-        Ok(artifact) => {
-            let started = Instant::now();
-            match tinysandbox::js::use_precompiled(&artifact) {
-                Ok(()) => println!(
-                    "run: loaded {} in {} ms",
-                    path.display(),
-                    started.elapsed().as_millis()
-                ),
-                Err(err) => println!("run: falling back to compiling quickjs: {err}"),
+async fn run(path: Option<PathBuf>) {
+    // Installing an artifact is optional. Skipping it leaves the one the build
+    // script embedded, which is already machine code.
+    if let Some(path) = path {
+        match std::fs::read(&path) {
+            Ok(artifact) => {
+                let started = Instant::now();
+                match tinysandbox::js::use_precompiled(&artifact) {
+                    Ok(()) => println!(
+                        "run: installed {} in {} ms",
+                        path.display(),
+                        started.elapsed().as_millis()
+                    ),
+                    // A stale or foreign artifact is not fatal: the embedded one
+                    // still serves, and a compile is the last resort.
+                    Err(err) => println!("run: keeping the embedded runtime: {err}"),
+                }
             }
+            Err(err) => println!("run: no artifact at {}: {err}", path.display()),
         }
-        Err(err) => println!("run: no artifact at {}: {err}", path.display()),
     }
 
-    // Host globals are unaffected by where the machine code came from: they
-    // are installed per command from the sandbox's registry.
+    // Host globals are unaffected by where the machine code came from: they are
+    // installed per command from the sandbox's registry, so one artifact serves
+    // every sandbox and every tool surface in the process.
     let sandbox = Sandbox::builder()
         .js_global("whoami", |_args| async { Ok(json!("agent-1")) })
         .js_global("tools.answer", |_args| async { Ok(json!(42)) })
@@ -91,13 +81,19 @@ async fn run(path: PathBuf) {
     let result = sandbox
         .exec("js -e 'console.log(whoami(), tools.answer())'")
         .await;
+    let source = tinysandbox::js::runtime_source().expect("runtime source");
     println!(
-        "run: first js exec took {} ms -> {}",
+        "run: first js exec took {} ms from {} machine code -> {}",
         started.elapsed().as_millis(),
+        match source {
+            RuntimeSource::Precompiled => "precompiled",
+            RuntimeSource::Compiled => "just-in-time compiled",
+        },
         result.stdout.trim_end()
     );
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "agent-1 42\n");
+    assert_eq!(source, RuntimeSource::Precompiled);
 }
 
 fn path_arg(args: &[String], fallback: PathBuf) -> PathBuf {
