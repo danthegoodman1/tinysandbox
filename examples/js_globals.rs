@@ -83,10 +83,11 @@ try {
         "answer=42 user=agent-1\nE_KEY:key is required\n200:feature=on\n"
     );
 
-    // Prompt chunks name the bound globals so the model knows what it can call.
+    // Prompt chunks name the bound globals so the model knows what it can
+    // call, straight from the registry rather than a hand-kept list.
     println!(
         "{}",
-        tinysandbox::prompts::globals(["kv.get", "kv.put", "whoami"])
+        tinysandbox::prompts::globals(sandbox.js_global_names())
     );
 }
 

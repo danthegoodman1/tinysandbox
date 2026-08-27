@@ -2113,9 +2113,12 @@ fn check_js_global_name(name: &str) -> Result<(), JsGlobalError> {
 /// `tools` and `tools.search` cannot both be registered.
 #[cfg(feature = "js")]
 fn paths_conflict(left: &str, right: &str) -> bool {
-    left == right
-        || left.starts_with(&format!("{right}."))
-        || right.starts_with(&format!("{left}."))
+    fn is_inside(namespace: &str, path: &str) -> bool {
+        path.len() > namespace.len()
+            && path.as_bytes()[namespace.len()] == b'.'
+            && path.starts_with(namespace)
+    }
+    left == right || is_inside(left, right) || is_inside(right, left)
 }
 
 #[cfg(feature = "js")]

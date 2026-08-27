@@ -344,9 +344,7 @@ fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
         .get_or_init(|| {
             let engine = Engine::new(&quickjs_engine_config(None)?)?;
             let (module, source) = load_module(&engine)?;
-            let mut runtime = link_runtime(engine, module)?;
-            runtime.source = source;
-            Ok(runtime)
+            link_runtime(engine, module, source)
         })
         .as_ref()
         .map_err(|err| wasmtime::Error::msg(err.to_string()))
@@ -374,6 +372,12 @@ pub fn runtime_source() -> Result<RuntimeSource, PrecompileError> {
         .map_err(|err| PrecompileError::new(err.to_string()))
 }
 
+fn engine() -> Result<Engine, PrecompileError> {
+    quickjs_engine_config(None)
+        .and_then(|config| Engine::new(&config))
+        .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))
+}
+
 /// Loads the module, preferring the build script's artifact.
 ///
 /// A rejected artifact is not an error: an engine or CPU the build did not
@@ -386,10 +390,6 @@ fn load_module(engine: &Engine) -> wasmtime::Result<(Module, RuntimeSource)> {
     Module::new(engine, QUICKJS_WASM).map(|module| (module, RuntimeSource::Compiled))
 }
 
-/// # Safety
-///
-/// Wasmtime trusts these bytes as its own output. Callers pass either the
-/// build script's artifact or bytes the embedder vouches for.
 fn deserialize_module(engine: &Engine, artifact: &[u8]) -> wasmtime::Result<Module> {
     // SAFETY: Wasmtime validates its own header and rejects artifacts from a
     // different version or for CPU features this machine lacks; the remaining
@@ -401,7 +401,11 @@ fn deserialize_module(engine: &Engine, artifact: &[u8]) -> wasmtime::Result<Modu
     }
 }
 
-fn link_runtime(engine: Engine, module: Module) -> wasmtime::Result<CompiledRuntime> {
+fn link_runtime(
+    engine: Engine,
+    module: Module,
+    source: RuntimeSource,
+) -> wasmtime::Result<CompiledRuntime> {
     start_epoch_thread(engine.clone());
     let mut linker = Linker::new(&engine);
     define_tinysandbox_imports(&mut linker)?;
@@ -410,7 +414,7 @@ fn link_runtime(engine: Engine, module: Module) -> wasmtime::Result<CompiledRunt
     Ok(CompiledRuntime {
         engine,
         pre,
-        source: RuntimeSource::Compiled,
+        source,
     })
 }
 
@@ -438,20 +442,19 @@ impl std::error::Error for PrecompileError {}
 
 /// Compiles the embedded QuickJS module and returns the machine-code artifact.
 ///
-/// The `js-precompiled` feature, on by default, already does this during the
-/// build for the crate's own target, so a normal build never runs Cranelift at
-/// runtime. Use this to produce an artifact yourself: to target a different
-/// machine, to share one across processes that build separately, or when the
-/// feature is off.
+/// The build script already does this for the crate's own target, so a normal
+/// build never runs Cranelift at runtime. Use this to produce an artifact
+/// yourself: to target a different machine, or to share one across processes
+/// that build separately.
+///
+/// The engine here matches the one the runtime uses, so the artifact loads
+/// through [`use_precompiled`] on any machine of the same architecture.
 ///
 /// The artifact is tied to this Wasmtime version and to the CPU features of the
 /// machine it targets; Wasmtime rejects a mismatched artifact rather than
 /// running it, so treat it as a build output, never as a portable asset.
 pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
-    let engine = quickjs_engine_config(None)
-        .and_then(|config| Engine::new(&config))
-        .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))?;
-    engine
+    engine()?
         .precompile_module(QUICKJS_WASM)
         .map_err(|err| PrecompileError::new(format!("precompile quickjs module: {err}")))
 }
@@ -469,14 +472,11 @@ pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
 /// Wasmtime trusts these bytes as its own output. Load only an artifact your
 /// build produced with [`precompile`], from a location you control.
 pub fn use_precompiled(artifact: &[u8]) -> Result<(), PrecompileError> {
-    let engine = quickjs_engine_config(None)
-        .and_then(|config| Engine::new(&config))
-        .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))?;
+    let engine = engine()?;
     let module = deserialize_module(&engine, artifact)
         .map_err(|err| PrecompileError::new(format!("deserialize quickjs module: {err}")))?;
-    let mut runtime = link_runtime(engine, module)
+    let runtime = link_runtime(engine, module, RuntimeSource::Precompiled)
         .map_err(|err| PrecompileError::new(format!("link quickjs runtime: {err}")))?;
-    runtime.source = RuntimeSource::Precompiled;
     RUNTIME.set(Ok(runtime)).map_err(|_| {
         PrecompileError::new("the JavaScript runtime is already initialized in this process")
     })

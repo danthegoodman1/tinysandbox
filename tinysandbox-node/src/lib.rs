@@ -13,8 +13,8 @@ use napi_derive::napi;
 use serde_json::Value;
 use tinysandbox::sandbox::{
     Command, CommandContext, CommandFuture, CommandResult, ExecResult as CoreExecResult,
-    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostError, Limits,
-    Sandbox as CoreSandbox,
+    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostError, JsGlobals,
+    Limits, Sandbox as CoreSandbox,
 };
 use tinysandbox::vfs::{
     DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
@@ -107,6 +107,10 @@ impl Sandbox {
     #[napi(constructor)]
     pub fn new(options: Option<Object<'_>>) -> Result<Self> {
         let mut builder = CoreSandbox::builder();
+        // Collected rather than registered on the builder so the core validates
+        // them through the fallible path and this constructor can raise a
+        // JavaScript error instead of letting a builder panic cross N-API.
+        let mut js_globals = JsGlobals::new();
         #[cfg(unix)]
         let mut local_vfs = HashMap::new();
 
@@ -136,7 +140,6 @@ impl Sandbox {
             }
             if let Some(globals) = get_optional_object(&options, "globals")? {
                 for name in Object::keys(&globals)? {
-                    validate_js_global_name(&name)?;
                     let callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>> =
                         globals.get_named_property(&name)?;
                     let callback = Arc::new(
@@ -146,7 +149,7 @@ impl Sandbox {
                             .weak::<true>()
                             .build_callback(|ctx| Ok((ctx.value,)))?,
                     );
-                    builder = builder.js_global(name, move |args| {
+                    js_globals = js_globals.with(name, move |args| {
                         let callback = Arc::clone(&callback);
                         async move { call_js_global(callback, args).await }
                     });
@@ -235,8 +238,16 @@ impl Sandbox {
             }
         }
 
+        let sandbox = builder.build();
+        sandbox.extend_js_globals(js_globals).map_err(|err| {
+            Error::new(
+                Status::InvalidArg,
+                format!("Sandbox constructor {err} in the globals option"),
+            )
+        })?;
+
         Ok(Self {
-            inner: Arc::new(builder.build()),
+            inner: Arc::new(sandbox),
             #[cfg(unix)]
             local_vfs,
         })
@@ -1455,52 +1466,6 @@ fn quota_value(value: f64, context: &str, name: &str) -> Result<u64> {
             format!("{context} quota {name} must be a non-negative safe integer"),
         )
     })
-}
-
-fn validate_js_global_name(name: &str) -> Result<()> {
-    if !is_js_global_name(name) {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "Sandbox constructor cannot register invalid global name '{name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments"
-            ),
-        ));
-    }
-    let root = name.split('.').next().unwrap_or(name);
-    // Mirrors RESERVED_JS_GLOBALS in the core crate.
-    const RESERVED: &[&str] = &[
-        "Buffer",
-        "Headers",
-        "Response",
-        "__dirname",
-        "__filename",
-        "console",
-        "exports",
-        "fetch",
-        "globalThis",
-        "module",
-        "process",
-        "require",
-    ];
-    if RESERVED.contains(&root) {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "Sandbox constructor cannot register reserved global name '{name}'; '{root}' is provided by the JavaScript runtime"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn is_js_global_name(name: &str) -> bool {
-    !name.is_empty() && name.split('.').all(is_js_global_segment)
-}
-
-fn is_js_global_segment(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn get_optional<T>(object: &Object<'_>, name: &str) -> Result<Option<T>>

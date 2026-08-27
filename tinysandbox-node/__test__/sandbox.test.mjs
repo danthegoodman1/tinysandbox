@@ -350,14 +350,17 @@ test('fetchResponseBytes limits Node fetch response bodies', async () => {
 })
 
 test('invalid global names throw during Sandbox construction', () => {
-  // Constructor validation prevents Rust builder panics from crossing N-API.
+  // The core validates, so its rules reach JavaScript as errors rather than as
+  // a builder panic crossing N-API.
+  assert.throws(() => new Sandbox({ globals: { 'bad-name': () => null } }), /invalid name/)
+  assert.throws(() => new Sandbox({ globals: { 'tools..a': () => null } }), /invalid name/)
+  assert.throws(() => new Sandbox({ globals: { console: () => null } }), /reserved name/)
+  assert.throws(() => new Sandbox({ globals: { 'process.exit': () => null } }), /reserved name/)
   assert.throws(
-    () => new Sandbox({ globals: { 'bad-name': () => null } }),
-    /invalid global name/
+    () => new Sandbox({ globals: { tools: () => null, 'tools.search': () => null } }),
+    /conflicts with/
   )
-  assert.throws(() => new Sandbox({ globals: { 'tools..a': () => null } }), /invalid global name/)
-  assert.throws(() => new Sandbox({ globals: { console: () => null } }), /reserved global name/)
-  assert.throws(() => new Sandbox({ globals: { 'process.exit': () => null } }), /reserved global name/)
+  assert.throws(() => new Sandbox({ globals: { ok: 'not a function' } }), /must be a function/)
 })
 
 test('direct VFS calls proceed while exec is in flight', async () => {

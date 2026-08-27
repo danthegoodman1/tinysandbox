@@ -119,31 +119,6 @@ impl JsGlobals {
             .push((name.into(), std::sync::Arc::new(global)));
         self
     }
-
-    /// Reports whether the set is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Returns how many globals the set holds.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-impl std::fmt::Debug for JsGlobals {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JsGlobals")
-            .field(
-                "names",
-                &self
-                    .entries
-                    .iter()
-                    .map(|(name, _)| name)
-                    .collect::<Vec<_>>(),
-            )
-            .finish()
-    }
 }
 
 /// Error returned by an embedder host global or fetch handler.

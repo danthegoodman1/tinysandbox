@@ -9,8 +9,6 @@
 use serde_json::{Value, json};
 use tinysandbox::sandbox::{HostError, JsGlobals, Sandbox};
 
-const LIST: &str = "js -e 'console.log(globals())'";
-
 /// A base capability every turn keeps, written as a plain function so the same
 /// handler can be re-granted after a revoking swap.
 async fn whoami(_args: Value) -> Result<Value, HostError> {
@@ -19,17 +17,8 @@ async fn whoami(_args: Value) -> Result<Value, HostError> {
 
 #[tokio::main]
 async fn main() {
-    let sandbox = Sandbox::builder()
-        .js_global("whoami", whoami)
-        // A prelude keeps the demo output short: it reports the bound surface
-        // the way a script would discover it.
-        .js_prelude(
-            "globalThis.globals = () => [typeof whoami === 'function' ? 'whoami' : null, \
-             typeof tools === 'undefined' ? null : 'tools.' + Object.keys(tools).join(',tools.')] \
-             .filter(Boolean).join(' ') || '(none)'",
-        )
-        .build();
-    println!("base:    {}", sandbox.exec(LIST).await.stdout.trim_end());
+    let sandbox = Sandbox::builder().js_global("whoami", whoami).build();
+    println!("base:    {:?}", sandbox.js_global_names());
 
     // Turn one adds tools and keeps everything already bound.
     sandbox
@@ -41,9 +30,9 @@ async fn main() {
                 .with("tools.read_doc", |_args| async { Ok(json!("doc body")) }),
         )
         .expect("grant turn-one tools");
-    println!("turn 1:  {}", sandbox.exec(LIST).await.stdout.trim_end());
+    println!("turn 1:  {:?}", sandbox.js_global_names());
     let result = sandbox
-        .exec(r#"js -e 'console.log(tools.search({ q: "vfs" }).hits[0])'"#)
+        .exec(r#"js -e 'console.log(whoami(), tools.search({ q: "vfs" }).hits[0])'"#)
         .await;
     print!("call:    {}", result.stdout);
 
@@ -58,7 +47,7 @@ async fn main() {
                 }),
         )
         .expect("grant turn-two tools");
-    println!("turn 2:  {}", sandbox.exec(LIST).await.stdout.trim_end());
+    println!("turn 2:  {:?}", sandbox.js_global_names());
     let revoked = sandbox
         .exec("js -e 'console.log(typeof tools.search)'")
         .await;
@@ -68,7 +57,7 @@ async fn main() {
     sandbox
         .set_js_global("tools.trace", |_args| async { Ok(json!("traced")) })
         .expect("add tools.trace");
-    println!("added:   {}", sandbox.exec(LIST).await.stdout.trim_end());
+    println!("added:   {:?}", sandbox.js_global_names());
     println!("removed: {}", sandbox.remove_js_global("tools.trace"));
     println!("again:   {}", sandbox.remove_js_global("tools.trace"));
 

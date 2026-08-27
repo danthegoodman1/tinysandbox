@@ -61,7 +61,7 @@ function wrapCommands(commands) {
 function wrapGlobals(globals) {
   return Object.fromEntries(
     Object.entries(globals).map(([name, global]) => {
-      validateGlobalName(name)
+      // Names are validated by the native layer, which owns the rules.
       if (typeof global !== 'function') throw new TypeError(`global '${name}' must be a function`)
       return [
         name,
@@ -124,34 +124,6 @@ function firstArgument(value) {
   // napi-rs TSFN callbacks marshal tuple arguments as an object with numeric
   // keys, while direct wrapper calls already pass the request object.
   return value && typeof value === 'object' && Object.hasOwn(value, '0') ? value[0] : value
-}
-
-// Mirrors RESERVED_JS_GLOBALS in the Rust crate.
-const reservedGlobals = new Set([
-  'Buffer',
-  'Headers',
-  'Response',
-  '__dirname',
-  '__filename',
-  'console',
-  'exports',
-  'fetch',
-  'globalThis',
-  'module',
-  'process',
-  'require'
-])
-
-function validateGlobalName(name) {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(name)) {
-    throw new TypeError(
-      `invalid global name '${name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments`
-    )
-  }
-  const [root] = name.split('.')
-  if (reservedGlobals.has(root)) {
-    throw new TypeError(`reserved global name '${name}'; '${root}' is provided by the JavaScript runtime`)
-  }
 }
 
 function normalizeJsonValue(value) {
