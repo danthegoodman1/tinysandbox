@@ -1258,10 +1258,10 @@ What a process pays, measured on Linux x86_64 with `wasmtime` 46:
 
 | Step | When | Cost |
 | --- | --- | --- |
-| First `js` command in a process | loads the artifact | ~9 ms, ~9.5 MiB RSS |
+| First `js` command in a process | loads the artifact | ~9 ms, ~8.4 MiB RSS |
 | The same first command, on the fallback path | only when the artifact is refused | ~430 ms, ~31 MiB RSS |
 | One in-flight `js` command | every run | ~3.4 ms, ~0.5 MiB RSS |
-| Sandbox with no `js` command running | — | no runtime cost |
+| Sandbox with no `js` command running | — | ~7 KiB, no runtime cost |
 
 The artifact is pinned to the target triple with that architecture's baseline
 CPU features, so it runs on any CPU of that architecture rather than only one as
