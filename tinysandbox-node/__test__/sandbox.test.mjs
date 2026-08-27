@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Sandbox, prompts, runConformance } from '../index.js'
+import { Sandbox, jsRuntimeSource, prompts, runConformance } from '../index.js'
 import { createMemoryVfs } from './helpers.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -208,25 +208,25 @@ test('Node e2e pipeline can cat into the sandboxed js command', async () => {
   assert.equal(result.stdout, 'ABC\n')
 })
 
-test('JS syscalls round-trip JSON values through Node handlers', async () => {
-  // Generated sandbox.<name> functions synchronously call the async Node host callback.
+test('JS globals round-trip JSON values through Node handlers', async () => {
+  // Bound globals synchronously call the async Node host callback.
   const sandbox = new Sandbox({
-    syscalls: {
+    globals: {
       inspect: async (args) => {
         assert.deepEqual(args, { value: 7 })
         return { doubled: args.value * 2, nested: [true, null, 'ok'] }
       }
     }
   })
-  const result = await sandbox.exec("js -e 'const out = sandbox.inspect({ value: 7 }); console.log(JSON.stringify(out))'")
+  const result = await sandbox.exec("js -e 'const out = inspect({ value: 7 }); console.log(JSON.stringify(out))'")
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, '{"doubled":14,"nested":[true,null,"ok"]}\n')
 })
 
-test('JS syscall handler errors preserve string code fields', async () => {
+test('JS global handler errors preserve string code fields', async () => {
   // Thrown Node errors become guest Error objects with message and optional code.
   const sandbox = new Sandbox({
-    syscalls: {
+    globals: {
       deny: () => {
         const err = new Error('denied by host')
         err.code = 'E_DENIED'
@@ -236,7 +236,7 @@ test('JS syscall handler errors preserve string code fields', async () => {
   })
   const script = `
 try {
-  sandbox.deny({ id: 1 })
+  deny({ id: 1 })
 } catch (err) {
   console.log(err.message)
   console.log(err.code)
@@ -247,17 +247,33 @@ try {
   assert.equal(result.stdout, 'denied by host\nE_DENIED\n')
 })
 
-test('jsPrelude can wrap a Node-backed syscall', async () => {
-  // The prelude can expose a narrower global and hide the generated sandbox object.
+test('jsPrelude can wrap a Node-backed global', async () => {
+  // The prelude can expose a narrower global and hide the bound one.
   const sandbox = new Sandbox({
-    syscalls: {
+    globals: {
       kvGet: ({ key }) => ({ value: key === 'answer' ? 42 : null })
     },
-    jsPrelude: 'const kvGet = sandbox.kvGet; globalThis.getAnswer = () => kvGet({ key: "answer" }).value; delete globalThis.sandbox'
+    jsPrelude: 'const bound = globalThis.kvGet; globalThis.getAnswer = () => bound({ key: "answer" }).value; delete globalThis.kvGet'
   })
-  const result = await sandbox.exec("js -e 'console.log(getAnswer(), typeof sandbox)'")
+  const result = await sandbox.exec("js -e 'console.log(getAnswer(), typeof kvGet)'")
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, '42 undefined\n')
+})
+
+test('dotted global names build a namespace object', async () => {
+  // `tools.a` and `tools.b` share one generated namespace the script can enumerate.
+  const sandbox = new Sandbox({
+    globals: {
+      'tools.a': () => 'a',
+      'tools.b': () => 'b',
+      search: () => 'top-level'
+    }
+  })
+  const result = await sandbox.exec(
+    "js -e 'console.log(search(), tools.a(), tools.b(), Object.keys(tools).join(\",\"))'"
+  )
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(result.stdout, 'top-level a b a,b\n')
 })
 
 test('fetch calls a Node transport with Buffer request and response bodies', async () => {
@@ -333,12 +349,46 @@ test('fetchResponseBytes limits Node fetch response bodies', async () => {
   assert.equal(result.stdout, 'TypeError fetch failed\nfetch response body exceeded limit of 3 bytes\n')
 })
 
-test('invalid syscall names throw during Sandbox construction', () => {
-  // Constructor validation prevents Rust builder panics from crossing N-API.
+test('globals can change between commands on a live sandbox', async () => {
+  // Each `js` command snapshots the registry, so a turn can grant a different
+  // tool surface without rebuilding the sandbox.
+  const sandbox = new Sandbox({ globals: { whoami: () => 'agent-1' } })
+  sandbox.extendJsGlobals({ 'tools.a': () => 'a', 'tools.b': () => 'b' })
+  assert.deepEqual(sandbox.jsGlobalNames(), ['tools.a', 'tools.b', 'whoami'])
+
+  const granted = await sandbox.exec("js -e 'console.log(whoami(), tools.a(), tools.b())'")
+  assert.equal(granted.exitCode, 0, granted.stderr)
+  assert.equal(granted.stdout, 'agent-1 a b\n')
+
+  // replace drops what it does not name, including constructor globals.
+  sandbox.replaceJsGlobals({ 'tools.c': () => 'c' })
+  assert.deepEqual(sandbox.jsGlobalNames(), ['tools.c'])
+  const revoked = await sandbox.exec("js -e 'console.log(typeof whoami, tools.c())'")
+  assert.equal(revoked.stdout, 'undefined c\n')
+
+  sandbox.setJsGlobal('search', () => 'hit')
+  assert.equal((await sandbox.exec("js -e 'console.log(search())'")).stdout, 'hit\n')
+  assert.equal(sandbox.removeJsGlobal('search'), true)
+  assert.equal(sandbox.removeJsGlobal('search'), false)
+
+  // A rejected change leaves the live surface untouched.
+  assert.throws(() => sandbox.setJsGlobal('console', () => null), /reserved name/)
+  assert.throws(() => sandbox.extendJsGlobals({ tools: () => null }), /conflicts with/)
+  assert.deepEqual(sandbox.jsGlobalNames(), ['tools.c'])
+})
+
+test('invalid global names throw during Sandbox construction', () => {
+  // The core validates, so its rules reach JavaScript as errors rather than as
+  // a builder panic crossing N-API.
+  assert.throws(() => new Sandbox({ globals: { 'bad-name': () => null } }), /invalid name/)
+  assert.throws(() => new Sandbox({ globals: { 'tools..a': () => null } }), /invalid name/)
+  assert.throws(() => new Sandbox({ globals: { console: () => null } }), /reserved name/)
+  assert.throws(() => new Sandbox({ globals: { 'process.exit': () => null } }), /reserved name/)
   assert.throws(
-    () => new Sandbox({ syscalls: { 'bad-name': () => null } }),
-    /invalid syscall name/
+    () => new Sandbox({ globals: { tools: () => null, 'tools.search': () => null } }),
+    /conflicts with/
   )
+  assert.throws(() => new Sandbox({ globals: { ok: 'not a function' } }), /must be a function/)
 })
 
 test('direct VFS calls proceed while exec is in flight', async () => {
@@ -416,6 +466,15 @@ test('JS VFS adapters do not keep child processes alive', async () => {
   assert.equal(result.code, 0, result.stderr)
 })
 
+test('the js runtime runs on machine code built ahead of time', async () => {
+  // The native package embeds a precompiled artifact, so no process compiles
+  // the QuickJS module on its first `js` command.
+  const sandbox = new Sandbox()
+  const result = await sandbox.exec("js -e 'console.log(1)'")
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(jsRuntimeSource(), 'precompiled')
+})
+
 test('prompt chunks map to the matching native constants', async () => {
   // Spot-checks distinctive content per chunk so a crossed mapping in
   // index.js (e.g. prompts.shell pointing at the builtins text) is caught.
@@ -425,15 +484,17 @@ test('prompt chunks map to the matching native constants', async () => {
     builtins: 'GNU counterparts',
     jq: '--argjson',
     js: 'readFileSync',
-    syscalls: 'Object.keys(sandbox)',
+    globals: 'bound as globals',
     fetch: 'WHATWG',
     sessionEphemeral: 'do not carry over',
     sessionPersistent: 'persist across'
   }
   assert.deepEqual(Object.keys(prompts).sort(), Object.keys(distinctive).sort())
   for (const [key, marker] of Object.entries(distinctive)) {
-    assert.ok(prompts[key].includes(marker), `prompts.${key} should mention '${marker}'`)
+    const chunk = typeof prompts[key] === 'function' ? prompts[key](['search']) : prompts[key]
+    assert.ok(chunk.includes(marker), `prompts.${key} should mention '${marker}'`)
   }
+  assert.ok(prompts.globals(['kv.get']).includes('`kv.get(args)`'))
 
   // The builtins chunk must list exactly what `ls /bin` reports, minus `js`
   // which is introduced by the js chunk.

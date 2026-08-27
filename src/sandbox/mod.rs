@@ -22,9 +22,9 @@
 mod builtins;
 pub mod command;
 pub mod fs;
-mod jq;
 #[cfg(feature = "js")]
-pub mod syscall;
+pub mod host;
+mod jq;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -32,7 +32,7 @@ use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -51,14 +51,13 @@ pub use command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult, Limits,
 };
 #[cfg(feature = "js")]
-pub use syscall::{
-    Fetch, FetchFuture, FetchRequest, FetchResponse, Syscall, SyscallError, SyscallFuture,
+pub use host::{
+    Fetch, FetchFuture, FetchRequest, FetchResponse, HostError, JsGlobal, JsGlobalError,
+    JsGlobalFuture, JsGlobals,
 };
 
 const PIPE_CAPACITY_BYTES: usize = STREAM_CHUNK_BYTES;
 const TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
-#[cfg(feature = "js")]
-const RESERVED_FETCH_SYSCALL: &str = "fetch";
 
 /// Result of a sandbox `exec` call.
 #[derive(Debug, Clone)]
@@ -117,7 +116,7 @@ pub struct Sandbox {
     commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
     command_names: Arc<BTreeSet<String>>,
     #[cfg(feature = "js")]
-    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_globals: RwLock<Arc<BTreeMap<String, Arc<dyn JsGlobal>>>>,
     #[cfg(feature = "js")]
     fetch: Option<Arc<dyn Fetch>>,
     #[cfg(feature = "js")]
@@ -133,7 +132,7 @@ pub struct SandboxBuilder {
     mounts: BTreeMap<String, Arc<dyn Vfs>>,
     commands: BTreeMap<String, Arc<dyn Command>>,
     #[cfg(feature = "js")]
-    syscalls: Vec<(String, Arc<dyn Syscall>)>,
+    js_globals: Vec<(String, Arc<dyn JsGlobal>)>,
     #[cfg(feature = "js")]
     fetch: Option<Arc<dyn Fetch>>,
     #[cfg(feature = "js")]
@@ -162,6 +161,103 @@ impl Sandbox {
             Arc::clone(&self.vfs),
             Arc::clone(&self.command_names),
             session.cwd.clone(),
+        )
+    }
+
+    /// Binds a host function at a dotted global path, replacing any global
+    /// already registered under that exact name.
+    ///
+    /// The change is visible to `js` commands whose registry snapshot is taken
+    /// after this returns. A command already running keeps the set it started
+    /// with, so a script never sees a global appear or vanish mid-run.
+    #[cfg(feature = "js")]
+    pub fn set_js_global<F, Fut>(
+        &self,
+        name: impl Into<String>,
+        global: F,
+    ) -> Result<(), JsGlobalError>
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
+    {
+        let entries = vec![(name.into(), Arc::new(global) as Arc<dyn JsGlobal>)];
+        self.mutate_js_globals(|current| merge_js_globals(current, entries))
+    }
+
+    /// Adds a set of host globals to the ones already bound, replacing any that
+    /// share an exact name and leaving the rest untouched.
+    ///
+    /// The merged surface is validated before it lands, so a set that conflicts
+    /// with a bound namespace leaves the live globals unchanged. Use this to add
+    /// several names as one swap; use [`Sandbox::replace_js_globals`] when the
+    /// old surface must go away.
+    #[cfg(feature = "js")]
+    pub fn extend_js_globals(&self, globals: JsGlobals) -> Result<(), JsGlobalError> {
+        self.mutate_js_globals(|current| merge_js_globals(current, globals.entries))
+    }
+
+    /// Removes a host global, reporting whether it was registered.
+    ///
+    /// Commands already running keep calling it; the removal applies to
+    /// snapshots taken afterwards. A handler mid-flight is not cancelled.
+    #[cfg(feature = "js")]
+    pub fn remove_js_global(&self, name: &str) -> bool {
+        let mut guard = self
+            .js_globals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !guard.contains_key(name) {
+            return false;
+        }
+        let mut globals = guard.as_ref().clone();
+        globals.remove(name);
+        *guard = Arc::new(globals);
+        true
+    }
+
+    /// Replaces every host global with the given set in one swap.
+    ///
+    /// Globals registered on the builder go away too: the live surface becomes
+    /// exactly this set. It is validated as a whole first, so a rejected set
+    /// leaves the sandbox untouched rather than landing halfway. This is the
+    /// call for a per-turn tool surface, where anything not granted again should
+    /// stop being callable.
+    #[cfg(feature = "js")]
+    pub fn replace_js_globals(&self, globals: JsGlobals) -> Result<(), JsGlobalError> {
+        self.mutate_js_globals(|_| merge_js_globals(BTreeMap::new(), globals.entries))
+    }
+
+    /// Applies a validated change to the registry while holding the write lock,
+    /// so concurrent mutations cannot lose an update.
+    #[cfg(feature = "js")]
+    fn mutate_js_globals<F>(&self, change: F) -> Result<(), JsGlobalError>
+    where
+        F: FnOnce(
+            BTreeMap<String, Arc<dyn JsGlobal>>,
+        ) -> Result<BTreeMap<String, Arc<dyn JsGlobal>>, JsGlobalError>,
+    {
+        let mut guard = self
+            .js_globals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let next = change(guard.as_ref().clone())?;
+        *guard = Arc::new(next);
+        Ok(())
+    }
+
+    /// Returns the names currently bound as host globals, in sorted order.
+    #[cfg(feature = "js")]
+    pub fn js_global_names(&self) -> Vec<String> {
+        self.js_globals_snapshot().keys().cloned().collect()
+    }
+
+    #[cfg(feature = "js")]
+    fn js_globals_snapshot(&self) -> Arc<BTreeMap<String, Arc<dyn JsGlobal>>> {
+        Arc::clone(
+            &self
+                .js_globals
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
         )
     }
 
@@ -469,7 +565,7 @@ impl Sandbox {
                 limits: self.limits,
                 commands: Arc::clone(&self.command_names),
                 #[cfg(feature = "js")]
-                js_syscalls: Arc::clone(&self.syscalls),
+                js_globals: self.js_globals_snapshot(),
                 #[cfg(feature = "js")]
                 js_fetch: self.fetch.clone(),
                 #[cfg(feature = "js")]
@@ -541,7 +637,7 @@ impl Sandbox {
                     limits: self.limits,
                     commands: Arc::clone(&self.command_names),
                     #[cfg(feature = "js")]
-                    js_syscalls: Arc::clone(&self.syscalls),
+                    js_globals: self.js_globals_snapshot(),
                     #[cfg(feature = "js")]
                     js_fetch: self.fetch.clone(),
                     #[cfg(feature = "js")]
@@ -577,7 +673,7 @@ impl Sandbox {
             limits: self.limits,
             commands: Arc::clone(&self.command_names),
             #[cfg(feature = "js")]
-            js_syscalls: Arc::clone(&self.syscalls),
+            js_globals: self.js_globals_snapshot(),
             #[cfg(feature = "js")]
             js_fetch: self.fetch.clone(),
             #[cfg(feature = "js")]
@@ -800,7 +896,7 @@ impl SandboxBuilder {
             mounts,
             commands,
             #[cfg(feature = "js")]
-            syscalls: Vec::new(),
+            js_globals: Vec::new(),
             #[cfg(feature = "js")]
             fetch: None,
             #[cfg(feature = "js")]
@@ -862,14 +958,19 @@ impl SandboxBuilder {
         self
     }
 
-    /// Registers a host syscall callable from sandboxed JavaScript.
+    /// Binds a host function into the sandboxed JavaScript global scope.
+    ///
+    /// The name is a dotted path: `search` becomes `globalThis.search`, and
+    /// `tools.search` becomes `globalThis.tools.search` with the `tools`
+    /// namespace created for you. Names may not shadow a global the runtime
+    /// installs itself.
     #[cfg(feature = "js")]
-    pub fn syscall<F, Fut>(mut self, name: impl Into<String>, syscall: F) -> Self
+    pub fn js_global<F, Fut>(mut self, name: impl Into<String>, global: F) -> Self
     where
         F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<serde_json::Value, SyscallError>> + Send + 'static,
+        Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
     {
-        self.syscalls.push((name.into(), Arc::new(syscall)));
+        self.js_globals.push((name.into(), Arc::new(global)));
         self
     }
 
@@ -878,7 +979,7 @@ impl SandboxBuilder {
     pub fn fetch<F, Fut>(mut self, fetch: F) -> Self
     where
         F: Fn(FetchRequest) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<FetchResponse, SyscallError>> + Send + 'static,
+        Fut: Future<Output = Result<FetchResponse, HostError>> + Send + 'static,
     {
         self.fetch = Some(Arc::new(fetch));
         self
@@ -924,7 +1025,7 @@ impl SandboxBuilder {
     /// Builds the sandbox.
     pub fn build(self) -> Sandbox {
         #[cfg(feature = "js")]
-        let syscalls = Arc::new(build_syscall_registry(self.syscalls));
+        let js_globals = Arc::new(build_js_global_registry(self.js_globals));
         #[cfg(feature = "js")]
         let js_prelude = Arc::<str>::from(self.js_prelude.unwrap_or_default());
         let command_names = Arc::new(self.commands.keys().cloned().collect());
@@ -936,7 +1037,7 @@ impl SandboxBuilder {
             commands: Arc::new(self.commands),
             command_names,
             #[cfg(feature = "js")]
-            syscalls,
+            js_globals: RwLock::new(js_globals),
             #[cfg(feature = "js")]
             fetch: self.fetch,
             #[cfg(feature = "js")]
@@ -1272,7 +1373,7 @@ struct PreparedStage {
     limits: Limits,
     commands: Arc<BTreeSet<String>>,
     #[cfg(feature = "js")]
-    js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     #[cfg(feature = "js")]
     js_fetch: Option<Arc<dyn Fetch>>,
     #[cfg(feature = "js")]
@@ -1607,7 +1708,7 @@ async fn run_registered_stage(
             limits: stage.limits,
             commands: stage.commands,
             #[cfg(feature = "js")]
-            js_syscalls: stage.js_syscalls,
+            js_globals: stage.js_globals,
             #[cfg(feature = "js")]
             js_fetch: stage.js_fetch,
             #[cfg(feature = "js")]
@@ -1939,32 +2040,91 @@ fn assert_not_reserved(name: &str) {
 }
 
 #[cfg(feature = "js")]
-fn build_syscall_registry(
-    entries: Vec<(String, Arc<dyn Syscall>)>,
-) -> BTreeMap<String, Arc<dyn Syscall>> {
-    let mut syscalls = BTreeMap::new();
-    for (name, syscall) in entries {
-        if !is_js_syscall_name(&name) {
-            panic!(
-                "SandboxBuilder::syscall cannot register invalid name '{name}'; names must match [A-Za-z_][A-Za-z0-9_]*"
-            );
+const RESERVED_JS_GLOBALS: &[&str] = &[
+    "Buffer",
+    "Headers",
+    "Response",
+    "__dirname",
+    "__filename",
+    "console",
+    "exports",
+    "fetch",
+    "globalThis",
+    "module",
+    "process",
+    "require",
+];
+
+#[cfg(feature = "js")]
+fn build_js_global_registry(
+    entries: Vec<(String, Arc<dyn JsGlobal>)>,
+) -> BTreeMap<String, Arc<dyn JsGlobal>> {
+    merge_js_globals(BTreeMap::new(), entries)
+        .unwrap_or_else(|err| panic!("SandboxBuilder::js_global {err}"))
+}
+
+/// Merges entries onto an existing surface, validating the result so a rejected
+/// change never lands halfway.
+///
+/// A name already bound in `merged` is replaced; a name repeated inside
+/// `entries` is an error, which is what makes a duplicate in a builder or a
+/// replacement set fail instead of silently winning.
+#[cfg(feature = "js")]
+fn merge_js_globals(
+    mut merged: BTreeMap<String, Arc<dyn JsGlobal>>,
+    entries: Vec<(String, Arc<dyn JsGlobal>)>,
+) -> Result<BTreeMap<String, Arc<dyn JsGlobal>>, JsGlobalError> {
+    let mut added: BTreeSet<String> = BTreeSet::new();
+    for (name, global) in entries {
+        check_js_global_name(&name)?;
+        if !added.insert(name.clone()) {
+            return Err(JsGlobalError::new(format!(
+                "cannot register duplicate name '{name}'"
+            )));
         }
-        if name == RESERVED_FETCH_SYSCALL {
-            panic!(
-                "SandboxBuilder::syscall cannot register reserved name 'fetch'; use SandboxBuilder::fetch to provide globalThis.fetch"
-            );
+        merged.remove(&name);
+        if let Some(other) = merged.keys().find(|other| paths_conflict(other, &name)) {
+            return Err(JsGlobalError::new(format!(
+                "cannot register '{name}'; it conflicts with '{other}'"
+            )));
         }
-        if syscalls.insert(name.clone(), syscall).is_some() {
-            panic!("SandboxBuilder::syscall cannot register duplicate name '{name}'");
-        }
+        merged.insert(name, global);
     }
-    syscalls
+    Ok(merged)
 }
 
 #[cfg(feature = "js")]
-fn is_js_syscall_name(name: &str) -> bool {
-    // JavaScript syscall names use the same identifier shape as shell assignments.
-    is_assignment_name(name)
+fn check_js_global_name(name: &str) -> Result<(), JsGlobalError> {
+    if !is_js_global_name(name) {
+        return Err(JsGlobalError::new(format!(
+            "cannot register invalid name '{name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments"
+        )));
+    }
+    let root = name.split('.').next().unwrap_or(name);
+    if RESERVED_JS_GLOBALS.contains(&root) {
+        return Err(JsGlobalError::new(format!(
+            "cannot register reserved name '{name}'; '{root}' is provided by the JavaScript runtime"
+        )));
+    }
+    Ok(())
+}
+
+/// Reports whether one global path is the other or a namespace inside it, so
+/// `tools` and `tools.search` cannot both be registered.
+#[cfg(feature = "js")]
+fn paths_conflict(left: &str, right: &str) -> bool {
+    fn is_inside(namespace: &str, path: &str) -> bool {
+        path.len() > namespace.len()
+            && path.as_bytes()[namespace.len()] == b'.'
+            && path.starts_with(namespace)
+    }
+    left == right || is_inside(left, right) || is_inside(right, left)
+}
+
+#[cfg(feature = "js")]
+fn is_js_global_name(name: &str) -> bool {
+    // Each segment uses the same identifier shape as shell assignments.
+    !name.is_empty() && name.split('.').all(is_assignment_name)
 }
 
 fn is_assignment_name(name: &str) -> bool {

@@ -1,12 +1,12 @@
-//! JavaScript syscalls, prelude wrappers, and embedder-backed fetch.
+//! Host globals, namespaced globals, prelude wrappers, and embedder-backed fetch.
 //!
-//! Run with: cargo run --example js_syscalls
+//! Run with: cargo run --example js_globals
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use tinysandbox::sandbox::{FetchResponse, Sandbox, SyscallError};
+use tinysandbox::sandbox::{FetchResponse, HostError, Sandbox};
 
 #[tokio::main]
 async fn main() {
@@ -15,7 +15,8 @@ async fn main() {
     let put_store = Arc::clone(&store);
 
     let sandbox = Sandbox::builder()
-        .syscall("kv_get", move |args| {
+        // A dotted name creates the namespace: scripts call `kv.get(...)`.
+        .js_global("kv.get", move |args| {
             let store = Arc::clone(&get_store);
             async move {
                 let key = string_arg(&args, "key")?;
@@ -23,7 +24,7 @@ async fn main() {
                 Ok(json!({ "value": value.unwrap_or(Value::Null) }))
             }
         })
-        .syscall("kv_put", move |args| {
+        .js_global("kv.put", move |args| {
             let store = Arc::clone(&put_store);
             async move {
                 let key = string_arg(&args, "key")?.to_owned();
@@ -32,7 +33,11 @@ async fn main() {
                 Ok(json!({ "ok": true }))
             }
         })
-        .js_prelude("globalThis.kvGet = key => sandbox.kv_get({ key }).value")
+        // A bare name binds one top-level global: scripts call `whoami()`.
+        .js_global("whoami", |_args| async { Ok(json!({ "name": "agent-1" })) })
+        // The prelude still runs before the script, so host globals can be
+        // wrapped in friendlier JavaScript.
+        .js_prelude("globalThis.kvGet = key => kv.get({ key }).value")
         .fetch(|request| async move {
             if request.url == "https://example.test/config" {
                 Ok(FetchResponse {
@@ -42,7 +47,7 @@ async fn main() {
                 })
             } else {
                 Err(
-                    SyscallError::new(format!("no canned response for {}", request.url))
+                    HostError::new(format!("no canned response for {}", request.url))
                         .with_code("ENOENT"),
                 )
             }
@@ -50,11 +55,11 @@ async fn main() {
         .build();
 
     let script = r#"
-sandbox.kv_put({ key: 'answer', value: 42 })
-console.log(`answer=${kvGet('answer')}`)
+kv.put({ key: 'answer', value: 42 })
+console.log(`answer=${kvGet('answer')} user=${whoami().name}`)
 
 try {
-  sandbox.kv_get({})
+  kv.get({})
 } catch (err) {
   console.log(`${err.code}:${err.message}`)
 }
@@ -75,12 +80,19 @@ try {
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
         result.stdout,
-        "answer=42\nE_KEY:key is required\n200:feature=on\n"
+        "answer=42 user=agent-1\nE_KEY:key is required\n200:feature=on\n"
+    );
+
+    // Prompt chunks name the bound globals so the model knows what it can
+    // call, straight from the registry rather than a hand-kept list.
+    println!(
+        "{}",
+        tinysandbox::prompts::globals(sandbox.js_global_names())
     );
 }
 
-fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, SyscallError> {
+fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, HostError> {
     args.get(name)
         .and_then(Value::as_str)
-        .ok_or_else(|| SyscallError::new(format!("{name} is required")).with_code("E_KEY"))
+        .ok_or_else(|| HostError::new(format!("{name} is required")).with_code("E_KEY"))
 }

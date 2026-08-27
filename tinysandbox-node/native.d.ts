@@ -9,6 +9,25 @@ export declare class ExternalObject<T> {
 }
 export declare class NativeSandbox {
   constructor(options?: object | undefined | null)
+  /**
+   * Binds one host function, replacing any global under that exact name.
+   * Visible to `js` commands that start after this returns.
+   */
+  setJsGlobal(name: string, global: (arg: [any]) => Promise<JsGlobalCallbackResponse>): void
+  /**
+   * Adds host functions to the ones already bound, replacing any that share
+   * an exact name and leaving the rest untouched.
+   */
+  extendJsGlobals(globals: object): void
+  /**
+   * Replaces every host global with the given set, dropping the ones the set
+   * does not name, including globals bound when the sandbox was constructed.
+   */
+  replaceJsGlobals(globals: object): void
+  /** Removes a host global, reporting whether it was bound. */
+  removeJsGlobal(name: string): boolean
+  /** The names currently bound as host globals, in sorted order. */
+  jsGlobalNames(): Array<string>
   exec(script: string): Promise<ExecResult>
   get fs(): SandboxFs
   stats(): Promise<SandboxStats>
@@ -88,7 +107,7 @@ export interface ExecResult {
 
 export interface FetchCallbackResponse {
   response?: FetchResponse
-  error?: SyscallCallbackError
+  error?: HostCallbackError
 }
 
 export interface FetchRequest {
@@ -111,6 +130,19 @@ export interface FileStat {
   isDir: boolean
 }
 
+export interface HostCallbackError {
+  message?: string
+  code?: string
+}
+
+export interface JsGlobalCallbackResponse {
+  value?: any
+  error?: HostCallbackError
+}
+
+/** Reports where this process's JavaScript machine code came from. */
+export declare function jsRuntimeSource(): string
+
 export interface OpenModeJs {
   read?: boolean
   write?: boolean
@@ -119,6 +151,9 @@ export interface OpenModeJs {
   truncate?: boolean
   append?: boolean
 }
+
+/** Compiles the embedded QuickJS module and returns the machine-code artifact. */
+export declare function precompileJs(): Buffer
 
 export const PROMPT_BUILTINS: string
 
@@ -136,7 +171,7 @@ export const PROMPT_SESSION_PERSISTENT: string
 
 export const PROMPT_SHELL: string
 
-export const PROMPT_SYSCALLS: string
+export declare function promptGlobals(names: Array<string>): string
 
 export declare function runConformance(factory: (arg: [VfsQuotaJs]) => Promise<JsVfsHandle>): Promise<unknown>
 
@@ -145,15 +180,8 @@ export interface SandboxStats {
   vfs?: VfsStatsJs
 }
 
-export interface SyscallCallbackError {
-  message?: string
-  code?: string
-}
-
-export interface SyscallCallbackResponse {
-  value?: any
-  error?: SyscallCallbackError
-}
+/** Installs a `precompileJs` artifact as this process's JavaScript runtime. */
+export declare function usePrecompiledJs(artifact: Buffer): void
 
 export interface VfsCallbackError {
   code?: string

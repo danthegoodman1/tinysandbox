@@ -15,6 +15,13 @@
 //! partial output. Module stack traces still reflect QuickJS details: wrapper
 //! prefixes leave a line-1 column offset, method frames are named like `at boom`,
 //! and visible `<tinysandbox>` glue frames can appear below user frames.
+//!
+//! `quickjs.wasm` is machine code by the time a script runs. The build script
+//! compiles it for this crate's target and the module embeds the result, so the
+//! first `js` command loads it rather than running Cranelift. [`precompile`]
+//! and [`use_precompiled`] produce and install an artifact by hand, for a
+//! different machine or a differently built process, and
+//! [`runtime_source`] reports which path a process ended up on.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -27,20 +34,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use wasmtime::{
-    Caller, Config, Engine, Extern, InstancePre, Linker, Memory, Module, ResourceLimiter, Store,
-    Trap,
+    Caller, Engine, Extern, InstancePre, Linker, Memory, Module, ResourceLimiter, Store, Trap,
 };
 
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
 use crate::sandbox::fs::{Fs, join_path};
-use crate::sandbox::syscall::{Fetch, FetchRequest, FetchResponse, Syscall, SyscallError};
+use crate::sandbox::host::{Fetch, FetchRequest, FetchResponse, HostError, JsGlobal};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
+include!("engine_config.rs");
+
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
+/// Machine code for [`QUICKJS_WASM`], produced by `build.rs` for this target.
+#[cfg(quickjs_precompiled)]
+const QUICKJS_CWASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quickjs.cwasm"));
 const EPOCH_TICK: Duration = Duration::from_millis(5);
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
-const QUICKJS_WASMTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Registers the `js` command in a sandbox command registry.
 pub fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
@@ -57,7 +67,7 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
             mut stderr,
             fs,
             limits,
-            js_syscalls,
+            js_globals,
             js_fetch,
             js_prelude,
             ..
@@ -70,14 +80,14 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
                 return CommandResult::new(1);
             }
         };
-        let syscall_runtime = tokio::runtime::Handle::current();
+        let host_runtime = tokio::runtime::Handle::current();
 
         let config = JsRunConfig {
             invocation,
             env,
             cwd,
             fs,
-            js_syscalls,
+            js_globals,
             js_fetch,
             js_prelude,
             limits: JsRuntimeLimits {
@@ -85,7 +95,7 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
                 fetch_response_bytes: limits.fetch_response_bytes,
                 wall_time: limits.wall_time,
             },
-            syscall_runtime,
+            host_runtime,
         };
 
         let result =
@@ -110,11 +120,11 @@ struct JsRunConfig {
     env: BTreeMap<String, String>,
     cwd: String,
     fs: Fs,
-    js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    js_globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     js_fetch: Option<Arc<dyn Fetch>>,
     js_prelude: Arc<str>,
     limits: JsRuntimeLimits,
-    syscall_runtime: tokio::runtime::Handle,
+    host_runtime: tokio::runtime::Handle,
 }
 
 #[derive(Clone, Copy)]
@@ -198,7 +208,7 @@ struct GuestConfig<'a> {
     argv: &'a [String],
     env: &'a BTreeMap<String, String>,
     cwd: &'a str,
-    syscalls: &'a [String],
+    globals: &'a [String],
     prelude: &'a str,
 }
 
@@ -233,11 +243,11 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         env,
         cwd,
         fs,
-        js_syscalls,
+        js_globals,
         js_fetch,
         js_prelude,
         limits,
-        syscall_runtime,
+        host_runtime,
     } = config;
     let compiled = compiled_runtime()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -248,8 +258,8 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         HostState::new(HostStateConfig {
             fs,
             runtime,
-            syscall_runtime,
-            syscalls: js_syscalls,
+            host_runtime,
+            globals: js_globals,
             fetch: js_fetch,
             limits,
         }),
@@ -274,14 +284,14 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
     let free = instance.get_typed_func::<i32, ()>(&mut store, "tinysandbox_free")?;
     let run = instance.get_typed_func::<(i32, i32), i32>(&mut store, "tinysandbox_run")?;
 
-    let syscall_names = store.data().syscalls.keys().cloned().collect::<Vec<_>>();
+    let global_names = store.data().globals.keys().cloned().collect::<Vec<_>>();
     let config = GuestConfig {
         code: &invocation.code,
         script_path: &invocation.script_path,
         argv: &invocation.argv,
         env: &env,
         cwd: &cwd,
-        syscalls: &syscall_names,
+        globals: &global_names,
         prelude: &js_prelude,
     };
     let input = serde_json::to_vec(&config).map_err(wasmtime::Error::new)?;
@@ -324,26 +334,152 @@ fn epoch_ticks(wall_time: Duration) -> u64 {
 struct CompiledRuntime {
     engine: Engine,
     pre: InstancePre<HostState>,
+    source: RuntimeSource,
 }
 
+static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
+
 fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
-    static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
     RUNTIME
         .get_or_init(|| {
-            let mut config = Config::new();
-            config.epoch_interruption(true);
-            config.max_wasm_stack(QUICKJS_WASMTIME_STACK_BYTES);
-            let engine = Engine::new(&config)?;
-            start_epoch_thread(engine.clone());
-            let module = Module::new(&engine, QUICKJS_WASM)?;
-            let mut linker = Linker::new(&engine);
-            define_tinysandbox_imports(&mut linker)?;
-            define_wasi_imports(&mut linker)?;
-            let pre = linker.instantiate_pre(&module)?;
-            Ok(CompiledRuntime { engine, pre })
+            let engine = Engine::new(&quickjs_engine_config(None)?)?;
+            let (module, source) = load_module(&engine)?;
+            link_runtime(engine, module, source)
         })
         .as_ref()
         .map_err(|err| wasmtime::Error::msg(err.to_string()))
+}
+
+/// Where the machine code backing the JavaScript runtime came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSource {
+    /// Loaded from the artifact the build script precompiled, or from one
+    /// installed with [`use_precompiled`].
+    Precompiled,
+    /// Compiled in this process, the slow path the build normally avoids.
+    Compiled,
+}
+
+/// Reports where this process's JavaScript runtime came from, initializing it
+/// if no `js` command has run yet.
+///
+/// [`RuntimeSource::Compiled`] means the process paid for compilation: the
+/// build script produced no artifact, or the one it produced was rejected by
+/// this engine.
+pub fn runtime_source() -> Result<RuntimeSource, PrecompileError> {
+    compiled_runtime()
+        .map(|runtime| runtime.source)
+        .map_err(|err| PrecompileError::new(err.to_string()))
+}
+
+fn engine() -> Result<Engine, PrecompileError> {
+    quickjs_engine_config(None)
+        .and_then(|config| Engine::new(&config))
+        .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))
+}
+
+/// Loads the module, preferring the build script's artifact.
+///
+/// A rejected artifact is not an error: an engine or CPU the build did not
+/// target falls back to compiling, which is slower but correct.
+fn load_module(engine: &Engine) -> wasmtime::Result<(Module, RuntimeSource)> {
+    #[cfg(quickjs_precompiled)]
+    if let Ok(module) = deserialize_module(engine, QUICKJS_CWASM) {
+        return Ok((module, RuntimeSource::Precompiled));
+    }
+    Module::new(engine, QUICKJS_WASM).map(|module| (module, RuntimeSource::Compiled))
+}
+
+fn deserialize_module(engine: &Engine, artifact: &[u8]) -> wasmtime::Result<Module> {
+    // SAFETY: Wasmtime validates its own header and rejects artifacts from a
+    // different version or for CPU features this machine lacks; the remaining
+    // contract, that the bytes came from `precompile`, is documented on the
+    // public entry points.
+    #[allow(unsafe_code)]
+    unsafe {
+        Module::deserialize(engine, artifact)
+    }
+}
+
+fn link_runtime(
+    engine: Engine,
+    module: Module,
+    source: RuntimeSource,
+) -> wasmtime::Result<CompiledRuntime> {
+    start_epoch_thread(engine.clone());
+    let mut linker = Linker::new(&engine);
+    define_tinysandbox_imports(&mut linker)?;
+    define_wasi_imports(&mut linker)?;
+    let pre = linker.instantiate_pre(&module)?;
+    Ok(CompiledRuntime {
+        engine,
+        pre,
+        source,
+    })
+}
+
+/// Error from the precompiled-runtime APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecompileError {
+    message: String,
+}
+
+impl PrecompileError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PrecompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PrecompileError {}
+
+/// Compiles the embedded QuickJS module and returns the machine-code artifact.
+///
+/// The build script already does this for the crate's own target, so a normal
+/// build never runs Cranelift at runtime. Use this to produce an artifact
+/// yourself: to target a different machine, or to share one across processes
+/// that build separately.
+///
+/// The engine here matches the one the runtime uses, so the artifact loads
+/// through [`use_precompiled`] on any machine of the same architecture.
+///
+/// The artifact is tied to this Wasmtime version and to the CPU features of the
+/// machine it targets; Wasmtime rejects a mismatched artifact rather than
+/// running it, so treat it as a build output, never as a portable asset.
+pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
+    engine()?
+        .precompile_module(QUICKJS_WASM)
+        .map_err(|err| PrecompileError::new(format!("precompile quickjs module: {err}")))
+}
+
+/// Installs an artifact from [`precompile`] as this process's JavaScript
+/// runtime, in place of the one the build script embedded.
+///
+/// Call it before the first `js` command: the runtime is initialized once per
+/// process, so a later call fails and leaves the existing runtime in place. A
+/// stale or foreign artifact fails here too, which is the signal to fall back to
+/// the normal path and let the next `js` command compile the module.
+///
+/// # Safety
+///
+/// Wasmtime trusts these bytes as its own output. Load only an artifact your
+/// build produced with [`precompile`], from a location you control.
+pub fn use_precompiled(artifact: &[u8]) -> Result<(), PrecompileError> {
+    let engine = engine()?;
+    let module = deserialize_module(&engine, artifact)
+        .map_err(|err| PrecompileError::new(format!("deserialize quickjs module: {err}")))?;
+    let runtime = link_runtime(engine, module, RuntimeSource::Precompiled)
+        .map_err(|err| PrecompileError::new(format!("link quickjs runtime: {err}")))?;
+    RUNTIME.set(Ok(runtime)).map_err(|_| {
+        PrecompileError::new("the JavaScript runtime is already initialized in this process")
+    })
 }
 
 fn start_epoch_thread(engine: Engine) {
@@ -364,8 +500,8 @@ fn start_epoch_thread(engine: Engine) {
 struct HostState {
     fs: Fs,
     runtime: tokio::runtime::Runtime,
-    syscall_runtime: tokio::runtime::Handle,
-    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    host_runtime: tokio::runtime::Handle,
+    globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     fetch: Option<Arc<dyn Fetch>>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -382,8 +518,8 @@ struct HostState {
 struct HostStateConfig {
     fs: Fs,
     runtime: tokio::runtime::Runtime,
-    syscall_runtime: tokio::runtime::Handle,
-    syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    host_runtime: tokio::runtime::Handle,
+    globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     fetch: Option<Arc<dyn Fetch>>,
     limits: JsRuntimeLimits,
 }
@@ -393,16 +529,16 @@ impl HostState {
         let HostStateConfig {
             fs,
             runtime,
-            syscall_runtime,
-            syscalls,
+            host_runtime,
+            globals,
             fetch,
             limits,
         } = config;
         Self {
             fs,
             runtime,
-            syscall_runtime,
-            syscalls,
+            host_runtime,
+            globals,
             fetch,
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -436,7 +572,7 @@ where
     // Fire before the outer command deadline so the guest can observe the host-call error.
     let remaining = state.remaining_wall_time().saturating_sub(EPOCH_TICK * 2);
     state
-        .syscall_runtime
+        .host_runtime
         .block_on(async move { tokio::time::timeout(remaining, future).await })
 }
 
@@ -768,14 +904,14 @@ impl HostCallError {
 }
 
 #[derive(Serialize)]
-struct SyscallHostError {
+struct HostErrorPayload {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
 }
 
-impl From<SyscallError> for SyscallHostError {
-    fn from(error: SyscallError) -> Self {
+impl From<HostError> for HostErrorPayload {
+    fn from(error: HostError) -> Self {
         Self {
             message: error.message,
             code: error.code,
@@ -794,15 +930,15 @@ struct NodeError {
 }
 
 fn handle_host_call(state: &mut HostState, op: &str, args: Value) -> HostResponse {
-    if op == "syscall" {
-        match handle_syscall(state, &args) {
+    if op == "global" {
+        match handle_js_global(state, &args) {
             Ok(value) => HostResponse::value(value),
-            Err(err) => HostResponse::error(SyscallHostError::from(err)),
+            Err(err) => HostResponse::error(HostErrorPayload::from(err)),
         }
     } else if op == "fetch" {
         match handle_fetch(state, &args) {
             Ok(value) => HostResponse::value(value),
-            Err(err) => HostResponse::error(SyscallHostError::from(err)),
+            Err(err) => HostResponse::error(HostErrorPayload::from(err)),
         }
     } else {
         match handle_host_call_result(state, op, &args) {
@@ -827,19 +963,19 @@ struct FetchHostResponse {
     body: String,
 }
 
-fn handle_fetch(state: &mut HostState, args: &Value) -> Result<Value, SyscallError> {
+fn handle_fetch(state: &mut HostState, args: &Value) -> Result<Value, HostError> {
     let fetch = state.fetch.clone().ok_or_else(|| {
-        SyscallError::new("network is not available in this sandbox: no fetch handler registered")
+        HostError::new("network is not available in this sandbox: no fetch handler registered")
     })?;
     let payload: FetchHostRequest = serde_json::from_value(args.clone())
-        .map_err(|err| SyscallError::new(format!("invalid fetch request: {err}")))?;
+        .map_err(|err| HostError::new(format!("invalid fetch request: {err}")))?;
     let body = payload
         .body
         .as_deref()
         .map(|body| {
             BASE64_STANDARD
                 .decode(body)
-                .map_err(|_| SyscallError::new("invalid fetch request body encoding"))
+                .map_err(|_| HostError::new("invalid fetch request body encoding"))
         })
         .transpose()?;
     let request = FetchRequest {
@@ -850,15 +986,15 @@ fn handle_fetch(state: &mut HostState, args: &Value) -> Result<Value, SyscallErr
     };
     let response = match block_on_host_timeout(state, fetch.fetch(request)) {
         Ok(result) => result?,
-        Err(_) => return Err(SyscallError::new("fetch timed out")),
+        Err(_) => return Err(HostError::new("fetch timed out")),
     };
     if response.body.len() > state.fetch_response_bytes {
-        return Err(SyscallError::new(format!(
+        return Err(HostError::new(format!(
             "fetch response body exceeded limit of {} bytes",
             state.fetch_response_bytes
         )));
     }
-    fetch_response_json(response).map_err(|err| SyscallError::new(err.to_string()))
+    fetch_response_json(response).map_err(|err| HostError::new(err.to_string()))
 }
 
 fn fetch_response_json(response: FetchResponse) -> serde_json::Result<Value> {
@@ -869,20 +1005,20 @@ fn fetch_response_json(response: FetchResponse) -> serde_json::Result<Value> {
     })
 }
 
-fn handle_syscall(state: &mut HostState, args: &Value) -> Result<Value, SyscallError> {
+fn handle_js_global(state: &mut HostState, args: &Value) -> Result<Value, HostError> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| SyscallError::new("syscall host call requires a string name"))?;
-    let syscall = state
-        .syscalls
+        .ok_or_else(|| HostError::new("global host call requires a string name"))?;
+    let global = state
+        .globals
         .get(name)
         .cloned()
-        .ok_or_else(|| SyscallError::new(format!("unknown syscall '{name}'")))?;
+        .ok_or_else(|| HostError::new(format!("unknown global '{name}'")))?;
     let payload = args.get("args").cloned().unwrap_or(Value::Null);
-    match block_on_host_timeout(state, syscall.call(payload)) {
+    match block_on_host_timeout(state, global.call(payload)) {
         Ok(result) => result,
-        Err(_) => Err(SyscallError::new(format!("syscall '{name}' timed out"))),
+        Err(_) => Err(HostError::new(format!("global '{name}' timed out"))),
     }
 }
 

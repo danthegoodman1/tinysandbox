@@ -26,6 +26,27 @@ export declare class Sandbox extends NativeSandbox {
   constructor(options?: SandboxOptions | null)
   override get fs(): SandboxFs
   override stats(): Promise<SandboxStats>
+  /**
+   * Binds one host function, replacing any global under that exact name.
+   * Visible to `js` commands that start after the call returns; one already
+   * running keeps the set it started with.
+   */
+  override setJsGlobal(name: string, global: JsGlobal): void
+  /**
+   * Adds host functions to the ones already bound, replacing any that share an
+   * exact name and leaving the rest untouched.
+   */
+  override extendJsGlobals(globals: Record<string, JsGlobal>): void
+  /**
+   * Replaces every host global with this set, dropping the ones it does not
+   * name, including globals bound in the constructor. The set is validated
+   * before it lands, so a rejected one leaves the live globals untouched.
+   */
+  override replaceJsGlobals(globals: Record<string, JsGlobal>): void
+  /** Removes a host global, reporting whether it was bound. */
+  override removeJsGlobal(name: string): boolean
+  /** The names currently bound as host globals, in sorted order. */
+  override jsGlobalNames(): Array<string>
 }
 
 export interface SandboxOptions {
@@ -34,7 +55,12 @@ export interface SandboxOptions {
   cwd?: string
   persistSession?: boolean
   commands?: Record<string, JsCommand>
-  syscalls?: Record<string, JsSyscall>
+  /**
+   * Host functions bound into the sandboxed JavaScript global scope. Each key
+   * is a dotted path: `search` becomes `globalThis.search`, `tools.search`
+   * becomes `globalThis.tools.search`.
+   */
+  globals?: Record<string, JsGlobal>
   jsPrelude?: string
   fetch?: JsFetch
   /** Static top-level filesystem mounts. Replaces the default in-memory workspace when present. */
@@ -159,8 +185,8 @@ export interface CommandOutput {
   stderr?: Buffer | Uint8Array | string
 }
 
-/** Host function exposed to sandboxed JavaScript as synchronous sandbox.<name>(args). */
-export type JsSyscall = (args: unknown) => Promise<JsonValue> | JsonValue
+/** Host function bound into the JavaScript global scope, called synchronously as name(args). */
+export type JsGlobal = (args: unknown) => Promise<JsonValue> | JsonValue
 
 export type JsonValue =
   | null
@@ -252,8 +278,8 @@ export type VfsErrno =
  * self-contained block describing one part of the sandbox; pick the chunks
  * that match your sandbox configuration and join them with blank lines.
  *
- * Skip `syscalls` when no syscalls are registered and `fetch` when no fetch
- * handler is set. Include exactly one of `sessionEphemeral` or
+ * Skip `fetch` when no fetch handler is set, and add `globals(names)` when
+ * host globals are registered. Include exactly one of `sessionEphemeral` or
  * `sessionPersistent` depending on the `persistSession` option.
  */
 export declare const prompts: {
@@ -267,8 +293,8 @@ export declare const prompts: {
   readonly jq: string
   /** The `js` command and its Node-compatible runtime, including the fs API. */
   readonly js: string
-  /** Host syscalls exposed to sandboxed JavaScript as sandbox.<name>(). */
-  readonly syscalls: string
+  /** Host globals bound into sandboxed JavaScript, listing the given names. */
+  readonly globals: (names?: readonly string[]) => string
   /** The fetch capability inside sandboxed JavaScript. */
   readonly fetch: string
   /** Session behavior with the default per-exec cwd/env reset. */
@@ -276,6 +302,30 @@ export declare const prompts: {
   /** Session behavior when `persistSession` is enabled. */
   readonly sessionPersistent: string
 }
+
+/**
+ * Compiles the embedded QuickJS module and returns the machine-code artifact.
+ * The native package already embeds one for its platform, so this is for
+ * producing an artifact yourself — for another machine, or to share one across
+ * processes. It is tied to this package's Wasmtime version and to the target
+ * CPU features, so treat it as a build output.
+ */
+export declare function precompileJs(): Buffer
+
+/**
+ * Installs a `precompileJs` artifact as this process's JavaScript runtime, in
+ * place of the embedded one. Call it before the first `js` command; a second
+ * call, or a stale or foreign artifact, throws and leaves the embedded runtime
+ * in place.
+ */
+export declare function usePrecompiledJs(artifact: Buffer | Uint8Array): void
+
+/**
+ * Reports where this process's JavaScript machine code came from:
+ * `'precompiled'` when it was loaded from an artifact, `'compiled'` when this
+ * process had to compile the module itself.
+ */
+export declare function jsRuntimeSource(): 'precompiled' | 'compiled'
 
 export declare function runConformance(
   vfsFactory: (quota: VfsQuota) => JsVfs | Promise<JsVfs>
