@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tinysandbox::sandbox::{FetchRequest, FetchResponse, HostError, Limits, Sandbox};
+use tinysandbox::sandbox::{FetchRequest, FetchResponse, HostError, JsGlobals, Limits, Sandbox};
 use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
 
 #[tokio::test]
@@ -1790,4 +1790,104 @@ fn read_vfs_file(vfs: &dyn Vfs, path: &str) -> Vec<u8> {
     }
     vfs.close(handle).expect("close copied file");
     out
+}
+
+#[tokio::test]
+async fn js_globals_change_between_commands() {
+    // The registry is snapshotted per command, so mutations land on the next
+    // one without rebuilding the sandbox.
+    let sandbox = Sandbox::builder()
+        .js_global("tools.a", |_args| async { Ok(json!("a")) })
+        .build();
+    let list = "js -e 'console.log(typeof tools === \"undefined\" ? \"none\" : Object.keys(tools).join(\",\"), typeof search)'";
+
+    let before = sandbox.exec(list).await;
+    assert_eq!(before.stdout, "a undefined\n");
+
+    sandbox
+        .set_js_global("tools.b", |_args| async { Ok(json!("b")) })
+        .expect("set tools.b");
+    let added = sandbox.exec(list).await;
+    assert_eq!(added.stdout, "a,b undefined\n");
+
+    assert!(sandbox.remove_js_global("tools.a"));
+    assert!(!sandbox.remove_js_global("tools.a"));
+    let removed = sandbox.exec(list).await;
+    assert_eq!(removed.stdout, "b undefined\n");
+
+    sandbox
+        .replace_js_globals(JsGlobals::new().with("search", |_args| async { Ok(json!("hit")) }))
+        .expect("replace globals");
+    let replaced = sandbox.exec(list).await;
+    assert_eq!(replaced.stdout, "none function\n");
+    assert_eq!(sandbox.js_global_names(), vec!["search".to_owned()]);
+}
+
+#[tokio::test]
+async fn js_global_mutations_validate_without_disturbing_the_live_set() {
+    // The live API reports the same rules the builder panics on, and a rejected
+    // set leaves the sandbox exactly as it was.
+    let sandbox = Sandbox::builder()
+        .js_global("tools.a", |_args| async { Ok(Value::Null) })
+        .build();
+
+    for name in ["", "bad-name", "a..b", "console", "process.exit"] {
+        assert!(
+            sandbox
+                .set_js_global(name, |_args| async { Ok(Value::Null) })
+                .is_err(),
+            "{name:?} should be rejected"
+        );
+    }
+    assert!(
+        sandbox
+            .set_js_global("tools", |_args| async { Ok(Value::Null) })
+            .is_err(),
+        "a namespace already in use should be rejected"
+    );
+
+    let rejected = sandbox.replace_js_globals(
+        JsGlobals::new()
+            .with("fine", |_args| async { Ok(Value::Null) })
+            .with("console", |_args| async { Ok(Value::Null) }),
+    );
+    assert!(rejected.is_err());
+    assert_eq!(sandbox.js_global_names(), vec!["tools.a".to_owned()]);
+
+    // Setting an existing name replaces its handler rather than conflicting.
+    sandbox
+        .set_js_global("tools.a", |_args| async { Ok(json!("second")) })
+        .expect("replace handler");
+    let result = sandbox.exec("js -e 'console.log(tools.a())'").await;
+    assert_eq!(result.stdout, "second\n");
+}
+
+#[tokio::test]
+async fn js_global_removal_does_not_disturb_a_running_command() {
+    // A command holds the snapshot it started with: a global removed while a
+    // script runs stays callable for the rest of that run.
+    let sandbox = Arc::new(
+        Sandbox::builder()
+            .js_global("slow", |_args| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(json!("ok"))
+            })
+            .build(),
+    );
+
+    let running = tokio::spawn({
+        let sandbox = Arc::clone(&sandbox);
+        async move { sandbox.exec("js -e 'console.log(slow(), slow())'").await }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(sandbox.remove_js_global("slow"));
+
+    let result = running.await.expect("exec task");
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "ok ok\n");
+
+    // The next command sees the removal.
+    let after = sandbox.exec("js -e 'console.log(typeof slow)'").await;
+    assert_eq!(after.stdout, "undefined\n");
 }

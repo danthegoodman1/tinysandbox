@@ -49,3 +49,7 @@ required-features = ["js"]
 [[example]]
 name = "js_precompiled"
 required-features = ["js"]
+
+[[example]]
+name = "js_dynamic_globals"
+required-features = ["js"]

@@ -66,6 +66,86 @@ where
     }
 }
 
+/// Error from registering host globals on a live sandbox.
+///
+/// The builder validates the same rules eagerly and panics instead, because a
+/// statically declared global surface should fail at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsGlobalError {
+    message: String,
+}
+
+impl JsGlobalError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for JsGlobalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JsGlobalError {}
+
+/// A set of host globals to bind in one swap.
+///
+/// Build the set for a turn, then hand it to
+/// [`Sandbox::replace_js_globals`](crate::sandbox::Sandbox::replace_js_globals);
+/// the whole set is validated before it replaces the live one, so a rejected
+/// set never lands halfway.
+#[derive(Default)]
+pub struct JsGlobals {
+    pub(crate) entries: Vec<(String, std::sync::Arc<dyn JsGlobal>)>,
+}
+
+impl JsGlobals {
+    /// Creates an empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a host function at a dotted global path.
+    #[must_use]
+    pub fn with<F, Fut>(mut self, name: impl Into<String>, global: F) -> Self
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value, HostError>> + Send + 'static,
+    {
+        self.entries
+            .push((name.into(), std::sync::Arc::new(global)));
+        self
+    }
+
+    /// Reports whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns how many globals the set holds.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl std::fmt::Debug for JsGlobals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsGlobals")
+            .field(
+                "names",
+                &self
+                    .entries
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
 /// Error returned by an embedder host global or fetch handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostError {

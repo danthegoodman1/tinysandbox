@@ -5,6 +5,11 @@
 //! resident memory. A build step can pay that instead: `precompile` returns the
 //! machine code, and `use_precompiled` loads it in later processes.
 //!
+//! The artifact is the compiled QuickJS interpreter, nothing else. Host
+//! globals are per-command configuration, not part of the module, so one
+//! artifact serves every sandbox and every tool surface in the process — the
+//! `run` half below binds globals to show that.
+//!
 //! Run with: cargo run --example js_precompiled
 //!
 //! With no arguments the example writes an artifact to the system temp
@@ -20,6 +25,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+use serde_json::json;
 use tinysandbox::sandbox::Sandbox;
 
 #[tokio::main]
@@ -75,15 +81,23 @@ async fn run(path: PathBuf) {
         Err(err) => println!("run: no artifact at {}: {err}", path.display()),
     }
 
-    let sandbox = Sandbox::builder().build();
+    // Host globals are unaffected by where the machine code came from: they
+    // are installed per command from the sandbox's registry.
+    let sandbox = Sandbox::builder()
+        .js_global("whoami", |_args| async { Ok(json!("agent-1")) })
+        .js_global("tools.answer", |_args| async { Ok(json!(42)) })
+        .build();
     let started = Instant::now();
-    let result = sandbox.exec("js -e 'console.log(6 * 7)'").await;
+    let result = sandbox
+        .exec("js -e 'console.log(whoami(), tools.answer())'")
+        .await;
     println!(
         "run: first js exec took {} ms -> {}",
         started.elapsed().as_millis(),
         result.stdout.trim_end()
     );
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "agent-1 42\n");
 }
 
 fn path_arg(args: &[String], fallback: PathBuf) -> PathBuf {

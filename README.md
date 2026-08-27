@@ -61,6 +61,7 @@ console.assert(result.stdout === '1\n')
   - [TypeScript](#typescript-4)
 - [JavaScript host capabilities](#javascript-host-capabilities)
   - [Host globals](#host-globals)
+  - [Changing globals between commands](#changing-globals-between-commands)
   - [JavaScript prelude](#javascript-prelude)
   - [Fetch](#fetch)
 - [Filesystem backends](#filesystem-backends)
@@ -486,6 +487,56 @@ If a handler throws or returns an error, sandboxed JS receives a normal
 `Error`. A string `code` property on the thrown error is copied to
 `err.code`. Returned values must be JSON values; non-JSON-serializable Node
 returns fail the call.
+
+### Changing globals between commands
+
+`SandboxBuilder::js_global` fixes the surface when the sandbox is built. A live
+sandbox can also change it, which is what an agent loop wants when each turn
+grants a different set of tools:
+
+```rust no_run
+use serde_json::json;
+use tinysandbox::sandbox::{JsGlobals, Sandbox};
+
+#[tokio::main]
+async fn main() {
+    let sandbox = Sandbox::builder().build();
+
+    // One swap, validated as a whole.
+    sandbox
+        .replace_js_globals(
+            JsGlobals::new()
+                .with("tools.search", |_args| async { Ok(json!({ "hits": [] })) })
+                .with("tools.read_doc", |_args| async { Ok(json!("doc body")) }),
+        )
+        .expect("grant this turn's tools");
+
+    // Or one name at a time.
+    sandbox
+        .set_js_global("whoami", |_args| async { Ok(json!("agent-1")) })
+        .expect("bind whoami");
+    assert!(sandbox.remove_js_global("whoami"));
+    assert_eq!(sandbox.js_global_names().len(), 2);
+}
+```
+
+Every `js` command snapshots the registry when it starts, which fixes what the
+change is visible to:
+
+- A command already running keeps the set it started with, so a script never
+  sees a global appear or vanish mid-run, and a handler already executing is not
+  cancelled by removing its name.
+- The snapshot is taken per command, not per `exec`, so in `js a.js && js b.js`
+  a change landing between the two is invisible to the first and visible to the
+  second.
+- `replace_js_globals` validates the whole set before it lands; a rejected set
+  leaves the live globals untouched. `set_js_global` and `remove_js_global` are
+  each one swap, so a remove-then-add pair has a window in between where a
+  command would see neither. Use `replace_js_globals` when the set must change
+  together.
+
+These are Rust-side APIs. The TypeScript binding takes `globals` when the
+sandbox is constructed.
 
 ### JavaScript prelude
 
@@ -1238,6 +1289,7 @@ Runnable with `cargo run --example <name>`:
   command and composing it with builtins
 - [`js_scripts`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_scripts.rs) — multi-file JS with `require`,
   the `fs` API, and a look at limits and metrics
+- [`js_dynamic_globals`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_dynamic_globals.rs) — changing the host global surface between commands
 - [`js_precompiled`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_precompiled.rs) — precompiling the QuickJS module and loading it in a later process
 - [`js_globals`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_globals.rs) — host globals,
   prelude wrappers, and embedder-backed fetch

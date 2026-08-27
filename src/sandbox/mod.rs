@@ -32,7 +32,7 @@ use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,8 @@ pub use command::{
 };
 #[cfg(feature = "js")]
 pub use host::{
-    Fetch, FetchFuture, FetchRequest, FetchResponse, HostError, JsGlobal, JsGlobalFuture,
+    Fetch, FetchFuture, FetchRequest, FetchResponse, HostError, JsGlobal, JsGlobalError,
+    JsGlobalFuture, JsGlobals,
 };
 
 const PIPE_CAPACITY_BYTES: usize = STREAM_CHUNK_BYTES;
@@ -115,7 +116,7 @@ pub struct Sandbox {
     commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
     command_names: Arc<BTreeSet<String>>,
     #[cfg(feature = "js")]
-    js_globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
+    js_globals: RwLock<Arc<BTreeMap<String, Arc<dyn JsGlobal>>>>,
     #[cfg(feature = "js")]
     fetch: Option<Arc<dyn Fetch>>,
     #[cfg(feature = "js")]
@@ -161,6 +162,86 @@ impl Sandbox {
             Arc::clone(&self.command_names),
             session.cwd.clone(),
         )
+    }
+
+    /// Binds a host function at a dotted global path, replacing any global
+    /// already registered under that exact name.
+    ///
+    /// The change is visible to `js` commands whose registry snapshot is taken
+    /// after this returns. A command already running keeps the set it started
+    /// with, so a script never sees a global appear or vanish mid-run.
+    #[cfg(feature = "js")]
+    pub fn set_js_global<F, Fut>(
+        &self,
+        name: impl Into<String>,
+        global: F,
+    ) -> Result<(), JsGlobalError>
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
+    {
+        let name = name.into();
+        check_js_global_name(&name)?;
+        let mut globals = self.js_globals_snapshot().as_ref().clone();
+        globals.remove(&name);
+        if let Some(other) = globals.keys().find(|other| paths_conflict(other, &name)) {
+            return Err(JsGlobalError::new(format!(
+                "cannot register '{name}'; it conflicts with '{other}'"
+            )));
+        }
+        globals.insert(name, Arc::new(global));
+        self.store_js_globals(globals);
+        Ok(())
+    }
+
+    /// Removes a host global, reporting whether it was registered.
+    ///
+    /// Commands already running keep calling it; the removal applies to
+    /// snapshots taken afterwards. A handler mid-flight is not cancelled.
+    #[cfg(feature = "js")]
+    pub fn remove_js_global(&self, name: &str) -> bool {
+        let mut globals = self.js_globals_snapshot().as_ref().clone();
+        let removed = globals.remove(name).is_some();
+        if removed {
+            self.store_js_globals(globals);
+        }
+        removed
+    }
+
+    /// Replaces every host global with the given set in one swap.
+    ///
+    /// The set is validated as a whole first, so a rejected set leaves the live
+    /// globals untouched rather than landing halfway. This is the call for a
+    /// per-turn tool surface.
+    #[cfg(feature = "js")]
+    pub fn replace_js_globals(&self, globals: JsGlobals) -> Result<(), JsGlobalError> {
+        let globals = validate_js_global_registry(globals.entries)?;
+        self.store_js_globals(globals);
+        Ok(())
+    }
+
+    /// Returns the names currently bound as host globals, in sorted order.
+    #[cfg(feature = "js")]
+    pub fn js_global_names(&self) -> Vec<String> {
+        self.js_globals_snapshot().keys().cloned().collect()
+    }
+
+    #[cfg(feature = "js")]
+    fn js_globals_snapshot(&self) -> Arc<BTreeMap<String, Arc<dyn JsGlobal>>> {
+        Arc::clone(
+            &self
+                .js_globals
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    #[cfg(feature = "js")]
+    fn store_js_globals(&self, globals: BTreeMap<String, Arc<dyn JsGlobal>>) {
+        *self
+            .js_globals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(globals);
     }
 
     /// Returns aggregate sandbox statistics.
@@ -467,7 +548,7 @@ impl Sandbox {
                 limits: self.limits,
                 commands: Arc::clone(&self.command_names),
                 #[cfg(feature = "js")]
-                js_globals: Arc::clone(&self.js_globals),
+                js_globals: self.js_globals_snapshot(),
                 #[cfg(feature = "js")]
                 js_fetch: self.fetch.clone(),
                 #[cfg(feature = "js")]
@@ -539,7 +620,7 @@ impl Sandbox {
                     limits: self.limits,
                     commands: Arc::clone(&self.command_names),
                     #[cfg(feature = "js")]
-                    js_globals: Arc::clone(&self.js_globals),
+                    js_globals: self.js_globals_snapshot(),
                     #[cfg(feature = "js")]
                     js_fetch: self.fetch.clone(),
                     #[cfg(feature = "js")]
@@ -575,7 +656,7 @@ impl Sandbox {
             limits: self.limits,
             commands: Arc::clone(&self.command_names),
             #[cfg(feature = "js")]
-            js_globals: Arc::clone(&self.js_globals),
+            js_globals: self.js_globals_snapshot(),
             #[cfg(feature = "js")]
             js_fetch: self.fetch.clone(),
             #[cfg(feature = "js")]
@@ -939,7 +1020,7 @@ impl SandboxBuilder {
             commands: Arc::new(self.commands),
             command_names,
             #[cfg(feature = "js")]
-            js_globals,
+            js_globals: RwLock::new(js_globals),
             #[cfg(feature = "js")]
             fetch: self.fetch,
             #[cfg(feature = "js")]
@@ -1961,29 +2042,47 @@ const RESERVED_JS_GLOBALS: &[&str] = &[
 fn build_js_global_registry(
     entries: Vec<(String, Arc<dyn JsGlobal>)>,
 ) -> BTreeMap<String, Arc<dyn JsGlobal>> {
+    validate_js_global_registry(entries)
+        .unwrap_or_else(|err| panic!("SandboxBuilder::js_global {err}"))
+}
+
+/// Validates a whole global surface, so a rejected set never lands halfway.
+#[cfg(feature = "js")]
+fn validate_js_global_registry(
+    entries: Vec<(String, Arc<dyn JsGlobal>)>,
+) -> Result<BTreeMap<String, Arc<dyn JsGlobal>>, JsGlobalError> {
     let mut globals: BTreeMap<String, Arc<dyn JsGlobal>> = BTreeMap::new();
     for (name, global) in entries {
-        if !is_js_global_name(&name) {
-            panic!(
-                "SandboxBuilder::js_global cannot register invalid name '{name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments"
-            );
-        }
-        let root = name.split('.').next().unwrap_or(&name);
-        if RESERVED_JS_GLOBALS.contains(&root) {
-            panic!(
-                "SandboxBuilder::js_global cannot register reserved name '{name}'; '{root}' is provided by the JavaScript runtime"
-            );
+        check_js_global_name(&name)?;
+        if globals.contains_key(&name) {
+            return Err(JsGlobalError::new(format!(
+                "cannot register duplicate name '{name}'"
+            )));
         }
         if let Some(other) = globals.keys().find(|other| paths_conflict(other, &name)) {
-            panic!(
-                "SandboxBuilder::js_global cannot register '{name}'; it conflicts with '{other}'"
-            );
+            return Err(JsGlobalError::new(format!(
+                "cannot register '{name}'; it conflicts with '{other}'"
+            )));
         }
-        if globals.insert(name.clone(), global).is_some() {
-            panic!("SandboxBuilder::js_global cannot register duplicate name '{name}'");
-        }
+        globals.insert(name, global);
     }
-    globals
+    Ok(globals)
+}
+
+#[cfg(feature = "js")]
+fn check_js_global_name(name: &str) -> Result<(), JsGlobalError> {
+    if !is_js_global_name(name) {
+        return Err(JsGlobalError::new(format!(
+            "cannot register invalid name '{name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments"
+        )));
+    }
+    let root = name.split('.').next().unwrap_or(name);
+    if RESERVED_JS_GLOBALS.contains(&root) {
+        return Err(JsGlobalError::new(format!(
+            "cannot register reserved name '{name}'; '{root}' is provided by the JavaScript runtime"
+        )));
+    }
+    Ok(())
 }
 
 /// Reports whether one global path is the other or a namespace inside it, so
