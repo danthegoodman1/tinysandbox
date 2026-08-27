@@ -25,7 +25,7 @@ console.log(result.stdout)
 - Static top-level filesystem mounts backed by memory, local directories, S3, or JavaScript VFS adapters. The default is an in-memory `/workspace`. `ls /` lists every mount plus `/bin`.
 - Local directory mounts (Unix only) with strict path containment and per-mount quotas. Usage can be rebaselined with `sandbox.refreshLocalVfs(mount)` or `sandbox.setLocalVfsUsage(mount, usage)`.
 - S3 mounts that expose bucket/key prefixes, perform bounded range reads instead of downloading whole objects, and write back through staged object operations.
-- A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`; expose JS-facing custom host functionality as syscalls.
+- A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`; expose JS-facing custom host functionality as host globals.
 - Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes and JSON nesting are capped before evaluation, and the jq filter program text (not input data) is capped on size, nesting, and syntax complexity; jq filter evaluation has the limitations documented in the repository README.
 
 ## S3 filesystem

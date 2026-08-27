@@ -43,5 +43,9 @@ name = "js_scripts"
 required-features = ["js"]
 
 [[example]]
-name = "js_syscalls"
+name = "js_globals"
+required-features = ["js"]
+
+[[example]]
+name = "js_precompiled"
 required-features = ["js"]

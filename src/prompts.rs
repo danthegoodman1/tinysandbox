@@ -18,8 +18,8 @@
 //! # assert!(system_prompt.contains("bash"));
 //! ```
 //!
-//! Skip [`JS`] when the `js` feature is disabled, [`SYSCALLS`] when no
-//! syscalls are registered, and [`FETCH`] when no fetch handler is set.
+//! Skip [`JS`] when the `js` feature is disabled and [`FETCH`] when no fetch
+//! handler is set. Add [`globals()`] when host globals are registered.
 //! Include exactly one of [`SESSION_EPHEMERAL`] or [`SESSION_PERSISTENT`]
 //! depending on the builder's `persist_session` setting.
 
@@ -45,9 +45,34 @@ pub const JS: &str = "`js script.js [args...]` and `js -e 'code'` run JavaScript
 - `console`, `process.argv/env/cwd()/exit()`, `Buffer`, `__filename`, `__dirname`.
 There are no timers and no event loop: only already-settled promise callbacks run before exit. Scripts run under memory and CPU limits; an infinite loop exits with code 124.";
 
-/// Host syscalls exposed to sandboxed JavaScript. Include only when syscalls
-/// are registered.
-pub const SYSCALLS: &str = "Inside `js`, host-provided functions are available as synchronous `sandbox.<name>(args)` calls that take and return one JSON value. `Object.keys(sandbox)` lists them. Failures throw a normal `Error`, with `err.code` set when the host provides one.";
+/// Host functions bound into the sandboxed JavaScript global scope. Pass the
+/// names registered with
+/// [`SandboxBuilder::js_global`](crate::sandbox::SandboxBuilder::js_global) so
+/// the model knows what it can call.
+///
+/// ```
+/// let chunk = tinysandbox::prompts::globals(["search", "tools.query"]);
+/// assert!(chunk.contains("`tools.query(args)`"));
+/// ```
+pub fn globals<I, S>(names: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let list = names
+        .into_iter()
+        .map(|name| format!("`{}(args)`", name.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bound = if list.is_empty() {
+        String::new()
+    } else {
+        format!(" The bound names are {list}.")
+    };
+    format!(
+        "Inside `js`, host-provided functions are bound as globals you call synchronously; each takes and returns one JSON value.{bound} Failures throw a normal `Error`, with `err.code` set when the host provides one."
+    )
+}
 
 /// The `fetch` capability inside sandboxed JavaScript. Include only when a
 /// fetch handler is registered.

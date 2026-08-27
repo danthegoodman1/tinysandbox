@@ -21,8 +21,8 @@ function normalizeOptions(options) {
   const normalized = { ...options }
   if (options.commands) normalized.commands = wrapCommands(options.commands)
   else delete normalized.commands
-  if (options.syscalls) normalized.syscalls = wrapSyscalls(options.syscalls)
-  else delete normalized.syscalls
+  if (options.globals) normalized.globals = wrapGlobals(options.globals)
+  else delete normalized.globals
   if (options.fetch) normalized.fetch = wrapFetch(options.fetch)
   else delete normalized.fetch
   if (options.mounts) normalized.mounts = wrapMounts(options.mounts)
@@ -58,16 +58,16 @@ function wrapCommands(commands) {
   )
 }
 
-function wrapSyscalls(syscalls) {
+function wrapGlobals(globals) {
   return Object.fromEntries(
-    Object.entries(syscalls).map(([name, syscall]) => {
-      validateSyscallName(name)
-      if (typeof syscall !== 'function') throw new TypeError(`syscall '${name}' must be a function`)
+    Object.entries(globals).map(([name, global]) => {
+      validateGlobalName(name)
+      if (typeof global !== 'function') throw new TypeError(`global '${name}' must be a function`)
       return [
         name,
         async (args) => {
           try {
-            return { value: normalizeJsonValue(await syscall(firstArgument(args))) }
+            return { value: normalizeJsonValue(await global(firstArgument(args))) }
           } catch (err) {
             return { error: callbackErrorPayload(err) }
           }
@@ -126,12 +126,31 @@ function firstArgument(value) {
   return value && typeof value === 'object' && Object.hasOwn(value, '0') ? value[0] : value
 }
 
-function validateSyscallName(name) {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    throw new TypeError(`invalid syscall name '${name}'; names must match [A-Za-z_][A-Za-z0-9_]*`)
+// Mirrors RESERVED_JS_GLOBALS in the Rust crate.
+const reservedGlobals = new Set([
+  'Buffer',
+  'Headers',
+  'Response',
+  '__dirname',
+  '__filename',
+  'console',
+  'exports',
+  'fetch',
+  'globalThis',
+  'module',
+  'process',
+  'require'
+])
+
+function validateGlobalName(name) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(name)) {
+    throw new TypeError(
+      `invalid global name '${name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments`
+    )
   }
-  if (name === 'fetch') {
-    throw new TypeError("reserved syscall name 'fetch'; use the fetch option")
+  const [root] = name.split('.')
+  if (reservedGlobals.has(root)) {
+    throw new TypeError(`reserved global name '${name}'; '${root}' is provided by the JavaScript runtime`)
   }
 }
 
@@ -145,10 +164,10 @@ function validateJsonValue(value, seen) {
   if (typeof value === 'string' || typeof value === 'boolean') return
   if (typeof value === 'number') {
     if (Number.isFinite(value)) return
-    throw new TypeError('syscall return value must contain only finite numbers')
+    throw new TypeError('host global return value must contain only finite numbers')
   }
   if (Array.isArray(value)) {
-    if (seen.has(value)) throw new TypeError('syscall return value must not contain cycles')
+    if (seen.has(value)) throw new TypeError('host global return value must not contain cycles')
     seen.add(value)
     for (const item of value) validateJsonValue(item, seen)
     seen.delete(value)
@@ -157,15 +176,15 @@ function validateJsonValue(value, seen) {
   if (typeof value === 'object') {
     const proto = Object.getPrototypeOf(value)
     if (proto !== Object.prototype && proto !== null) {
-      throw new TypeError('syscall return value must contain only JSON objects, arrays, and scalars')
+      throw new TypeError('host global return value must contain only JSON objects, arrays, and scalars')
     }
-    if (seen.has(value)) throw new TypeError('syscall return value must not contain cycles')
+    if (seen.has(value)) throw new TypeError('host global return value must not contain cycles')
     seen.add(value)
     for (const item of Object.values(value)) validateJsonValue(item, seen)
     seen.delete(value)
     return
   }
-  throw new TypeError('syscall return value must be JSON-serializable')
+  throw new TypeError('host global return value must be JSON-serializable')
 }
 
 function normalizeFetchRequest(request) {
@@ -360,12 +379,14 @@ const prompts = Object.freeze({
   builtins: native.PROMPT_BUILTINS,
   jq: native.PROMPT_JQ,
   js: native.PROMPT_JS,
-  syscalls: native.PROMPT_SYSCALLS,
+  globals: (names = []) => native.promptGlobals([...names]),
   fetch: native.PROMPT_FETCH,
   sessionEphemeral: native.PROMPT_SESSION_EPHEMERAL,
   sessionPersistent: native.PROMPT_SESSION_PERSISTENT
 })
 
+exports.precompileJs = () => native.precompileJs()
+exports.usePrecompiledJs = (artifact) => native.usePrecompiledJs(artifact)
 exports.NativeSandbox = native.NativeSandbox
 exports.SandboxFs = SandboxFs
 exports.Sandbox = Sandbox

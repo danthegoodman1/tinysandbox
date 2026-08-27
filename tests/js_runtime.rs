@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tinysandbox::sandbox::{FetchRequest, FetchResponse, Limits, Sandbox, SyscallError};
+use tinysandbox::sandbox::{FetchRequest, FetchResponse, HostError, Limits, Sandbox};
 use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
 
 #[tokio::test]
@@ -51,19 +51,17 @@ async fn js_usage_errors_report_message_and_status() {
 }
 
 #[tokio::test]
-async fn js_syscall_is_callable_from_guest() {
-    // Verifies the generated `sandbox.<name>` binding calls the host handler and
-    // returns its JSON value to the script.
+async fn js_global_is_callable_from_guest() {
+    // Verifies the generated global binding calls the host handler and returns
+    // its JSON value to the script.
     let sandbox = Sandbox::builder()
-        .syscall("echo", |args| async move {
+        .js_global("echo", |args| async move {
             Ok(json!({ "seen": args["value"].clone(), "ok": true }))
         })
         .build();
 
     let result = sandbox
-        .exec(
-            "js -e 'const out = sandbox.echo({ value: \"hello\" }); console.log(out.seen, out.ok)'",
-        )
+        .exec("js -e 'const out = echo({ value: \"hello\" }); console.log(out.seen, out.ok)'")
         .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -71,11 +69,11 @@ async fn js_syscall_is_callable_from_guest() {
 }
 
 #[tokio::test]
-async fn js_syscall_json_values_round_trip_faithfully() {
+async fn js_global_json_values_round_trip_faithfully() {
     // Nested objects, arrays, unicode, nulls, booleans, and numeric values must
     // survive both guest-to-host and host-to-guest serialization.
     let sandbox = Sandbox::builder()
-        .syscall("roundTrip", |args| async move {
+        .js_global("roundTrip", |args| async move {
             Ok(json!({
                 "received": args,
                 "unicode": "hello λ 🙂",
@@ -85,7 +83,7 @@ async fn js_syscall_json_values_round_trip_faithfully() {
         })
         .build();
     let script = r#"
-const value = sandbox.roundTrip({
+const value = roundTrip({
   text: 'hi λ 🙂',
   list: [1, 2.5, { deep: true }],
   nothing: null
@@ -115,17 +113,17 @@ console.log(JSON.stringify(value))
 }
 
 #[tokio::test]
-async fn js_syscall_arguments_preserve_undefined_and_scalars() {
+async fn js_global_arguments_preserve_undefined_and_scalars() {
     // The glue maps an omitted argument to JSON null while preserving scalar
     // argument values without wrapping them in an object.
     let sandbox = Sandbox::builder()
-        .syscall("echo", |args| async move { Ok(args) })
+        .js_global("echo", |args| async move { Ok(args) })
         .build();
     let script = r#"
 console.log(JSON.stringify([
-  sandbox.echo(),
-  sandbox.echo(42),
-  sandbox.echo('s')
+  echo(),
+  echo(42),
+  echo('s')
 ]))
 "#;
 
@@ -139,17 +137,17 @@ console.log(JSON.stringify([
 }
 
 #[tokio::test]
-async fn js_syscall_error_is_catchable_with_code() {
+async fn js_global_error_is_catchable_with_code() {
     // Handler errors become ordinary guest Error objects with message and
     // optional code fields.
     let sandbox = Sandbox::builder()
-        .syscall("fail", |_args| async {
-            Err(SyscallError::new("access denied").with_code("E_DENIED"))
+        .js_global("fail", |_args| async {
+            Err(HostError::new("access denied").with_code("E_DENIED"))
         })
         .build();
     let script = r#"
 try {
-  sandbox.fail({ id: 1 })
+  fail({ id: 1 })
 } catch (err) {
   console.log(err.message)
   console.log(err.code)
@@ -165,16 +163,16 @@ try {
 }
 
 #[tokio::test]
-async fn js_syscall_handlers_use_embedder_runtime_and_wall_timeout() {
-    // A timer-backed handler proves syscalls run on the embedder runtime; a
+async fn js_global_handlers_use_embedder_runtime_and_wall_timeout() {
+    // A timer-backed handler proves globals run on the embedder runtime; a
     // pending handler must return a guest-visible timeout error.
     let timed = Sandbox::builder()
-        .syscall("delay", |_args| async {
+        .js_global("delay", |_args| async {
             tokio::time::sleep(Duration::from_millis(1)).await;
             Ok(json!("done"))
         })
         .build()
-        .exec("js -e 'console.log(sandbox.delay())'")
+        .exec("js -e 'console.log(delay())'")
         .await;
     assert_eq!(timed.exit_code, 0, "stderr: {}", timed.stderr);
     assert_eq!(timed.stdout, "done\n");
@@ -184,18 +182,18 @@ async fn js_syscall_handlers_use_embedder_runtime_and_wall_timeout() {
             wall_time: Duration::from_millis(500),
             ..Limits::default()
         })
-        .syscall("hang", |_args| async {
-            std::future::pending::<Result<Value, SyscallError>>().await
+        .js_global("hang", |_args| async {
+            std::future::pending::<Result<Value, HostError>>().await
         })
         .build();
     let start = Instant::now();
     let result = sandbox
-        .exec("js -e 'try { sandbox.hang() } catch (err) { console.log(err.message) }'")
+        .exec("js -e 'try { hang() } catch (err) { console.log(err.message) }'")
         .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert!(start.elapsed() < Duration::from_secs(2));
-    assert_eq!(result.stdout, "syscall 'hang' timed out\n");
+    assert_eq!(result.stdout, "global 'hang' timed out\n");
 }
 
 #[tokio::test]
@@ -349,7 +347,7 @@ async fn js_fetch_handler_error_rejects_with_fetch_failed_cause() {
     // Handler errors follow undici's catchable TypeError shape and preserve the
     // host error message on `cause`.
     let sandbox = Sandbox::builder()
-        .fetch(|_request| async { Err(SyscallError::new("upstream unavailable")) })
+        .fetch(|_request| async { Err(HostError::new("upstream unavailable")) })
         .build();
     let script = r#"
 (async () => {
@@ -383,7 +381,7 @@ async fn js_fetch_hanging_handler_rejects_before_command_timeout() {
             ..Limits::default()
         })
         .fetch(|_request| async {
-            std::future::pending::<Result<FetchResponse, SyscallError>>().await
+            std::future::pending::<Result<FetchResponse, HostError>>().await
         })
         .build();
     let start = Instant::now();
@@ -658,13 +656,13 @@ Promise.resolve().then(() => {
 
 #[tokio::test]
 async fn js_internal_host_globals_are_hidden_from_guest() {
-    // The generated syscall namespace is visible, but the raw host ABI and
-    // config object are not guest capabilities.
+    // Bound globals are visible, but the raw host ABI and config object are not
+    // guest capabilities.
     let sandbox = Sandbox::builder()
-        .syscall("known", |_args| async { Ok(Value::Null) })
+        .js_global("known", |_args| async { Ok(Value::Null) })
         .build();
     let script = r#"
-console.log(Object.keys(sandbox).join(','))
+console.log(typeof known)
 console.log([
   '__tinysandbox_host_call',
   '__tinysandbox_stdout',
@@ -682,19 +680,21 @@ console.log([
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(
         result.stdout,
-        "known\nundefined,undefined,undefined,undefined,undefined,undefined\n"
+        "function\nundefined,undefined,undefined,undefined,undefined,undefined\n"
     );
 }
 
 #[tokio::test]
-async fn js_without_syscalls_has_no_sandbox_global() {
+async fn js_without_globals_leaves_global_scope_unchanged() {
     // Keeps the baseline guest global surface unchanged when the embedder did
-    // not opt in to any syscalls.
+    // not bind any host globals.
     let sandbox = Sandbox::builder().build();
-    let result = sandbox.exec("js -e 'console.log(typeof sandbox)'").await;
+    let result = sandbox
+        .exec("js -e 'console.log(typeof search, typeof tools)'")
+        .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
-    assert_eq!(result.stdout, "undefined\n");
+    assert_eq!(result.stdout, "undefined undefined\n");
 }
 
 #[tokio::test]
@@ -710,17 +710,17 @@ async fn js_prelude_defines_global_visible_to_script() {
 }
 
 #[tokio::test]
-async fn js_prelude_can_wrap_syscall_and_delete_sandbox_global() {
-    // A prelude can expose a narrower wrapper, remove the generated syscall
-    // namespace, and still leave the raw host boundary hidden from the script.
+async fn js_prelude_can_wrap_and_delete_host_global() {
+    // A prelude can expose a narrower wrapper, remove the bound global, and
+    // still leave the raw host boundary hidden from the script.
     let sandbox = Sandbox::builder()
-        .syscall("secret", |args| async move { Ok(json!({ "value": args["value"].clone() })) })
+        .js_global("secret", |args| async move { Ok(json!({ "value": args["value"].clone() })) })
         .js_prelude(
-            "const secret = sandbox.secret; globalThis.callSecret = value => secret({ value }).value; delete globalThis.sandbox",
+            "const bound = globalThis.secret; globalThis.callSecret = value => bound({ value }).value; delete globalThis.secret",
         )
         .build();
     let result = sandbox
-        .exec("js -e 'console.log(callSecret(\"ok\"), typeof sandbox, typeof __tinysandbox_host_call, typeof __tinysandboxConfig)'")
+        .exec("js -e 'console.log(callSecret(\"ok\"), typeof secret, typeof __tinysandbox_host_call, typeof __tinysandboxConfig)'")
         .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -743,12 +743,12 @@ async fn js_prelude_throw_aborts_with_prelude_stack() {
 }
 
 #[test]
-fn js_syscall_names_are_validated_at_build() {
-    // Registry names become JavaScript property names generated by the host.
-    for name in ["", "1bad", "bad-name"] {
+fn js_global_names_are_validated_at_build() {
+    // Registry names become JavaScript global paths generated by the host.
+    for name in ["", "1bad", "bad-name", "a..b", "a.", ".a"] {
         let result = std::panic::catch_unwind(|| {
             Sandbox::builder()
-                .syscall(name, |_args| async { Ok(Value::Null) })
+                .js_global(name, |_args| async { Ok(Value::Null) })
                 .build()
         });
         assert!(result.is_err(), "{name:?} should be invalid");
@@ -756,20 +756,89 @@ fn js_syscall_names_are_validated_at_build() {
 
     let duplicate = std::panic::catch_unwind(|| {
         Sandbox::builder()
-            .syscall("dup", |_args| async { Ok(Value::Null) })
-            .syscall("dup", |_args| async { Ok(Value::Null) })
+            .js_global("dup", |_args| async { Ok(Value::Null) })
+            .js_global("dup", |_args| async { Ok(Value::Null) })
             .build()
     });
-    assert!(duplicate.is_err(), "duplicate syscall names should panic");
+    assert!(duplicate.is_err(), "duplicate global names should panic");
 
-    let reserved_fetch = std::panic::catch_unwind(|| {
+    for name in ["fetch", "console", "process", "require"] {
+        let reserved = std::panic::catch_unwind(|| {
+            Sandbox::builder()
+                .js_global(name, |_args| async { Ok(Value::Null) })
+                .build()
+        });
+        assert!(reserved.is_err(), "reserved name {name:?} should panic");
+    }
+
+    let reserved_namespace = std::panic::catch_unwind(|| {
         Sandbox::builder()
-            .syscall("fetch", |_args| async { Ok(Value::Null) })
+            .js_global("console.log", |_args| async { Ok(Value::Null) })
             .build()
     });
     assert!(
-        reserved_fetch.is_err(),
-        "reserved fetch syscall name should panic"
+        reserved_namespace.is_err(),
+        "a reserved root segment should panic"
+    );
+
+    let conflict = std::panic::catch_unwind(|| {
+        Sandbox::builder()
+            .js_global("tools", |_args| async { Ok(Value::Null) })
+            .js_global("tools.search", |_args| async { Ok(Value::Null) })
+            .build()
+    });
+    assert!(
+        conflict.is_err(),
+        "a name that is also a namespace should panic"
+    );
+}
+
+#[tokio::test]
+async fn js_globals_bind_bare_names_and_namespaces() {
+    // A bare name binds one global; dotted names share a generated namespace
+    // object that scripts can enumerate.
+    let sandbox = Sandbox::builder()
+        .js_global("search", |_args| async { Ok(json!("top-level")) })
+        .js_global("tools.a", |_args| async { Ok(json!("a")) })
+        .js_global("tools.b", |_args| async { Ok(json!("b")) })
+        .build();
+    let script = r#"
+console.log(search())
+console.log(tools.a(), tools.b())
+console.log(Object.keys(tools).join(','))
+"#;
+
+    let result = sandbox
+        .exec(&format!("js -e '{}'", shell_single_quote(script)))
+        .await;
+
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "top-level
+a b
+a,b
+"
+    );
+}
+
+#[tokio::test]
+async fn js_global_colliding_with_runtime_global_fails_the_run() {
+    // Names the host cannot know are reserved, such as JavaScript intrinsics,
+    // are refused by the guest instead of silently shadowing them.
+    let sandbox = Sandbox::builder()
+        .js_global("JSON.rewrite", |_args| async { Ok(Value::Null) })
+        .build();
+    let result = sandbox.exec("js -e 'console.log(1)'").await;
+
+    assert_ne!(result.exit_code, 0);
+    assert_eq!(result.stdout, "");
+    assert!(
+        result
+            .stderr
+            .contains("collides with existing global 'JSON'"),
+        "stderr: {}",
+        result.stderr
     );
 }
 

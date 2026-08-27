@@ -13,8 +13,8 @@ use napi_derive::napi;
 use serde_json::Value;
 use tinysandbox::sandbox::{
     Command, CommandContext, CommandFuture, CommandResult, ExecResult as CoreExecResult,
-    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, Limits,
-    Sandbox as CoreSandbox, SyscallError,
+    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostError, Limits,
+    Sandbox as CoreSandbox,
 };
 use tinysandbox::vfs::{
     DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
@@ -25,8 +25,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 type JsCommandCallback = Arc<
     ThreadsafeFunction<CommandCall, Promise<CommandOutput>, (CommandCall,), Status, false, true>,
 >;
-type JsSyscallCallback =
-    Arc<ThreadsafeFunction<Value, Promise<SyscallCallbackResponse>, (Value,), Status, false, true>>;
+type JsGlobalCallback = Arc<
+    ThreadsafeFunction<Value, Promise<JsGlobalCallbackResponse>, (Value,), Status, false, true>,
+>;
 type JsFetchCallback = Arc<
     ThreadsafeFunction<
         FetchRequest,
@@ -54,7 +55,24 @@ pub const PROMPT_JQ: &str = tinysandbox::prompts::JQ;
 #[napi]
 pub const PROMPT_JS: &str = tinysandbox::prompts::JS;
 #[napi]
-pub const PROMPT_SYSCALLS: &str = tinysandbox::prompts::SYSCALLS;
+pub fn prompt_globals(names: Vec<String>) -> String {
+    tinysandbox::prompts::globals(names)
+}
+
+/// Compiles the embedded QuickJS module and returns the machine-code artifact.
+#[napi]
+pub fn precompile_js() -> Result<Buffer> {
+    tinysandbox::js::precompile()
+        .map(Buffer::from)
+        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
+}
+
+/// Installs a `precompileJs` artifact as this process's JavaScript runtime.
+#[napi]
+pub fn use_precompiled_js(artifact: Buffer) -> Result<()> {
+    tinysandbox::js::use_precompiled(&artifact)
+        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
+}
 #[napi]
 pub const PROMPT_FETCH: &str = tinysandbox::prompts::FETCH;
 #[napi]
@@ -105,11 +123,11 @@ impl Sandbox {
             if let Some(persist) = get_optional::<bool>(&options, "persistSession")? {
                 builder = builder.persist_session(persist);
             }
-            if let Some(syscalls) = get_optional_object(&options, "syscalls")? {
-                for name in Object::keys(&syscalls)? {
-                    validate_syscall_name(&name)?;
-                    let callback: Function<'_, (Value,), Promise<SyscallCallbackResponse>> =
-                        syscalls.get_named_property(&name)?;
+            if let Some(globals) = get_optional_object(&options, "globals")? {
+                for name in Object::keys(&globals)? {
+                    validate_js_global_name(&name)?;
+                    let callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>> =
+                        globals.get_named_property(&name)?;
                     let callback = Arc::new(
                         callback
                             .build_threadsafe_function::<Value>()
@@ -117,9 +135,9 @@ impl Sandbox {
                             .weak::<true>()
                             .build_callback(|ctx| Ok((ctx.value,)))?,
                     );
-                    builder = builder.syscall(name, move |args| {
+                    builder = builder.js_global(name, move |args| {
                         let callback = Arc::clone(&callback);
-                        async move { call_js_syscall(callback, args).await }
+                        async move { call_js_global(callback, args).await }
                     });
                 }
             }
@@ -494,17 +512,17 @@ async fn write_command_error(
     CommandResult::failure()
 }
 
-async fn call_js_syscall(
-    callback: JsSyscallCallback,
+async fn call_js_global(
+    callback: JsGlobalCallback,
     args: Value,
-) -> std::result::Result<Value, SyscallError> {
+) -> std::result::Result<Value, HostError> {
     let promise = callback
         .call_async_catch(args)
         .await
-        .map_err(|err| SyscallError::new(err.reason))?;
-    let response = promise.await.map_err(|err| SyscallError::new(err.reason))?;
+        .map_err(|err| HostError::new(err.reason))?;
+    let response = promise.await.map_err(|err| HostError::new(err.reason))?;
     if let Some(error) = response.error {
-        return Err(syscall_error_from_callback(error));
+        return Err(host_error_from_callback(error));
     }
     Ok(response.value.unwrap_or(Value::Null))
 }
@@ -512,18 +530,18 @@ async fn call_js_syscall(
 async fn call_js_fetch(
     callback: JsFetchCallback,
     request: CoreFetchRequest,
-) -> std::result::Result<CoreFetchResponse, SyscallError> {
+) -> std::result::Result<CoreFetchResponse, HostError> {
     let promise = callback
         .call_async_catch(FetchRequest::from(request))
         .await
-        .map_err(|err| SyscallError::new(err.reason))?;
-    let response = promise.await.map_err(|err| SyscallError::new(err.reason))?;
+        .map_err(|err| HostError::new(err.reason))?;
+    let response = promise.await.map_err(|err| HostError::new(err.reason))?;
     if let Some(error) = response.error {
-        return Err(syscall_error_from_callback(error));
+        return Err(host_error_from_callback(error));
     }
     let response = response
         .response
-        .ok_or_else(|| SyscallError::new("fetch handler did not return a response"))?;
+        .ok_or_else(|| HostError::new("fetch handler did not return a response"))?;
     Ok(CoreFetchResponse {
         status: status_from_js(response.status)?,
         headers: header_pairs_from_js(response.headers.unwrap_or_default())?,
@@ -531,22 +549,22 @@ async fn call_js_fetch(
     })
 }
 
-fn syscall_error_from_callback(error: SyscallCallbackError) -> SyscallError {
+fn host_error_from_callback(error: HostCallbackError) -> HostError {
     let message = error
         .message
         .unwrap_or_else(|| "host callback failed".to_owned());
     match error.code {
-        Some(code) => SyscallError::new(message).with_code(code),
-        None => SyscallError::new(message),
+        Some(code) => HostError::new(message).with_code(code),
+        None => HostError::new(message),
     }
 }
 
-fn status_from_js(status: Option<f64>) -> std::result::Result<u16, SyscallError> {
-    let status = status.ok_or_else(|| SyscallError::new("fetch response status is required"))?;
+fn status_from_js(status: Option<f64>) -> std::result::Result<u16, HostError> {
+    let status = status.ok_or_else(|| HostError::new("fetch response status is required"))?;
     if status.is_finite() && status.fract() == 0.0 && (100.0..=599.0).contains(&status) {
         Ok(status as u16)
     } else {
-        Err(SyscallError::new(
+        Err(HostError::new(
             "fetch response status must be an integer from 100 through 599",
         ))
     }
@@ -554,12 +572,12 @@ fn status_from_js(status: Option<f64>) -> std::result::Result<u16, SyscallError>
 
 fn header_pairs_from_js(
     headers: Vec<Vec<String>>,
-) -> std::result::Result<Vec<(String, String)>, SyscallError> {
+) -> std::result::Result<Vec<(String, String)>, HostError> {
     headers
         .into_iter()
         .map(|pair| match pair.as_slice() {
             [name, value] => Ok((name.clone(), value.clone())),
-            _ => Err(SyscallError::new(
+            _ => Err(HostError::new(
                 "fetch response headers must be [name, value] pairs",
             )),
         })
@@ -909,13 +927,13 @@ pub struct CommandOutput {
 }
 
 #[napi(object)]
-pub struct SyscallCallbackResponse {
+pub struct JsGlobalCallbackResponse {
     pub value: Option<Value>,
-    pub error: Option<SyscallCallbackError>,
+    pub error: Option<HostCallbackError>,
 }
 
 #[napi(object)]
-pub struct SyscallCallbackError {
+pub struct HostCallbackError {
     pub message: Option<String>,
     pub code: Option<String>,
 }
@@ -946,7 +964,7 @@ impl From<CoreFetchRequest> for FetchRequest {
 #[napi(object)]
 pub struct FetchCallbackResponse {
     pub response: Option<FetchResponse>,
-    pub error: Option<SyscallCallbackError>,
+    pub error: Option<HostCallbackError>,
 }
 
 #[napi(object)]
@@ -1428,27 +1446,48 @@ fn quota_value(value: f64, context: &str, name: &str) -> Result<u64> {
     })
 }
 
-fn validate_syscall_name(name: &str) -> Result<()> {
-    if !is_js_syscall_name(name) {
+fn validate_js_global_name(name: &str) -> Result<()> {
+    if !is_js_global_name(name) {
         return Err(Error::new(
             Status::InvalidArg,
             format!(
-                "Sandbox constructor cannot register invalid syscall name '{name}'; names must match [A-Za-z_][A-Za-z0-9_]*"
+                "Sandbox constructor cannot register invalid global name '{name}'; names are dot-separated paths of [A-Za-z_][A-Za-z0-9_]* segments"
             ),
         ));
     }
-    if name == "fetch" {
+    let root = name.split('.').next().unwrap_or(name);
+    // Mirrors RESERVED_JS_GLOBALS in the core crate.
+    const RESERVED: &[&str] = &[
+        "Buffer",
+        "Headers",
+        "Response",
+        "__dirname",
+        "__filename",
+        "console",
+        "exports",
+        "fetch",
+        "globalThis",
+        "module",
+        "process",
+        "require",
+    ];
+    if RESERVED.contains(&root) {
         return Err(Error::new(
             Status::InvalidArg,
-            "Sandbox constructor cannot register reserved syscall name 'fetch'; use the fetch option"
-                .to_owned(),
+            format!(
+                "Sandbox constructor cannot register reserved global name '{name}'; '{root}' is provided by the JavaScript runtime"
+            ),
         ));
     }
     Ok(())
 }
 
-fn is_js_syscall_name(name: &str) -> bool {
-    let mut chars = name.chars();
+fn is_js_global_name(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(is_js_global_segment)
+}
+
+fn is_js_global_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }

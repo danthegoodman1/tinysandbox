@@ -88,7 +88,7 @@ export interface ExecResult {
 
 export interface FetchCallbackResponse {
   response?: FetchResponse
-  error?: SyscallCallbackError
+  error?: HostCallbackError
 }
 
 export interface FetchRequest {
@@ -111,6 +111,16 @@ export interface FileStat {
   isDir: boolean
 }
 
+export interface HostCallbackError {
+  message?: string
+  code?: string
+}
+
+export interface JsGlobalCallbackResponse {
+  value?: any
+  error?: HostCallbackError
+}
+
 export interface OpenModeJs {
   read?: boolean
   write?: boolean
@@ -119,6 +129,9 @@ export interface OpenModeJs {
   truncate?: boolean
   append?: boolean
 }
+
+/** Compiles the embedded QuickJS module and returns the machine-code artifact. */
+export declare function precompileJs(): Buffer
 
 export const PROMPT_BUILTINS: string
 
@@ -136,7 +149,7 @@ export const PROMPT_SESSION_PERSISTENT: string
 
 export const PROMPT_SHELL: string
 
-export const PROMPT_SYSCALLS: string
+export declare function promptGlobals(names: Array<string>): string
 
 export declare function runConformance(factory: (arg: [VfsQuotaJs]) => Promise<JsVfsHandle>): Promise<unknown>
 
@@ -145,15 +158,8 @@ export interface SandboxStats {
   vfs?: VfsStatsJs
 }
 
-export interface SyscallCallbackError {
-  message?: string
-  code?: string
-}
-
-export interface SyscallCallbackResponse {
-  value?: any
-  error?: SyscallCallbackError
-}
+/** Installs a `precompileJs` artifact as this process's JavaScript runtime. */
+export declare function usePrecompiledJs(artifact: Buffer): void
 
 export interface VfsCallbackError {
   code?: string

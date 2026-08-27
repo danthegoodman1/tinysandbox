@@ -1,14 +1,14 @@
-//! Embedder syscall interfaces for sandboxed JavaScript.
+//! Embedder host interfaces for sandboxed JavaScript.
 
 use std::future::Future;
 use std::pin::Pin;
 
 use serde_json::Value;
 
-/// Future returned by sandbox syscalls.
-pub type SyscallFuture = Pin<Box<dyn Future<Output = Result<Value, SyscallError>> + Send>>;
+/// Future returned by host globals.
+pub type JsGlobalFuture = Pin<Box<dyn Future<Output = Result<Value, HostError>> + Send>>;
 /// Future returned by sandbox fetch handlers.
-pub type FetchFuture = Pin<Box<dyn Future<Output = Result<FetchResponse, SyscallError>> + Send>>;
+pub type FetchFuture = Pin<Box<dyn Future<Output = Result<FetchResponse, HostError>> + Send>>;
 
 /// Request passed to an embedder-provided JavaScript `fetch` handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,18 +34,18 @@ pub struct FetchResponse {
     pub body: Vec<u8>,
 }
 
-/// Host syscall implementation callable from sandboxed JavaScript.
-pub trait Syscall: Send + Sync {
-    /// Runs the syscall with the guest-provided JSON argument.
-    fn call(&self, args: Value) -> SyscallFuture;
+/// Host function bound into the sandboxed JavaScript global scope.
+pub trait JsGlobal: Send + Sync {
+    /// Runs the global with the guest-provided JSON argument.
+    fn call(&self, args: Value) -> JsGlobalFuture;
 }
 
-impl<F, Fut> Syscall for F
+impl<F, Fut> JsGlobal for F
 where
     F: Fn(Value) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<Value, SyscallError>> + Send + 'static,
+    Fut: Future<Output = Result<Value, HostError>> + Send + 'static,
 {
-    fn call(&self, args: Value) -> SyscallFuture {
+    fn call(&self, args: Value) -> JsGlobalFuture {
         Box::pin(self(args))
     }
 }
@@ -59,24 +59,24 @@ pub trait Fetch: Send + Sync {
 impl<F, Fut> Fetch for F
 where
     F: Fn(FetchRequest) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<FetchResponse, SyscallError>> + Send + 'static,
+    Fut: Future<Output = Result<FetchResponse, HostError>> + Send + 'static,
 {
     fn fetch(&self, request: FetchRequest) -> FetchFuture {
         Box::pin(self(request))
     }
 }
 
-/// Error returned by an embedder syscall.
+/// Error returned by an embedder host global or fetch handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyscallError {
+pub struct HostError {
     /// Human-readable error message exposed as the JavaScript `Error.message`.
     pub message: String,
     /// Optional machine-readable code exposed as the JavaScript `Error.code`.
     pub code: Option<String>,
 }
 
-impl SyscallError {
-    /// Creates a syscall error with no code.
+impl HostError {
+    /// Creates a host error with no code.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -91,10 +91,10 @@ impl SyscallError {
     }
 }
 
-impl std::fmt::Display for SyscallError {
+impl std::fmt::Display for HostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for SyscallError {}
+impl std::error::Error for HostError {}

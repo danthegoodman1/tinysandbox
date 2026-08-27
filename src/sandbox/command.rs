@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::fs::Fs;
 #[cfg(feature = "js")]
-use super::syscall::{Fetch, Syscall};
+use super::host::{Fetch, JsGlobal};
 
 /// Future returned by sandbox commands.
 pub type CommandFuture = Pin<Box<dyn Future<Output = CommandResult> + Send>>;
@@ -55,9 +55,9 @@ pub struct CommandContext {
     pub limits: Limits,
     /// Names available through `/bin` and command lookup.
     pub commands: Arc<BTreeSet<String>>,
-    /// JavaScript syscalls registered on the sandbox.
+    /// Host functions bound into the JavaScript global scope.
     #[cfg(feature = "js")]
-    pub js_syscalls: Arc<BTreeMap<String, Arc<dyn Syscall>>>,
+    pub js_globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     /// JavaScript fetch handler registered on the sandbox.
     #[cfg(feature = "js")]
     pub js_fetch: Option<Arc<dyn Fetch>>,

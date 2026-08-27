@@ -60,7 +60,7 @@ console.assert(result.stdout === '1\n')
   - [Rust](#rust-4)
   - [TypeScript](#typescript-4)
 - [JavaScript host capabilities](#javascript-host-capabilities)
-  - [Syscalls](#syscalls)
+  - [Host globals](#host-globals)
   - [JavaScript prelude](#javascript-prelude)
   - [Fetch](#fetch)
 - [Filesystem backends](#filesystem-backends)
@@ -88,6 +88,7 @@ console.assert(result.stdout === '1\n')
 - [Security model](#security-model)
 - [Comparison with just-bash](#comparison-with-just-bash)
 - [Performance](#performance)
+  - [JavaScript runtime startup](#javascript-runtime-startup)
 - [Feature flags](#feature-flags)
 - [Examples](#examples)
 - [License](#license)
@@ -346,13 +347,14 @@ const systemPrompt = [
 ```
 
 Available chunks: `OVERVIEW`/`overview`, `SHELL`/`shell`,
-`BUILTINS`/`builtins`, `JQ`/`jq`, `JS`/`js`, `SYSCALLS`/`syscalls`,
-`FETCH`/`fetch`, and `SESSION_EPHEMERAL`/`sessionEphemeral` or
+`BUILTINS`/`builtins`, `JQ`/`jq`, `JS`/`js`, `FETCH`/`fetch`, and
+`SESSION_EPHEMERAL`/`sessionEphemeral` or
 `SESSION_PERSISTENT`/`sessionPersistent` (pick the one matching
-`persist_session`). Skip `JS` when the `js` feature is off, `SYSCALLS` when
-no syscalls are registered, and `FETCH` when no fetch handler is set. Tests
-pin the builtins chunk to the actual command registry so the text cannot
-drift from the sandbox.
+`persist_session`). Skip `JS` when the `js` feature is off and `FETCH` when no
+fetch handler is set. `globals(names)`/`globals(names)` is a function rather
+than a constant: pass the names you bound so the chunk lists what the model can
+call. Tests pin the builtins chunk to the actual command registry so the text
+cannot drift from the sandbox.
 
 ## Custom commands
 
@@ -407,47 +409,54 @@ own code does with the results.
 ## JavaScript host capabilities
 
 The `js` runtime can receive a smaller capability surface than a whole shell
-command. Register host syscalls for synchronous `sandbox.*` functions, add a
-prelude to shape the guest API, and grant `fetch` only when you want agent JS
-to reach an embedder-provided transport.
+command. Bind host functions into the JavaScript global scope, add a prelude to
+shape the guest API, and grant `fetch` only when you want agent JS to reach an
+embedder-provided transport.
 
 Custom shell commands registered with `SandboxBuilder::command` / `commands`
 are available to the shell, not automatically to sandboxed JavaScript. If you
-want JavaScript to call custom host functionality, expose that functionality as
-a syscall and optionally wrap it with a JavaScript prelude.
+want JavaScript to call custom host functionality, bind it as a host global and
+optionally wrap it with a JavaScript prelude.
 
-### Syscalls
+### Host globals
 
-Syscalls are async host functions registered by name. The guest sees them as
-synchronous `sandbox.<name>(args)` functions that JSON round-trip one value in
-and one value out. Names must match `[A-Za-z_][A-Za-z0-9_]*`; `fetch` is
-reserved for the global fetch transport.
+Host globals are async host functions bound into the guest global scope by
+name. The guest calls them synchronously, JSON round-tripping one value in and
+one value out.
 
-The generated `sandbox` object is enumerable, so `Object.keys(sandbox)` gives
-the script a discoverable list of granted capabilities, similar to how `/bin`
-is synthesized from the command registry.
+The name is a dotted path. A bare `search` becomes `globalThis.search`;
+`tools.search` becomes `globalThis.tools.search` with the `tools` namespace
+object created for you, so several names can share one namespace. Each segment
+must match `[A-Za-z_][A-Za-z0-9_]*`. Names the runtime provides itself
+(`console`, `process`, `require`, `Buffer`, `fetch`, ...) are rejected when the
+sandbox is built, and a name that collides with any other existing global, such
+as a JavaScript intrinsic, fails the run instead of shadowing it. A name cannot
+be both a function and a namespace: `tools` and `tools.search` conflict.
 
 **Rust**
 
 ```rust no_run
 use serde_json::json;
-use tinysandbox::sandbox::{Sandbox, SyscallError};
+use tinysandbox::sandbox::{HostError, Sandbox};
 
 #[tokio::main]
 async fn main() {
     let sandbox = Sandbox::builder()
-        .syscall("kv_get", |args| async move {
+        // Bare name: scripts call `whoami()`.
+        .js_global("whoami", |_args| async { Ok(json!({ "name": "agent-1" })) })
+        // Dotted name: scripts call `kv.get({ key })`.
+        .js_global("kv.get", |args| async move {
             let key = args["key"].as_str().ok_or_else(|| {
-                SyscallError::new("key is required").with_code("E_KEY")
+                HostError::new("key is required").with_code("E_KEY")
             })?;
             Ok(json!({ "value": format!("value-for-{key}") }))
         })
         .build();
 
     let result = sandbox
-        .exec("js -e 'console.log(Object.keys(sandbox).join(\",\")); console.log(sandbox.kv_get({ key: \"a\" }).value)'")
+        .exec("js -e 'console.log(whoami().name); console.log(kv.get({ key: \"a\" }).value)'")
         .await;
-    assert_eq!(result.stdout, "kv_get\nvalue-for-a\n");
+    assert_eq!(result.stdout, "agent-1\nvalue-for-a\n");
 }
 ```
 
@@ -457,21 +466,26 @@ async fn main() {
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
-  syscalls: {
-    kvGet: async ({ key }) => ({ value: `value-for-${key}` })
+  globals: {
+    whoami: () => ({ name: 'agent-1' }),
+    'kv.get': async ({ key }) => ({ value: `value-for-${key}` })
   }
 })
 
 const result = await sandbox.exec(
-  `js -e 'console.log(Object.keys(sandbox).join(",")); console.log(sandbox.kvGet({ key: "a" }).value)'`
+  `js -e 'console.log(whoami().name); console.log(kv.get({ key: "a" }).value)'`
 )
-console.assert(result.stdout === 'kvGet\nvalue-for-a\n')
+console.assert(result.stdout === 'agent-1\nvalue-for-a\n')
 ```
+
+Scripts can enumerate a namespace with `Object.keys(tools)`, and
+`prompts::globals` / `prompts.globals` builds the prompt chunk that names every
+bound global, similar to how `/bin` is synthesized from the command registry.
 
 If a handler throws or returns an error, sandboxed JS receives a normal
 `Error`. A string `code` property on the thrown error is copied to
 `err.code`. Returned values must be JSON values; non-JSON-serializable Node
-returns fail the syscall.
+returns fail the call.
 
 ### JavaScript prelude
 
@@ -488,16 +502,16 @@ use tinysandbox::sandbox::Sandbox;
 #[tokio::main]
 async fn main() {
     let sandbox = Sandbox::builder()
-        .syscall("secret_get", |_args| async { Ok(json!({ "value": "redacted" })) })
+        .js_global("secret_get", |_args| async { Ok(json!({ "value": "redacted" })) })
         .js_prelude(
-            "const secretGet = sandbox.secret_get; \
+            "const secretGet = globalThis.secret_get; \
              globalThis.readSecret = () => secretGet({}).value; \
-             delete globalThis.sandbox",
+             delete globalThis.secret_get",
         )
         .build();
 
     let result = sandbox
-        .exec("js -e 'console.log(readSecret(), typeof sandbox)'")
+        .exec("js -e 'console.log(readSecret(), typeof secret_get)'")
         .await;
     assert_eq!(result.stdout, "redacted undefined\n");
 }
@@ -509,13 +523,14 @@ async fn main() {
 import { Sandbox } from '@tinysandbox/tinysandbox'
 
 const sandbox = new Sandbox({
-  syscalls: {
+  globals: {
     secretGet: () => ({ value: 'redacted' })
   },
-  jsPrelude: 'const secretGet = sandbox.secretGet; globalThis.readSecret = () => secretGet({}).value; delete globalThis.sandbox'
+  jsPrelude:
+    'const secretGet = globalThis.secretGet; globalThis.readSecret = () => secretGet({}).value; delete globalThis.secretGet'
 })
 
-const result = await sandbox.exec("js -e 'console.log(readSecret(), typeof sandbox)'")
+const result = await sandbox.exec("js -e 'console.log(readSecret(), typeof secretGet)'")
 console.assert(result.stdout === 'redacted undefined\n')
 ```
 
@@ -536,7 +551,7 @@ body accepted from the host before it reaches the guest.
 **Rust**
 
 ```rust no_run
-use tinysandbox::sandbox::{FetchResponse, Sandbox, SyscallError};
+use tinysandbox::sandbox::{FetchResponse, HostError, Sandbox};
 
 #[tokio::main]
 async fn main() {
@@ -549,7 +564,7 @@ async fn main() {
                     body: br#"{"ok":true}"#.to_vec(),
                 })
             } else {
-                Err(SyscallError::new("no route").with_code("ENOENT"))
+                Err(HostError::new("no route").with_code("ENOENT"))
             }
         })
         .build();
@@ -1152,6 +1167,60 @@ RSS includes runtime and allocator overhead for that process.
 | 100,000 | 680.95 MiB | 6.32 KiB | 315 ms | 1,000 | 685.83 MiB | 1.14 GiB | 38 ms |
 | 1,000,000 | 6.16 GiB | 6.38 KiB | 3.04 s | 1,000 | 6.16 GiB | 9.03 GiB | 29 ms |
 
+### JavaScript runtime startup
+
+The embedded `quickjs.wasm` is machine code by the time a script runs:
+Wasmtime's compiler, Cranelift, translates it to native code on the **first
+`js` command in a process**, not at startup and not per sandbox. The result is
+cached process-wide, so every later `js` command in that process reuses it, and
+a process that never runs `js` never compiles anything.
+
+Measured on Linux x86_64 with `wasmtime` 46:
+
+| Step | When | Cost |
+| --- | --- | --- |
+| Cranelift compile of `quickjs.wasm` | first `js` command in the process | 425 ms, ~29 MiB RSS |
+| `precompile()` artifact loaded instead | before the first `js` command | ~1 ms, ~1.3 MiB RSS |
+| One in-flight `js` command | every run | ~3.4 ms, ~0.5 MiB RSS |
+| Sandbox with no `js` command running | — | no runtime cost |
+
+`js::precompile` runs Cranelift in a build step and returns the machine code;
+`js::use_precompiled` loads that artifact in a later process. The artifact is
+tied to this Wasmtime version and to the target's CPU features, so produce it
+per target and keep it a build output rather than a checked-in asset. A stale
+or foreign artifact is rejected, which is the signal to fall back to the normal
+path.
+
+**Rust**
+
+```rust no_run
+// Build step, for example in build.rs or a packaging job.
+let artifact = tinysandbox::js::precompile().expect("precompile quickjs");
+std::fs::write("target/quickjs.cwasm", &artifact).expect("write artifact");
+
+// Later process, before the first `js` command runs.
+if let Ok(artifact) = std::fs::read("target/quickjs.cwasm") {
+    let _ = tinysandbox::js::use_precompiled(&artifact);
+}
+```
+
+**TypeScript**
+
+```ts
+import { readFileSync, writeFileSync } from 'node:fs'
+import { precompileJs, usePrecompiledJs } from '@tinysandbox/tinysandbox'
+
+// Build step.
+writeFileSync('quickjs.cwasm', precompileJs())
+
+// Later process, before the first `js` command runs.
+try {
+  usePrecompiledJs(readFileSync('quickjs.cwasm'))
+} catch {
+  // Stale or foreign artifact: the next `js` command compiles the module.
+}
+```
+
 ## Feature flags
 
 | Feature | Default | Effect |
@@ -1169,7 +1238,8 @@ Runnable with `cargo run --example <name>`:
   command and composing it with builtins
 - [`js_scripts`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_scripts.rs) — multi-file JS with `require`,
   the `fs` API, and a look at limits and metrics
-- [`js_syscalls`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_syscalls.rs) — host syscalls,
+- [`js_precompiled`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_precompiled.rs) — precompiling the QuickJS module and loading it in a later process
+- [`js_globals`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_globals.rs) — host globals,
   prelude wrappers, and embedder-backed fetch
 
 Runnable with `npm --prefix tinysandbox-node run examples` after the package
@@ -1178,7 +1248,8 @@ dependencies are installed:
 - `quickstart.ts` — sessions, pipelines, redirects, and host reads
 - `custom_command.ts` — registering a TypeScript host command
 - `js_scripts.ts` — multi-file sandboxed JS with limits and metrics
-- `js_syscalls.ts` — TypeScript syscalls, prelude wrappers, and fetch transport
+- `js_globals.ts` — TypeScript host globals, prelude wrappers, and fetch transport
+- `js_precompiled.ts` — precompiling the QuickJS module and loading the artifact
 - `js_vfs.ts` — TypeScript-backed VFS callbacks plus `runConformance`
 
 ## License
