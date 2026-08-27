@@ -443,8 +443,11 @@ jobs:
           # `release-version.mjs apply` can only leave placeholder entries for
           # the native packages, because the version does not exist on npm when
           # the release commit is built. They resolve now that publishing is
-          # done, and `npm ci` rejects the placeholders until they do.
-          npm install --package-lock-only --no-audit --no-fund --prefix tinysandbox-node
+          # done, and `npm ci` rejects the placeholders until they do. The
+          # refresh retries while the registry catches up with the packages this
+          # run just published, and fails the release rather than committing a
+          # lockfile that would break `npm ci` on main.
+          node scripts/refresh-native-lockfile.mjs "${VERSION}"
           if git diff --quiet -- tinysandbox-node/package-lock.json; then
             echo "lockfile already resolves ${VERSION}"
             exit 0
