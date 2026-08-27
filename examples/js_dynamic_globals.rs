@@ -6,19 +6,34 @@
 //!
 //! Run with: cargo run --example js_dynamic_globals
 
-use serde_json::json;
-use tinysandbox::sandbox::{JsGlobals, Sandbox};
+use serde_json::{Value, json};
+use tinysandbox::sandbox::{HostError, JsGlobals, Sandbox};
 
-const LIST: &str = r#"js -e 'console.log(typeof tools === "undefined" ? "(none)" : Object.keys(tools).join(","))'"#;
+const LIST: &str = "js -e 'console.log(globals())'";
+
+/// A base capability every turn keeps, written as a plain function so the same
+/// handler can be re-granted after a revoking swap.
+async fn whoami(_args: Value) -> Result<Value, HostError> {
+    Ok(json!("agent-1"))
+}
 
 #[tokio::main]
 async fn main() {
-    let sandbox = Sandbox::builder().build();
+    let sandbox = Sandbox::builder()
+        .js_global("whoami", whoami)
+        // A prelude keeps the demo output short: it reports the bound surface
+        // the way a script would discover it.
+        .js_prelude(
+            "globalThis.globals = () => [typeof whoami === 'function' ? 'whoami' : null, \
+             typeof tools === 'undefined' ? null : 'tools.' + Object.keys(tools).join(',tools.')] \
+             .filter(Boolean).join(' ') || '(none)'",
+        )
+        .build();
+    println!("base:    {}", sandbox.exec(LIST).await.stdout.trim_end());
 
-    // Turn one grants a read-only surface. One swap, validated as a whole: a
-    // rejected set leaves the previous turn's globals in place.
+    // Turn one adds tools and keeps everything already bound.
     sandbox
-        .replace_js_globals(
+        .extend_js_globals(
             JsGlobals::new()
                 .with("tools.search", |args| async move {
                     Ok(json!({ "hits": [format!("hit for {}", args["q"].as_str().unwrap_or(""))] }))
@@ -26,49 +41,46 @@ async fn main() {
                 .with("tools.read_doc", |_args| async { Ok(json!("doc body")) }),
         )
         .expect("grant turn-one tools");
-    println!(
-        "turn 1 tools: {}",
-        sandbox.exec(LIST).await.stdout.trim_end()
-    );
+    println!("turn 1:  {}", sandbox.exec(LIST).await.stdout.trim_end());
     let result = sandbox
         .exec(r#"js -e 'console.log(tools.search({ q: "vfs" }).hits[0])'"#)
         .await;
-    print!("turn 1 call: {}", result.stdout);
+    print!("call:    {}", result.stdout);
 
-    // Turn two revokes those and grants a writer instead.
+    // Turn two revokes turn one. `replace` swaps the whole surface, so the base
+    // capability is re-granted alongside the new tool.
     sandbox
         .replace_js_globals(
-            JsGlobals::new().with("tools.write_note", |args| async move {
-                Ok(json!({ "written": args["text"].as_str().unwrap_or("").len() }))
-            }),
+            JsGlobals::new()
+                .with("whoami", whoami)
+                .with("tools.write_note", |args| async move {
+                    Ok(json!({ "written": args["text"].as_str().unwrap_or("").len() }))
+                }),
         )
         .expect("grant turn-two tools");
-    println!(
-        "turn 2 tools: {}",
-        sandbox.exec(LIST).await.stdout.trim_end()
-    );
+    println!("turn 2:  {}", sandbox.exec(LIST).await.stdout.trim_end());
     let revoked = sandbox
         .exec("js -e 'console.log(typeof tools.search)'")
         .await;
-    print!("turn 2 sees search: {}", revoked.stdout);
+    print!("revoked: {}", revoked.stdout);
 
     // Single names can be added and dropped without touching the rest.
     sandbox
-        .set_js_global("whoami", |_args| async { Ok(json!("agent-1")) })
-        .expect("add whoami");
-    let added = sandbox.exec("js -e 'console.log(whoami())'").await;
-    print!("added whoami: {}", added.stdout);
-    println!("removed whoami: {}", sandbox.remove_js_global("whoami"));
-    println!("removed again: {}", sandbox.remove_js_global("whoami"));
-    println!("bound now: {:?}", sandbox.js_global_names());
+        .set_js_global("tools.trace", |_args| async { Ok(json!("traced")) })
+        .expect("add tools.trace");
+    println!("added:   {}", sandbox.exec(LIST).await.stdout.trim_end());
+    println!("removed: {}", sandbox.remove_js_global("tools.trace"));
+    println!("again:   {}", sandbox.remove_js_global("tools.trace"));
 
-    // The live API reports what the builder would panic on.
-    let rejected = sandbox
+    // The live API reports what the builder would panic on, and a rejected
+    // change leaves the surface exactly as it was.
+    let reserved = sandbox
         .set_js_global("console", |_args| async { Ok(json!(null)) })
         .expect_err("reserved name");
-    println!("rejected: {rejected}");
+    println!("refused: {reserved}");
     let conflict = sandbox
-        .set_js_global("tools", |_args| async { Ok(json!(null)) })
+        .extend_js_globals(JsGlobals::new().with("tools", |_args| async { Ok(json!(null)) }))
         .expect_err("namespace in use");
-    println!("rejected: {conflict}");
+    println!("refused: {conflict}");
+    println!("bound:   {:?}", sandbox.js_global_names());
 }

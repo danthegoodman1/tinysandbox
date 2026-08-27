@@ -180,18 +180,20 @@ impl Sandbox {
         F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
     {
-        let name = name.into();
-        check_js_global_name(&name)?;
-        let mut globals = self.js_globals_snapshot().as_ref().clone();
-        globals.remove(&name);
-        if let Some(other) = globals.keys().find(|other| paths_conflict(other, &name)) {
-            return Err(JsGlobalError::new(format!(
-                "cannot register '{name}'; it conflicts with '{other}'"
-            )));
-        }
-        globals.insert(name, Arc::new(global));
-        self.store_js_globals(globals);
-        Ok(())
+        let entries = vec![(name.into(), Arc::new(global) as Arc<dyn JsGlobal>)];
+        self.mutate_js_globals(|current| merge_js_globals(current, entries))
+    }
+
+    /// Adds a set of host globals to the ones already bound, replacing any that
+    /// share an exact name and leaving the rest untouched.
+    ///
+    /// The merged surface is validated before it lands, so a set that conflicts
+    /// with a bound namespace leaves the live globals unchanged. Use this to add
+    /// several names as one swap; use [`Sandbox::replace_js_globals`] when the
+    /// old surface must go away.
+    #[cfg(feature = "js")]
+    pub fn extend_js_globals(&self, globals: JsGlobals) -> Result<(), JsGlobalError> {
+        self.mutate_js_globals(|current| merge_js_globals(current, globals.entries))
     }
 
     /// Removes a host global, reporting whether it was registered.
@@ -200,23 +202,46 @@ impl Sandbox {
     /// snapshots taken afterwards. A handler mid-flight is not cancelled.
     #[cfg(feature = "js")]
     pub fn remove_js_global(&self, name: &str) -> bool {
-        let mut globals = self.js_globals_snapshot().as_ref().clone();
-        let removed = globals.remove(name).is_some();
-        if removed {
-            self.store_js_globals(globals);
+        let mut guard = self
+            .js_globals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !guard.contains_key(name) {
+            return false;
         }
-        removed
+        let mut globals = guard.as_ref().clone();
+        globals.remove(name);
+        *guard = Arc::new(globals);
+        true
     }
 
     /// Replaces every host global with the given set in one swap.
     ///
-    /// The set is validated as a whole first, so a rejected set leaves the live
-    /// globals untouched rather than landing halfway. This is the call for a
-    /// per-turn tool surface.
+    /// Globals registered on the builder go away too: the live surface becomes
+    /// exactly this set. It is validated as a whole first, so a rejected set
+    /// leaves the sandbox untouched rather than landing halfway. This is the
+    /// call for a per-turn tool surface, where anything not granted again should
+    /// stop being callable.
     #[cfg(feature = "js")]
     pub fn replace_js_globals(&self, globals: JsGlobals) -> Result<(), JsGlobalError> {
-        let globals = validate_js_global_registry(globals.entries)?;
-        self.store_js_globals(globals);
+        self.mutate_js_globals(|_| merge_js_globals(BTreeMap::new(), globals.entries))
+    }
+
+    /// Applies a validated change to the registry while holding the write lock,
+    /// so concurrent mutations cannot lose an update.
+    #[cfg(feature = "js")]
+    fn mutate_js_globals<F>(&self, change: F) -> Result<(), JsGlobalError>
+    where
+        F: FnOnce(
+            BTreeMap<String, Arc<dyn JsGlobal>>,
+        ) -> Result<BTreeMap<String, Arc<dyn JsGlobal>>, JsGlobalError>,
+    {
+        let mut guard = self
+            .js_globals
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let next = change(guard.as_ref().clone())?;
+        *guard = Arc::new(next);
         Ok(())
     }
 
@@ -234,14 +259,6 @@ impl Sandbox {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
         )
-    }
-
-    #[cfg(feature = "js")]
-    fn store_js_globals(&self, globals: BTreeMap<String, Arc<dyn JsGlobal>>) {
-        *self
-            .js_globals
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::new(globals);
     }
 
     /// Returns aggregate sandbox statistics.
@@ -2042,31 +2059,38 @@ const RESERVED_JS_GLOBALS: &[&str] = &[
 fn build_js_global_registry(
     entries: Vec<(String, Arc<dyn JsGlobal>)>,
 ) -> BTreeMap<String, Arc<dyn JsGlobal>> {
-    validate_js_global_registry(entries)
+    merge_js_globals(BTreeMap::new(), entries)
         .unwrap_or_else(|err| panic!("SandboxBuilder::js_global {err}"))
 }
 
-/// Validates a whole global surface, so a rejected set never lands halfway.
+/// Merges entries onto an existing surface, validating the result so a rejected
+/// change never lands halfway.
+///
+/// A name already bound in `merged` is replaced; a name repeated inside
+/// `entries` is an error, which is what makes a duplicate in a builder or a
+/// replacement set fail instead of silently winning.
 #[cfg(feature = "js")]
-fn validate_js_global_registry(
+fn merge_js_globals(
+    mut merged: BTreeMap<String, Arc<dyn JsGlobal>>,
     entries: Vec<(String, Arc<dyn JsGlobal>)>,
 ) -> Result<BTreeMap<String, Arc<dyn JsGlobal>>, JsGlobalError> {
-    let mut globals: BTreeMap<String, Arc<dyn JsGlobal>> = BTreeMap::new();
+    let mut added: BTreeSet<String> = BTreeSet::new();
     for (name, global) in entries {
         check_js_global_name(&name)?;
-        if globals.contains_key(&name) {
+        if !added.insert(name.clone()) {
             return Err(JsGlobalError::new(format!(
                 "cannot register duplicate name '{name}'"
             )));
         }
-        if let Some(other) = globals.keys().find(|other| paths_conflict(other, &name)) {
+        merged.remove(&name);
+        if let Some(other) = merged.keys().find(|other| paths_conflict(other, &name)) {
             return Err(JsGlobalError::new(format!(
                 "cannot register '{name}'; it conflicts with '{other}'"
             )));
         }
-        globals.insert(name, global);
+        merged.insert(name, global);
     }
-    Ok(globals)
+    Ok(merged)
 }
 
 #[cfg(feature = "js")]

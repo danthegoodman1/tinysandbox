@@ -1891,3 +1891,72 @@ async fn js_global_removal_does_not_disturb_a_running_command() {
     let after = sandbox.exec("js -e 'console.log(typeof slow)'").await;
     assert_eq!(after.stdout, "undefined\n");
 }
+
+#[tokio::test]
+async fn js_globals_extend_adds_without_dropping_the_rest() {
+    // extend merges onto the live surface; replace swaps it wholesale.
+    let sandbox = Sandbox::builder()
+        .js_global("whoami", |_args| async { Ok(json!("agent-1")) })
+        .build();
+
+    sandbox
+        .extend_js_globals(
+            JsGlobals::new()
+                .with("tools.a", |_args| async { Ok(json!("a")) })
+                .with("tools.b", |_args| async { Ok(json!("b")) }),
+        )
+        .expect("extend with turn tools");
+    assert_eq!(
+        sandbox.js_global_names(),
+        vec![
+            "tools.a".to_owned(),
+            "tools.b".to_owned(),
+            "whoami".to_owned()
+        ]
+    );
+    let result = sandbox
+        .exec("js -e 'console.log(whoami(), tools.a(), tools.b())'")
+        .await;
+    assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "agent-1 a b\n");
+
+    // A conflict against a bound namespace leaves the live surface alone.
+    let rejected = sandbox.extend_js_globals(
+        JsGlobals::new()
+            .with("fine", |_args| async { Ok(Value::Null) })
+            .with("tools", |_args| async { Ok(Value::Null) }),
+    );
+    assert!(rejected.is_err());
+    assert_eq!(
+        sandbox.js_global_names(),
+        vec![
+            "tools.a".to_owned(),
+            "tools.b".to_owned(),
+            "whoami".to_owned()
+        ]
+    );
+
+    // Repeating a name inside one set is an error, not a silent last-wins.
+    assert!(
+        sandbox
+            .extend_js_globals(
+                JsGlobals::new()
+                    .with("dup", |_args| async { Ok(Value::Null) })
+                    .with("dup", |_args| async { Ok(Value::Null) }),
+            )
+            .is_err()
+    );
+
+    // An exact name already bound is replaced by extend.
+    sandbox
+        .extend_js_globals(JsGlobals::new().with("whoami", |_args| async { Ok(json!("agent-2")) }))
+        .expect("rebind whoami");
+    let rebound = sandbox.exec("js -e 'console.log(whoami())'").await;
+    assert_eq!(rebound.stdout, "agent-2\n");
+
+    // replace drops everything the set does not name, builder globals included.
+    sandbox
+        .replace_js_globals(JsGlobals::new().with("only", |_args| async { Ok(Value::Null) }))
+        .expect("replace surface");
+    assert_eq!(sandbox.js_global_names(), vec!["only".to_owned()]);
+}

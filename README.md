@@ -511,12 +511,17 @@ async fn main() {
         )
         .expect("grant this turn's tools");
 
+    // Or add to what is already bound, leaving the rest in place.
+    sandbox
+        .extend_js_globals(JsGlobals::new().with("tools.trace", |_args| async { Ok(json!("ok")) }))
+        .expect("add this turn's extra tool");
+
     // Or one name at a time.
     sandbox
         .set_js_global("whoami", |_args| async { Ok(json!("agent-1")) })
         .expect("bind whoami");
     assert!(sandbox.remove_js_global("whoami"));
-    assert_eq!(sandbox.js_global_names().len(), 2);
+    assert_eq!(sandbox.js_global_names().len(), 3);
 }
 ```
 
@@ -529,11 +534,16 @@ change is visible to:
 - The snapshot is taken per command, not per `exec`, so in `js a.js && js b.js`
   a change landing between the two is invisible to the first and visible to the
   second.
-- `replace_js_globals` validates the whole set before it lands; a rejected set
-  leaves the live globals untouched. `set_js_global` and `remove_js_global` are
-  each one swap, so a remove-then-add pair has a window in between where a
-  command would see neither. Use `replace_js_globals` when the set must change
-  together.
+- `replace_js_globals` makes the surface exactly the set you pass, dropping
+  everything else including globals registered on the builder. That is what a
+  turn-scoped grant wants: a tool left out stops being callable. Re-include the
+  names that should survive.
+- `extend_js_globals` merges instead, replacing only names it repeats. Both
+  validate the resulting surface before it lands, so a set that collides with a
+  bound namespace leaves the live globals untouched.
+- Each call is one swap. A `remove_js_global` followed by a `set_js_global` has
+  a window in between where a command would see neither, so change a set that
+  must move together with `extend_js_globals` or `replace_js_globals`.
 
 These are Rust-side APIs. The TypeScript binding takes `globals` when the
 sandbox is constructed.
