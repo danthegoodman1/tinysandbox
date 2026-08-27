@@ -9,7 +9,7 @@
     "benchmark:memory": "tsx benchmarks/memory.ts",
     "test": "npm run build && node --import tsx --test __test__/*.mjs",
     "test:s3-compat": "node --test __test__/s3_vfs.test.mjs",
-    "examples": "tsx examples/quickstart.ts && tsx examples/custom_command.ts && tsx examples/js_scripts.ts && tsx examples/js_globals.ts && tsx examples/js_precompiled.ts && tsx examples/js_vfs.ts"
+    "examples": "tsx examples/quickstart.ts && tsx examples/custom_command.ts && tsx examples/js_scripts.ts && tsx examples/js_globals.ts && tsx examples/js_dynamic_globals.ts && tsx examples/js_precompiled.ts && tsx examples/js_vfs.ts"
   },
   "repository": {
     "type": "git",

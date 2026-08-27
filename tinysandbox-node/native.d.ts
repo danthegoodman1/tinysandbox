@@ -9,6 +9,25 @@ export declare class ExternalObject<T> {
 }
 export declare class NativeSandbox {
   constructor(options?: object | undefined | null)
+  /**
+   * Binds one host function, replacing any global under that exact name.
+   * Visible to `js` commands that start after this returns.
+   */
+  setJsGlobal(name: string, global: (arg: [any]) => Promise<JsGlobalCallbackResponse>): void
+  /**
+   * Adds host functions to the ones already bound, replacing any that share
+   * an exact name and leaving the rest untouched.
+   */
+  extendJsGlobals(globals: object): void
+  /**
+   * Replaces every host global with the given set, dropping the ones the set
+   * does not name, including globals bound when the sandbox was constructed.
+   */
+  replaceJsGlobals(globals: object): void
+  /** Removes a host global, reporting whether it was bound. */
+  removeJsGlobal(name: string): boolean
+  /** The names currently bound as host globals, in sorted order. */
+  jsGlobalNames(): Array<string>
   exec(script: string): Promise<ExecResult>
   get fs(): SandboxFs
   stats(): Promise<SandboxStats>

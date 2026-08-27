@@ -10,6 +10,18 @@ class Sandbox extends native.NativeSandbox {
     this._fs ??= new SandboxFs(super.fs)
     return this._fs
   }
+
+  setJsGlobal(name, global) {
+    return super.setJsGlobal(name, wrapGlobals({ [name]: global })[name])
+  }
+
+  extendJsGlobals(globals) {
+    return super.extendJsGlobals(wrapGlobals(globals))
+  }
+
+  replaceJsGlobals(globals) {
+    return super.replaceJsGlobals(wrapGlobals(globals))
+  }
 }
 
 async function runConformance(vfsFactory) {

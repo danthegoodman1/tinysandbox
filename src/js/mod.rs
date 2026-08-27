@@ -356,7 +356,7 @@ pub enum RuntimeSource {
     /// Loaded from the artifact the build script precompiled, or from one
     /// installed with [`use_precompiled`].
     Precompiled,
-    /// Compiled in this process by Cranelift.
+    /// Compiled in this process, the slow path the build normally avoids.
     Compiled,
 }
 

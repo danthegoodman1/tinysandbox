@@ -26,6 +26,27 @@ export declare class Sandbox extends NativeSandbox {
   constructor(options?: SandboxOptions | null)
   override get fs(): SandboxFs
   override stats(): Promise<SandboxStats>
+  /**
+   * Binds one host function, replacing any global under that exact name.
+   * Visible to `js` commands that start after the call returns; one already
+   * running keeps the set it started with.
+   */
+  override setJsGlobal(name: string, global: JsGlobal): void
+  /**
+   * Adds host functions to the ones already bound, replacing any that share an
+   * exact name and leaving the rest untouched.
+   */
+  override extendJsGlobals(globals: Record<string, JsGlobal>): void
+  /**
+   * Replaces every host global with this set, dropping the ones it does not
+   * name, including globals bound in the constructor. The set is validated
+   * before it lands, so a rejected one leaves the live globals untouched.
+   */
+  override replaceJsGlobals(globals: Record<string, JsGlobal>): void
+  /** Removes a host global, reporting whether it was bound. */
+  override removeJsGlobal(name: string): boolean
+  /** The names currently bound as host globals, in sorted order. */
+  override jsGlobalNames(): Array<string>
 }
 
 export interface SandboxOptions {

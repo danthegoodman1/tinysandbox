@@ -545,8 +545,27 @@ change is visible to:
   a window in between where a command would see neither, so change a set that
   must move together with `extend_js_globals` or `replace_js_globals`.
 
-These are Rust-side APIs. The TypeScript binding takes `globals` when the
-sandbox is constructed.
+**TypeScript**
+
+```ts
+import { Sandbox } from '@tinysandbox/tinysandbox'
+
+const sandbox = new Sandbox({ globals: { whoami: () => 'agent-1' } })
+
+// One swap, validated as a whole.
+sandbox.replaceJsGlobals({
+  'tools.search': async ({ q }) => ({ hits: [] }),
+  'tools.readDoc': () => 'doc body'
+})
+
+// Or add to what is already bound, leaving the rest in place.
+sandbox.extendJsGlobals({ 'tools.trace': () => 'ok' })
+
+// Or one name at a time.
+sandbox.setJsGlobal('whoami', () => 'agent-1')
+sandbox.removeJsGlobal('whoami')
+console.log(sandbox.jsGlobalNames()) // ['tools.readDoc', 'tools.search', 'tools.trace']
+```
 
 ### JavaScript prelude
 
@@ -1230,30 +1249,29 @@ RSS includes runtime and allocator overhead for that process.
 
 ### JavaScript runtime startup
 
-The embedded `quickjs.wasm` is machine code by the time a script runs. Turning
-wasm into machine code is Cranelift's job, and it costs about 425 ms and 29 MiB,
-so the build script does it: it compiles the module for the crate's target and
-the binary embeds the result. No process runs Cranelift, and the first `js`
-command loads the artifact instead.
+Nothing compiles wasm at run time. The build script turns `quickjs.wasm` into
+machine code for the crate's target and the binary embeds the result, so the
+first `js` command loads an artifact that is already executable. Doing that work
+during the build is worth about 425 ms and 29 MiB per process.
 
 Measured on Linux x86_64 with `wasmtime` 46:
 
 | Step | When | Cost |
 | --- | --- | --- |
-| Precompiling `quickjs.wasm` | once, during `cargo build` | 425 ms, 2.7 MB embedded in the binary |
+| Compiling `quickjs.wasm` to machine code | once, during `cargo build` | 425 ms, 2.7 MB embedded in the binary |
 | First `js` command in a process | loads the artifact | ~9 ms, ~9.5 MiB RSS |
-| The same first command, compiling instead | fallback only | ~430 ms, ~31 MiB RSS |
+| The same first command, on the fallback path | only when the artifact is refused | ~430 ms, ~31 MiB RSS |
 | One in-flight `js` command | every run | ~3.4 ms, ~0.5 MiB RSS |
 | Sandbox with no `js` command running | — | no runtime cost |
 
 The artifact is pinned to the target triple with that architecture's baseline
 CPU features, so it runs on any CPU of that architecture rather than only one as
 new as the build machine. It is also tied to this Wasmtime version. When either
-check fails — a cross-built binary Cranelift could not target, an artifact from
-a different Wasmtime — the runtime compiles the module itself and keeps working;
-`js::runtime_source()` reports which happened.
+check fails — a target the build could not generate code for, an artifact from a
+different Wasmtime — the runtime compiles the module itself and keeps working at
+the cost of that first command; `js::runtime_source()` reports which happened.
 
-Two costs come with this. Wasmtime is now a build dependency as well as a
+Two costs come with this. Wasmtime's compiler is a build dependency as well as a
 runtime one, so a cold `cargo build` compiles it twice; and the binary carries
 the 2.7 MB artifact alongside the 0.6 MB wasm.
 
@@ -1324,6 +1342,7 @@ dependencies are installed:
 - `custom_command.ts` — registering a TypeScript host command
 - `js_scripts.ts` — multi-file sandboxed JS with limits and metrics
 - `js_globals.ts` — TypeScript host globals, prelude wrappers, and fetch transport
+- `js_dynamic_globals.ts` — changing the host global surface between commands
 - `js_precompiled.ts` — precompiling the QuickJS module and loading the artifact
 - `js_vfs.ts` — TypeScript-backed VFS callbacks plus `runConformance`
 

@@ -13,8 +13,8 @@ use napi_derive::napi;
 use serde_json::Value;
 use tinysandbox::sandbox::{
     Command, CommandContext, CommandFuture, CommandResult, ExecResult as CoreExecResult,
-    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostError, JsGlobals,
-    Limits, Sandbox as CoreSandbox,
+    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostError, JsGlobalError,
+    JsGlobalFuture, JsGlobals, Limits, Sandbox as CoreSandbox,
 };
 use tinysandbox::vfs::{
     DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
@@ -139,21 +139,7 @@ impl Sandbox {
                 builder = builder.persist_session(persist);
             }
             if let Some(globals) = get_optional_object(&options, "globals")? {
-                for name in Object::keys(&globals)? {
-                    let callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>> =
-                        globals.get_named_property(&name)?;
-                    let callback = Arc::new(
-                        callback
-                            .build_threadsafe_function::<Value>()
-                            .callee_handled::<false>()
-                            .weak::<true>()
-                            .build_callback(|ctx| Ok((ctx.value,)))?,
-                    );
-                    js_globals = js_globals.with(name, move |args| {
-                        let callback = Arc::clone(&callback);
-                        async move { call_js_global(callback, args).await }
-                    });
-                }
+                js_globals = js_globals_from_object(&globals)?;
             }
             if let Some(js_prelude) = get_optional::<String>(&options, "jsPrelude")? {
                 builder = builder.js_prelude(js_prelude);
@@ -239,18 +225,59 @@ impl Sandbox {
         }
 
         let sandbox = builder.build();
-        sandbox.extend_js_globals(js_globals).map_err(|err| {
-            Error::new(
-                Status::InvalidArg,
-                format!("Sandbox constructor {err} in the globals option"),
-            )
-        })?;
+        sandbox
+            .extend_js_globals(js_globals)
+            .map_err(|err| js_global_error("Sandbox constructor", &err))?;
 
         Ok(Self {
             inner: Arc::new(sandbox),
             #[cfg(unix)]
             local_vfs,
         })
+    }
+
+    /// Binds one host function, replacing any global under that exact name.
+    /// Visible to `js` commands that start after this returns.
+    #[napi]
+    pub fn set_js_global(
+        &self,
+        name: String,
+        global: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>>,
+    ) -> Result<()> {
+        let globals = JsGlobals::new().with(name, js_global_handler(global)?);
+        self.inner
+            .extend_js_globals(globals)
+            .map_err(|err| js_global_error("setJsGlobal", &err))
+    }
+
+    /// Adds host functions to the ones already bound, replacing any that share
+    /// an exact name and leaving the rest untouched.
+    #[napi]
+    pub fn extend_js_globals(&self, globals: Object<'_>) -> Result<()> {
+        self.inner
+            .extend_js_globals(js_globals_from_object(&globals)?)
+            .map_err(|err| js_global_error("extendJsGlobals", &err))
+    }
+
+    /// Replaces every host global with the given set, dropping the ones the set
+    /// does not name, including globals bound when the sandbox was constructed.
+    #[napi]
+    pub fn replace_js_globals(&self, globals: Object<'_>) -> Result<()> {
+        self.inner
+            .replace_js_globals(js_globals_from_object(&globals)?)
+            .map_err(|err| js_global_error("replaceJsGlobals", &err))
+    }
+
+    /// Removes a host global, reporting whether it was bound.
+    #[napi]
+    pub fn remove_js_global(&self, name: String) -> bool {
+        self.inner.remove_js_global(&name)
+    }
+
+    /// The names currently bound as host globals, in sorted order.
+    #[napi]
+    pub fn js_global_names(&self) -> Vec<String> {
+        self.inner.js_global_names()
     }
 
     #[napi]
@@ -532,6 +559,36 @@ async fn write_command_error(
         .write_all(format!("tinysandbox-node: custom command failed: {reason}\n").as_bytes())
         .await;
     CommandResult::failure()
+}
+
+fn js_globals_from_object(globals: &Object<'_>) -> Result<JsGlobals> {
+    let mut set = JsGlobals::new();
+    for name in Object::keys(globals)? {
+        let callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>> =
+            globals.get_named_property(&name)?;
+        set = set.with(name, js_global_handler(callback)?);
+    }
+    Ok(set)
+}
+
+fn js_global_handler(
+    callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>>,
+) -> Result<impl Fn(Value) -> JsGlobalFuture + Send + Sync + use<>> {
+    let callback = Arc::new(
+        callback
+            .build_threadsafe_function::<Value>()
+            .callee_handled::<false>()
+            .weak::<true>()
+            .build_callback(|ctx| Ok((ctx.value,)))?,
+    );
+    Ok(move |args: Value| {
+        let callback = Arc::clone(&callback);
+        Box::pin(async move { call_js_global(callback, args).await }) as JsGlobalFuture
+    })
+}
+
+fn js_global_error(context: &str, err: &JsGlobalError) -> Error {
+    Error::new(Status::InvalidArg, format!("{context} {err}"))
 }
 
 async fn call_js_global(

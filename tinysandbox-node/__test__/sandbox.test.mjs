@@ -349,6 +349,34 @@ test('fetchResponseBytes limits Node fetch response bodies', async () => {
   assert.equal(result.stdout, 'TypeError fetch failed\nfetch response body exceeded limit of 3 bytes\n')
 })
 
+test('globals can change between commands on a live sandbox', async () => {
+  // Each `js` command snapshots the registry, so a turn can grant a different
+  // tool surface without rebuilding the sandbox.
+  const sandbox = new Sandbox({ globals: { whoami: () => 'agent-1' } })
+  sandbox.extendJsGlobals({ 'tools.a': () => 'a', 'tools.b': () => 'b' })
+  assert.deepEqual(sandbox.jsGlobalNames(), ['tools.a', 'tools.b', 'whoami'])
+
+  const granted = await sandbox.exec("js -e 'console.log(whoami(), tools.a(), tools.b())'")
+  assert.equal(granted.exitCode, 0, granted.stderr)
+  assert.equal(granted.stdout, 'agent-1 a b\n')
+
+  // replace drops what it does not name, including constructor globals.
+  sandbox.replaceJsGlobals({ 'tools.c': () => 'c' })
+  assert.deepEqual(sandbox.jsGlobalNames(), ['tools.c'])
+  const revoked = await sandbox.exec("js -e 'console.log(typeof whoami, tools.c())'")
+  assert.equal(revoked.stdout, 'undefined c\n')
+
+  sandbox.setJsGlobal('search', () => 'hit')
+  assert.equal((await sandbox.exec("js -e 'console.log(search())'")).stdout, 'hit\n')
+  assert.equal(sandbox.removeJsGlobal('search'), true)
+  assert.equal(sandbox.removeJsGlobal('search'), false)
+
+  // A rejected change leaves the live surface untouched.
+  assert.throws(() => sandbox.setJsGlobal('console', () => null), /reserved name/)
+  assert.throws(() => sandbox.extendJsGlobals({ tools: () => null }), /conflicts with/)
+  assert.deepEqual(sandbox.jsGlobalNames(), ['tools.c'])
+})
+
 test('invalid global names throw during Sandbox construction', () => {
   // The core validates, so its rules reach JavaScript as errors rather than as
   // a builder panic crossing N-API.
