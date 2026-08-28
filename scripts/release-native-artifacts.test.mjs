@@ -76,14 +76,25 @@ test("release matrix builds the four supported native bindings", () => {
   )
   // rust-cache separates entries by job, matrix, and rustc host triple, so the
   // two macOS architectures cannot share a cache.
-  assert.match(ciWorkflow, /uses: Swatinem\/rust-cache@v2\n\s+with:\n\s+key: node/)
+  assert.match(ciWorkflow, /uses: Swatinem\/rust-cache@[0-9a-f]{40} #[^\n]*\n\s+with:\n\s+key: node/)
+})
+
+test("workflows pin every action to a commit digest", () => {
+  // A tag can be moved to point at different code; a digest cannot.
+  for (const [name, contents] of [["release.yml", workflow], ["ci.yml", ciWorkflow]]) {
+    const refs = [...contents.matchAll(/uses: (?<ref>\S+)/g)].map((match) => match.groups.ref)
+    assert.ok(refs.length > 0, `${name} must use actions`)
+    for (const ref of refs) {
+      assert.match(ref, /@[0-9a-f]{40}$/u, `${name} must pin ${ref} to a commit digest`)
+    }
+  }
 })
 
 test("branch runs restore the cargo cache without evicting main's", () => {
   // The repository cache quota is shared, and a branch cannot read another
   // branch's entries. Saving from every branch run pushed main's cache out, so
   // main rebuilt from scratch: 20 minutes for a job that takes 2 warm.
-  const ciCaches = [...ciWorkflow.matchAll(/uses: Swatinem\/rust-cache@v2\n\s+with:\n(?<config>(?:\s{10}\S[^\n]*\n)+)/g)]
+  const ciCaches = [...ciWorkflow.matchAll(/uses: Swatinem\/rust-cache@[0-9a-f]{40} #[^\n]*\n\s+with:\n(?<config>(?:\s{10}\S[^\n]*\n)+)/g)]
   assert.equal(ciCaches.length, 4, "every CI job that builds Rust must cache it")
   for (const cache of ciCaches) {
     assert.match(
