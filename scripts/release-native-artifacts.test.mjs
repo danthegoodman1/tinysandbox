@@ -66,7 +66,7 @@ test("release matrix builds the four supported native bindings", () => {
   assert.deepEqual(matrixEntries, expectedBuilds)
   assert.match(workflow, /actual_arch="\$\(uname -m\)"/)
   assert.match(workflow, /matrix\.uname_arch/)
-  assert.match(workflow, /cargo-native-\$\{\{ matrix\.artifact \}\}/)
+  assert.match(workflow, /key: native-\$\{\{ matrix\.artifact \}\}/)
 
   const macosNodeMatrix = ciWorkflow.match(/\n  node-macos:\n[\s\S]*?\n        os: \[([^\]]+)\]/)
   assert.ok(macosNodeMatrix, "CI must define the macOS Node architecture matrix")
@@ -74,7 +74,24 @@ test("release matrix builds the four supported native bindings", () => {
     macosNodeMatrix[1].split(",").map((value) => value.trim()),
     expectedBuilds.filter(({ os }) => os.startsWith("macos")).map(({ os }) => os)
   )
-  assert.match(ciWorkflow, /runner\.arch.*cargo-node/)
+  // rust-cache separates entries by job, matrix, and rustc host triple, so the
+  // two macOS architectures cannot share a cache.
+  assert.match(ciWorkflow, /uses: Swatinem\/rust-cache@v2\n\s+with:\n\s+key: node/)
+})
+
+test("branch runs restore the cargo cache without evicting main's", () => {
+  // The repository cache quota is shared, and a branch cannot read another
+  // branch's entries. Saving from every branch run pushed main's cache out, so
+  // main rebuilt from scratch: 20 minutes for a job that takes 2 warm.
+  const ciCaches = [...ciWorkflow.matchAll(/uses: Swatinem\/rust-cache@v2\n\s+with:\n(?<config>(?:\s{10}\S[^\n]*\n)+)/g)]
+  assert.equal(ciCaches.length, 4, "every CI job that builds Rust must cache it")
+  for (const cache of ciCaches) {
+    assert.match(
+      cache.groups.config,
+      /save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/,
+      "CI caches must only be written from main"
+    )
+  }
 })
 
 test("Linux release and CI builds use pinned GLIBC 2.34 containers", () => {

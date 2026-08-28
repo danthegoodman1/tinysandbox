@@ -161,17 +161,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-
-            ${{ runner.os }}-cargo-
+          key: native-${{ matrix.artifact }}
 
       - uses: actions/setup-node@v4
         with:
@@ -247,17 +239,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-native-${{ matrix.artifact }}-
-            ${{ runner.os }}-cargo-
+          key: native-${{ matrix.artifact }}
 
       - uses: actions/setup-node@v4
         with:
@@ -319,17 +303,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tinysandbox-node/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-publish-
-            ${{ runner.os }}-cargo-
+          key: publish
 
       - uses: actions/setup-node@v4
         with:
