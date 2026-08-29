@@ -75,7 +75,7 @@ TMP_OUT="${WORK}/quickjs-tinysandbox.wasm"
   "${SRC_DIR}/libregexp.c" \
   "${SRC_DIR}/libunicode.c" \
   -Wl,--allow-undefined \
-  -Wl,-z,stack-size=4194304 \
+  -Wl,-z,stack-size=1048576 \
   -Wl,--export=tinysandbox_alloc \
   -Wl,--export=tinysandbox_free \
   -Wl,--export=tinysandbox_run \
