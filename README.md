@@ -325,7 +325,10 @@ synchronous VFS additionally enables `runFile()`, the supported `fs` subset,
 filesystem capability. The package does not include the shell, coreutils,
 native bindings, a concrete storage backend, or ambient network access. Its
 [package README](tinysandbox-js-runtime/README.md) documents the small API and
-host examples.
+host examples. A minimal
+[browser playground](tinysandbox-js-runtime/examples/browser/index.html) runs
+editable source in the wasm guest and shows console output, the return value,
+and peak linear memory side by side.
 
 Not there on purpose: timers, an event loop, direct networking,
 `child_process`/process spawning, built-in shell command execution from

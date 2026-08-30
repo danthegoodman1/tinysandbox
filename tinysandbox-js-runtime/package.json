@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/js-runtime",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stateless QuickJS runtime for standard WebAssembly hosts",
   "type": "module",
   "exports": {
@@ -12,10 +12,13 @@
   },
   "files": [
     "dist/",
+    "examples/browser/",
     "quickjs.wasm",
     "README.md",
     "LICENSE-APACHE",
-    "LICENSE-MIT"
+    "LICENSE-MIT",
+    "scripts/build-browser-site.mjs",
+    "scripts/serve-browser-example.mjs"
   ],
   "sideEffects": false,
   "engines": {
@@ -23,6 +26,8 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:site": "node scripts/build-browser-site.mjs",
+    "example:browser": "node scripts/serve-browser-example.mjs",
     "test": "npm run build && npm run typecheck && node --test test/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test:browser": "node test/browser-smoke.mjs",

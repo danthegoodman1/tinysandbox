@@ -1,25 +1,335 @@
 <!doctype html>
-<meta charset="utf-8">
-<title>tinysandbox JS runtime smoke</title>
-<pre id="result">RUNNING</pre>
-<script type="module">
-  import { createEngine } from "../../dist/index.js";
-  import { TestVfs } from "../../test/test-vfs.mjs";
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tinysandbox · QuickJS/WASM playground</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #10110f;
+      --panel: #161714;
+      --text: #e8eadf;
+      --muted: #92968a;
+      --line: #34372f;
+      --accent: #c4f36b;
+      --error: #ff8b7d;
+    }
 
-  const wasm = await fetch("../../quickjs.wasm").then(response => response.arrayBuffer());
-  const engine = await createEngine(wasm);
-  const result = engine.runCode("console.log(greet({ name: 'browser' }))", {
-    globals: { greet: ({ name }) => `hello ${name}` },
-  });
-  const vfs = new TestVfs({
-    "/app/main.js": "console.log(__filename, require('./message').text)",
-    "/app/message.js": "exports.text = require('fs').readFileSync('./value', 'utf8')",
-    "/app/value": "from-vfs",
-  });
-  const file = engine.runFile("main.js", { vfs, cwd: "/app" });
-  document.querySelector("#result").textContent =
-    result.exitCode === 0 && result.stdout === "hello browser\n" &&
-    file.exitCode === 0 && file.stdout === "/app/main.js from-vfs\n"
-      ? "PASS"
-      : JSON.stringify({ result, file });
-</script>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--background);
+      color: var(--text);
+      font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    main {
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: clamp(18px, 3vw, 24px);
+      font-weight: 600;
+      letter-spacing: -0.04em;
+    }
+
+    p {
+      max-width: 760px;
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .runtime {
+      flex: none;
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      color: var(--accent);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    section + section { border-left: 1px solid var(--line); }
+
+    .pane-header {
+      display: flex;
+      min-height: 45px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .actions { display: flex; gap: 8px; }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 0;
+      padding: 6px 10px;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 11px;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+
+    button:hover:not(:disabled), button:focus-visible {
+      border-color: var(--accent);
+      color: var(--accent);
+      outline: none;
+    }
+
+    button:disabled { cursor: wait; opacity: 0.45; }
+    button.primary { background: var(--accent); color: #171a11; border-color: var(--accent); }
+    button.primary:hover:not(:disabled), button.primary:focus-visible { color: #171a11; filter: brightness(1.08); }
+
+    textarea {
+      display: block;
+      width: 100%;
+      height: min(62vh, 620px);
+      min-height: 360px;
+      resize: vertical;
+      border: 0;
+      border-radius: 0;
+      padding: 18px;
+      background: var(--panel);
+      color: var(--text);
+      font: inherit;
+      line-height: 1.65;
+      tab-size: 2;
+      outline: none;
+    }
+
+    textarea:focus { box-shadow: inset 0 0 0 1px var(--accent); }
+    textarea[readonly] { color: #c9ccbf; }
+
+    footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-top: 0;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    #exit[data-state="ok"] { color: var(--accent); }
+    #exit[data-state="error"] { color: var(--error); }
+    kbd { color: var(--text); font: inherit; }
+
+    @media (max-width: 760px) {
+      main { padding: 18px; }
+      header { display: block; }
+      .runtime { display: inline-block; margin-top: 16px; }
+      .workspace { grid-template-columns: 1fr; }
+      section + section { border-left: 0; border-top: 1px solid var(--line); }
+      textarea { height: 42vh; min-height: 280px; }
+    }
+  </style>
+</head>
+<body data-runtime="quickjs-wasm">
+  <main>
+    <header>
+      <div>
+        <h1>tinysandbox / js</h1>
+        <p>Source runs in a fresh QuickJS instance inside WebAssembly. Browser globals, DOM, filesystem, and network capabilities are not exposed.</p>
+      </div>
+      <div class="runtime">host: V8 · guest: QuickJS/WASM</div>
+    </header>
+
+    <div class="workspace">
+      <section>
+        <div class="pane-header">
+          <span>input.js</span>
+          <div class="actions">
+            <button id="reset" type="button">reset</button>
+            <button class="primary" id="run" type="button" disabled>run</button>
+          </div>
+        </div>
+        <textarea id="source" aria-label="JavaScript source" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+      </section>
+
+      <section>
+        <div class="pane-header">
+          <span>output</span>
+          <span>console + return value</span>
+        </div>
+        <textarea id="output" aria-label="Execution output" readonly>Loading QuickJS WebAssembly…</textarea>
+      </section>
+    </div>
+
+    <footer aria-live="polite">
+      <span id="exit">loading wasm</span>
+      <span id="elapsed">time —</span>
+      <span id="memory">wasm peak —</span>
+      <span>limit 16 MiB</span>
+      <span><kbd>⌘/ctrl + enter</kbd> to run</span>
+    </footer>
+    <pre id="result" hidden>RUNNING</pre>
+  </main>
+
+  <script type="module">
+    import { createEngine } from "../../dist/index.js";
+
+    const MEMORY_LIMIT_BYTES = 16 * 1024 * 1024;
+    const DEFAULT_SOURCE = `console.log("hello from QuickJS");
+console.log("window:", typeof window);
+console.log("document:", typeof document);
+
+({ answer: 6 * 7, engine: "quickjs-wasm" });`;
+
+    const source = document.querySelector("#source");
+    const output = document.querySelector("#output");
+    const runButton = document.querySelector("#run");
+    const resetButton = document.querySelector("#reset");
+    const exit = document.querySelector("#exit");
+    const elapsed = document.querySelector("#elapsed");
+    const memory = document.querySelector("#memory");
+    const smoke = document.querySelector("#result");
+    source.value = DEFAULT_SOURCE;
+
+    let engine;
+    let firstRun = true;
+
+    function formatBytes(bytes) {
+      return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+    }
+
+    function guestProgram(userSource) {
+      // The browser only constructs this string. QuickJS evaluates it inside
+      // the wasm instance; browser eval() and Function() are never used.
+      return `(function () {
+  const capture = playground.capture;
+  const value = (0, eval)(${JSON.stringify(userSource)});
+  const type = value === null ? "null" : typeof value;
+  let text;
+  if (type === "undefined") text = "undefined";
+  else if (type === "bigint") text = String(value) + "n";
+  else if (type === "function" || type === "symbol") text = String(value);
+  else {
+    try {
+      text = JSON.stringify(value, function (_key, item) {
+        return typeof item === "bigint" ? String(item) + "n" : item;
+      }, 2);
+    } catch (_error) {
+      text = String(value);
+    }
+    if (text === undefined) text = String(value);
+  }
+  capture({ type: type, text: text });
+})()`;
+    }
+
+    function renderResult(result, returned, durationMs) {
+      const sections = [];
+      if (result.stdout) sections.push(`stdout\n${result.stdout.trimEnd()}`);
+      if (result.stderr) sections.push(`stderr\n${result.stderr.trimEnd()}`);
+      sections.push(returned ? `return (${returned.type})\n${returned.text}` : "return\n<not reached>");
+      output.value = sections.join("\n\n");
+
+      exit.textContent = `exit ${result.exitCode}`;
+      exit.dataset.state = result.exitCode === 0 ? "ok" : "error";
+      elapsed.textContent = `time ${durationMs.toFixed(1)} ms`;
+      memory.textContent = `wasm peak ${formatBytes(result.peakWasmMemoryBytes)} · initial ${formatBytes(result.initialWasmMemoryBytes)}`;
+
+      if (firstRun) {
+        firstRun = false;
+        smoke.textContent = result.exitCode === 0 &&
+          result.stdout.includes("hello from QuickJS") &&
+          result.stdout.includes("window: undefined") &&
+          returned?.text.includes('"answer": 42')
+            ? "PASS"
+            : "FAIL";
+      }
+    }
+
+    async function run() {
+      if (!engine) return;
+      runButton.disabled = true;
+      output.value = "Running inside QuickJS/WASM…";
+      exit.textContent = "running";
+      exit.dataset.state = "";
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      let returned;
+      const started = performance.now();
+      try {
+        const result = engine.runCode(guestProgram(source.value), {
+          globals: {
+            "playground.capture": value => {
+              returned = value;
+              return null;
+            },
+          },
+          wasmMemoryBytes: MEMORY_LIMIT_BYTES,
+          quickjsHeapBytes: 8 * 1024 * 1024,
+          timeoutMs: 1000,
+        });
+        renderResult(result, returned, performance.now() - started);
+      } catch (error) {
+        output.value = `host error\n${error instanceof Error ? error.stack : String(error)}`;
+        exit.textContent = "host error";
+        exit.dataset.state = "error";
+        elapsed.textContent = `time ${(performance.now() - started).toFixed(1)} ms`;
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    runButton.addEventListener("click", run);
+    resetButton.addEventListener("click", () => {
+      source.value = DEFAULT_SOURCE;
+      run();
+    });
+    source.addEventListener("keydown", event => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        run();
+      }
+    });
+
+    try {
+      const response = await fetch("../../quickjs.wasm");
+      if (!response.ok) throw new Error(`could not load quickjs.wasm (${response.status})`);
+      engine = await createEngine(await response.arrayBuffer());
+      runButton.disabled = false;
+      await run();
+    } catch (error) {
+      output.value = `initialization error\n${error instanceof Error ? error.stack : String(error)}`;
+      exit.textContent = "load error";
+      exit.dataset.state = "error";
+      smoke.textContent = "FAIL";
+    }
+  </script>
+</body>
+</html>

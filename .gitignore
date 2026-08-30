@@ -1,3 +1,4 @@
 /target
 node_modules
 *.node
+/tinysandbox-js-runtime/site-dist/
