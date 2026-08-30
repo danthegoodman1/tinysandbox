@@ -43,6 +43,40 @@ const result = engine.runCode("console.log(context.value(null))", {
 });
 ```
 
+## Browser playground
+
+The package includes a minimal two-pane
+[browser example](examples/browser/index.html) that displays guest console
+output, the evaluated script's return value, exit status, elapsed time, and
+initial/peak wasm linear memory. It deliberately ends with an expression so
+the example can capture that value through a synchronous custom global; the
+browser never evaluates the source itself.
+
+From this directory in either a source checkout or the unpacked package:
+
+```sh
+npm run example:browser
+```
+
+Then open `http://127.0.0.1:4173/`. The default script prints that `window` and
+`document` are unavailable inside the guest. Each click creates the same fresh,
+bounded QuickJS/WASM instance as a direct `runCode()` call.
+
+### Cloudflare Pages
+
+The site is entirely static. In a Cloudflare Pages Git integration, use:
+
+| Setting | Value |
+| --- | --- |
+| Framework preset | `None` |
+| Root directory | `tinysandbox-js-runtime` |
+| Build command | `npm ci && npm run build:site` |
+| Build output directory | `site-dist` |
+
+No environment variables, Pages Functions, Wrangler configuration, or separate
+deployment workflow are required. `build:site` creates a clean output directory
+containing only the playground, `runtime.js`, and `quickjs.wasm`.
+
 `runCode(code, options)` returns `exitCode`, UTF-8 `stdout` and `stderr`, and
 initial/peak wasm memory bytes. Its defaults are a 64 MiB wasm maximum, 32 MiB
 QuickJS heap, 30 second monotonic deadline, and 1 MiB each for source, serialized

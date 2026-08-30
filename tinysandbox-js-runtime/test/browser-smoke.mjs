@@ -3,13 +3,23 @@ import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 
-const root = new URL("../", import.meta.url);
+const packageRoot = new URL("../", import.meta.url);
+const root = new URL("../site-dist/", import.meta.url);
 const chrome = process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 await stat(chrome);
 
+await new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["scripts/build-browser-site.mjs"], {
+    cwd: packageRoot,
+    stdio: "inherit",
+  });
+  child.on("error", reject);
+  child.on("close", code => code === 0 ? resolve() : reject(new Error(`site build exited ${code}`)));
+});
+
 const server = createServer(async (request, response) => {
   try {
-    const pathname = request.url === "/" ? "/examples/browser/index.html" : request.url;
+    const pathname = request.url === "/" ? "/index.html" : request.url;
     const path = normalize(join(root.pathname, pathname));
     if (!path.startsWith(root.pathname)) throw new Error("outside fixture root");
     const content = await readFile(path);
@@ -33,7 +43,8 @@ try {
     child.on("error", reject);
     child.on("close", code => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(`Chrome exited ${code}: ${stderr}`)));
   });
-  if (!output.includes('<pre id="result">PASS</pre>')) throw new Error(`browser smoke failed:\n${output}\n${chromeStderr}`);
+  if (!/<pre id="result"[^>]*>PASS<\/pre>/u.test(output)) throw new Error(`browser smoke failed:\n${output}\n${chromeStderr}`);
+  if (!output.includes('<body data-runtime="quickjs-wasm">')) throw new Error("browser example must identify the guest runtime");
   console.log("headless_chrome_smoke=PASS");
 } finally {
   server.close();
