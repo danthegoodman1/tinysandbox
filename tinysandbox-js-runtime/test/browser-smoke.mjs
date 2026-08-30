@@ -45,6 +45,7 @@ try {
   });
   if (!/<pre id="result"[^>]*>PASS<\/pre>/u.test(output)) throw new Error(`browser smoke failed:\n${output}\n${chromeStderr}`);
   if (!output.includes('<body data-runtime="quickjs-wasm">')) throw new Error("browser example must identify the guest runtime");
+  if (!output.includes('href="https://github.com/danthegoodman1/tinysandbox"')) throw new Error("browser example must link to the repository");
   console.log("headless_chrome_smoke=PASS");
 } finally {
   server.close();
