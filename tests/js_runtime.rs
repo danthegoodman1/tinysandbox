@@ -5,9 +5,70 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tinysandbox::sandbox::{FetchRequest, FetchResponse, HostError, JsGlobals, Limits, Sandbox};
 use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
+
+#[tokio::test]
+async fn js_runs_shared_vfs_and_commonjs_portable_corpus() {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FileFixture {
+        path: String,
+        text: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Case {
+        name: String,
+        entry: String,
+        argv: Vec<String>,
+        files: Vec<FileFixture>,
+        exit_code: i32,
+        stdout: String,
+        stderr_prefix: String,
+    }
+
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/js_vfs_portable_corpus.json"))
+            .expect("valid portable VFS corpus");
+    for case in cases {
+        let vfs = Arc::new(InMemoryVfs::default());
+        vfs.mkdir("/app").expect("create app directory");
+        for file in &case.files {
+            let path = file
+                .path
+                .strip_prefix("/workspace")
+                .expect("portable fixture lives under /workspace");
+            write_vfs_file(vfs.as_ref(), path, file.text.as_bytes());
+        }
+        let sandbox_vfs: Arc<dyn Vfs> = vfs;
+        let sandbox = Sandbox::builder()
+            .mount_arc("workspace", sandbox_vfs)
+            .build();
+        let arguments = case.argv.iter().skip(2).cloned().collect::<Vec<_>>();
+        let command = std::iter::once("js".to_owned())
+            .chain(std::iter::once(case.entry.clone()))
+            .chain(arguments)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = sandbox.exec(&command).await;
+        assert_eq!(
+            result.exit_code, case.exit_code,
+            "{}: {}",
+            case.name, result.stderr
+        );
+        assert_eq!(result.stdout, case.stdout, "{}", case.name);
+        assert!(
+            result.stderr.starts_with(&case.stderr_prefix),
+            "{}: {}",
+            case.name,
+            result.stderr
+        );
+    }
+}
 
 #[tokio::test]
 async fn js_eval_console_process_and_node_verified_shape() {
@@ -1724,7 +1785,7 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
         .build();
     let start = Instant::now();
     let result = sandbox.exec("js -e 'while (true) {}'").await;
-    assert_eq!(result.exit_code, 124);
+    assert_eq!(result.exit_code, 124, "stderr: {}", result.stderr);
     assert!(start.elapsed() < Duration::from_secs(2));
 
     let oom = Sandbox::builder()
@@ -1744,6 +1805,141 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
         "the allocation bomb must instantiate the 19-page module and grow it before reaching the limit; peak={peak}"
     );
     assert!(peak <= OOM_LIMIT_BYTES);
+
+    let natural_ceiling = Sandbox::builder()
+        .limits(Limits {
+            wasm_memory_bytes: usize::MAX,
+            ..Limits::default()
+        })
+        .build()
+        .exec("js -e 'console.log(\"large cap\")'")
+        .await;
+    assert_eq!(natural_ceiling.exit_code, 0, "{}", natural_ceiling.stderr);
+    assert_eq!(natural_ceiling.stdout, "large cap\n");
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableCorpusCase {
+    name: String,
+    code: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+    cwd: Option<String>,
+    exit_code: i32,
+    stdout: String,
+    stderr_prefix: String,
+}
+
+#[tokio::test]
+async fn js_shared_portable_corpus_runs_under_wasmtime() {
+    let cases: Vec<PortableCorpusCase> =
+        serde_json::from_str(include_str!("fixtures/js_portable_corpus.json"))
+            .expect("portable corpus is valid JSON");
+
+    for case in cases {
+        let mut builder = Sandbox::builder();
+        if let Some(cwd) = &case.cwd {
+            builder = builder.cwd(cwd);
+        }
+        for (name, value) in &case.env {
+            builder = builder.env(name, value);
+        }
+        let mut command = format!("js -e '{}'", shell_single_quote(&case.code));
+        for argument in case.argv.iter().skip(2) {
+            command.push_str(" '");
+            command.push_str(&shell_single_quote(argument));
+            command.push('\'');
+        }
+        let result = builder.build().exec(&command).await;
+        assert_eq!(result.exit_code, case.exit_code, "{}", case.name);
+        assert_eq!(result.stdout, case.stdout, "{}", case.name);
+        assert!(
+            result.stderr.starts_with(&case.stderr_prefix),
+            "{}: {}",
+            case.name,
+            result.stderr
+        );
+    }
+}
+
+#[tokio::test]
+async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
+    const INITIAL_BYTES: usize = 19 * 64 * 1024;
+
+    let oversized_source = format!("js -e '{}'", "x".repeat(INITIAL_BYTES + 1));
+    let source = Sandbox::builder()
+        .limits(Limits {
+            wasm_memory_bytes: INITIAL_BYTES,
+            ..Limits::default()
+        })
+        .build()
+        .exec(&oversized_source)
+        .await;
+    assert_eq!(source.exit_code, 1);
+    assert!(source.stderr.contains("script source exceeded limit"));
+
+    const RESPONSE_CAP: usize = 4 * 1024 * 1024;
+    let over = Sandbox::builder()
+        .limits(Limits {
+            wasm_memory_bytes: RESPONSE_CAP,
+            ..Limits::default()
+        })
+        .js_global("exact", |_args| async {
+            Ok(json!("x".repeat(RESPONSE_CAP)))
+        })
+        .build()
+        .exec("js -e 'try { exact(null) } catch (err) { console.log(err.code) }'")
+        .await;
+    assert_eq!(over.exit_code, 0, "{}", over.stderr);
+    assert_eq!(over.stdout, "E2BIG\n");
+
+    let independent_fetch_cap = Sandbox::builder()
+        .limits(Limits {
+            fetch_response_bytes: 0,
+            ..Limits::default()
+        })
+        .js_global("small", |_args| async { Ok(Value::Null) })
+        .build()
+        .exec("echo file > /workspace/a; js -e 'console.log(small(null), require(\"fs\").readFileSync(\"/workspace/a\", \"utf8\").trim())'")
+        .await;
+    assert_eq!(
+        independent_fetch_cap.exit_code, 0,
+        "{}",
+        independent_fetch_cap.stderr
+    );
+    assert_eq!(independent_fetch_cap.stdout, "null file\n");
+
+    let output = Sandbox::builder()
+        .limits(Limits {
+            stdout_bytes: 64,
+            stderr_bytes: 64,
+            ..Limits::default()
+        })
+        .build()
+        .exec("js -e 'console.log(\"a\".repeat(1000)); console.error(\"b\".repeat(1000))'")
+        .await;
+    assert_eq!(output.exit_code, 0);
+    assert!(output.metrics.stdout_truncated);
+    assert!(output.metrics.stderr_truncated);
+    assert_eq!(output.stdout.len(), 64);
+    assert_eq!(output.stderr.len(), 64);
+    assert!(output.stdout.contains("[tinysandbox: output truncated]"));
+    assert!(output.stderr.contains("[tinysandbox: output truncated]"));
+
+    let short_budget = Sandbox::builder()
+        .limits(Limits {
+            wall_time: Duration::from_millis(40),
+            ..Limits::default()
+        })
+        .js_global("fast", |_args| async { Ok(json!("ok")) })
+        .build()
+        .exec("js -e 'console.log(fast(null))'")
+        .await;
+    assert_eq!(short_budget.exit_code, 0, "{}", short_budget.stderr);
+    assert_eq!(short_budget.stdout, "ok\n");
 }
 
 fn shell_single_quote(input: &str) -> String {

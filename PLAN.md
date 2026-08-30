@@ -514,7 +514,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 8A: `scripts/release-version.mjs` lockstep versioning | `next`/`apply`/`check` covers root Cargo, N-API Cargo, the facade and four native npm packages, package lock, loader version, optional dependencies, and N-API dependency version. |
-| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits lockstep bump; builds Linux glibc plus macOS native artifacts for x64 and arm64; publishes each artifact in one platform-constrained optional package before the JS-only facade; publishes crates.io + npm idempotently. |
+| Complete | Work | 8B: `release.yml` auto-release workflow | Workflow runs only after successful push CI on `main` or manual dispatch; skips `[skip release]` and `chore(release):`; commits the native packages' lockstep bump; builds Linux glibc plus macOS native artifacts for x64 and arm64; publishes each artifact in one platform-constrained optional package before the JS-only facade; and idempotently publishes crates.io, the native npm packages, and the independently versioned `@tinysandbox/js-runtime` version declared in its own manifest. |
 | Complete | Work | 8C: CI gates sufficient as release trigger | CI has read-only permissions and blocks on release script/native-package tests, fmt, locked Rust matrix, clippy, docs, crate publish dry-run, and npm tests/examples/package dry-run on Linux glibc and macOS across x64 and arm64. |
 | Complete | Test | script unit tests + dry-run roundtrip | Release tests verify lockstep versions, exact four-package metadata, artifact routing, and a zero-native facade tarball; every native CI runner also bundles the facade with esbuild and loads only its auto-detected package. `release-version.mjs check`, crate publish dry-run, and npm package dry-run remain gates. |
 | Incomplete | Gate | end-to-end auto-release on both registries | Missing: first successful `main` release observed on crates.io and npm. |
@@ -824,10 +824,12 @@ Out of scope:
 
 Completion gate:
 The same artifact runs the focused JS corpus under Wasmtime and Node/V8; a
-headless Chrome page executes `runCode()`; a Convex default-runtime Action
-imports the packaged wasm module and executes a smoke script; infinite loops,
-allocation bombs, oversized host responses, and global collisions fail with
-the documented bounded behavior.
+headless Chrome page executes `runCode()`; a copyable Convex default-runtime
+Action imports the packaged wasm module and passes strict type-checking plus a
+bundled V8 compatibility smoke; infinite loops, allocation bombs, oversized
+host responses, and global collisions fail with the documented bounded
+behavior. This repository does not deploy or execute the example in a Convex
+project.
 
 Testing plan:
 - Unit-test wasm loading, fresh-state isolation, UTF-8 I/O, exception/exit
@@ -837,8 +839,9 @@ Testing plan:
 - Run a small shared script corpus under both hosts for console/process,
   microtask draining, errors, recursion, and custom globals.
 - Serve a dependency-free browser fixture and execute it in headless Chrome;
-  bundle/type-check a Convex Action fixture and record one real default-runtime
-  smoke run without putting credentials in CI.
+  bundle/type-check a Convex Action fixture and execute the resulting bundle
+  against the standard V8/WebAssembly APIs it requires. Do not deploy it from
+  this repository.
 - Run `npm pack --dry-run` and inspect the tarball for only the ESM/types,
   README/license, and wasm artifact.
 
@@ -846,14 +849,14 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 12A: zero-dependency ESM package and explicit wasm loading | Missing: package scaffold, public types, bytes/module loading tests, and inspected pack output. |
-| Incomplete | Work | 12B: shared imported-memory and interrupt ABI | Missing: C exports/imports, V8 host adapter, Rust host adaptation, and ABI inspection evidence. |
-| Incomplete | Work | 12C: stateless `runCode()` with bounded result capture | Missing: implementation proving fresh physical instance/runtime per call and explicit disposal. |
-| Incomplete | Work | 12D: synchronous dotted custom globals | Missing: JSON bridge, collision/exception/size validation, and parity tests against tinysandbox. |
-| Incomplete | Test | hard memory, heap, timeout, and output/response limits | Missing: adversarial Node/V8 results plus unchanged Wasmtime limit tests. |
-| Incomplete | Test | Node/V8 and headless Chrome execution | Missing: shared corpus results in Node and actual Chrome smoke output. |
-| Incomplete | Test | Convex Action compatibility | Missing: bundled/type-checked example and recorded default-runtime action smoke using direct `.wasm` import. Convex documents `WebAssembly.Module` imports and standard WebAssembly support at `https://docs.convex.dev/functions/runtimes`. |
-| Incomplete | Gate | portable stateless runtime works in target V8 hosts | Missing: all Phase 12 host, limit, corpus, and package evidence. |
+| Complete | Work | 12A: zero-dependency ESM package and explicit wasm loading | `tinysandbox-js-runtime` has no runtime dependencies, exports ESM/types and `quickjs.wasm`, accepts bytes or `WebAssembly.Module`, and never loads an asset implicitly. `src/index.ts` is the authoritative runtime source copied by the dependency-free build. `npm pack --dry-run` and tar inspection show exactly seven files: ESM, types, package metadata, README, two licenses, and the 626,558-byte wasm; 270,506 bytes packed/660,534 bytes unpacked. |
+| Complete | Work | 12B: shared imported-memory and interrupt ABI | ABI 12 imports/re-exports `env.memory`, imports synchronous `tinysandbox.should_interrupt`, takes a third heap-limit argument on `tinysandbox_run`, and retains the 19-page floor. Both hosts create a maximum-bounded memory per run and clamp huge limits to the wasm32 65,536-page ceiling. V8 validates the exact imports/exports, arities, ABI marker, and a 19-minimum/65,536-maximum probe before accepting bytes or modules; patched-minimum and missing-interrupt adversarial modules reject at engine creation. Rust retains epoch interruption. Artifact inspection records the exact ABI; two final rebuilds match SHA-256 `486eae877cf3274ce36e74ba30c5e9231d312d08572bed508a92872e57f9923b`. |
+| Complete | Work | 12C: stateless `runCode()` with bounded result capture | `createEngine()` compiles once; each synchronous `runCode()` constructs a fresh imported memory, wasm instance, QuickJS runtime/context, and returns exit/stdout/stderr plus initial/peak memory. Isolation tests prove guest globals do not survive. Source and serialized response checks occur before boundary writes; V8 output imports and Rust's bounded head/tail capture avoid unbounded host accumulation while Rust preserves its existing truncation marker and metrics. |
+| Complete | Work | 12D: synchronous dotted custom globals | Portable globals reuse the validated dotted-name surface and synchronous JSON bridge. Promise returns, non-functions, invalid/reserved/conflicting paths, handler failures, non-JSON host return shapes, cycles, oversized responses, and runtime collisions have deterministic behavior. Guest arguments deliberately retain the existing `JSON.stringify` omission/coercion semantics; host returns are strict `JsonValue`. |
+| Complete | Test | hard memory, heap, timeout, and output/response limits | Portable Node tests cover limits below the artifact floor, huge-cap clamping, a 2 MiB wasm allocation bomb, 512 KiB QuickJS heap OOM, a 20 ms infinite-loop deadline, exact and one-byte-over UTF-8 source/host-response/stdout/stderr boundaries, and host-return serialization failures. Focused Wasmtime tests cover source/response/output bounding, fetch/global cap independence, huge-cap clamping, allocation growth refusal, recursion, and timeout; the full Rust matrix remains green. |
+| Complete | Test | Node/V8 and headless Chrome execution | The shared six-case console/process, microtask, UTF-8, exit, error, and recursion corpus passes under Node/V8 and Rust/Wasmtime. Package tests pass 10/10. The dependency-free browser fixture executed in installed headless Chrome and reported `headless_chrome_smoke=PASS`. |
+| Complete | Test | Convex Action fixture and local compatibility | `examples/convex/action.ts` is a copyable default-runtime `action({ handler })`, imports the `.wasm` subpath as `WebAssembly.Module`, awaits host work before entering QuickJS, and type-checks under strict TypeScript. The isolated dev-only esbuild shim produced an 852,579-byte browser/V8 bundle and executed it successfully: `convex_v8_bundle_smoke=PASS`. |
+| Complete | Gate | portable stateless runtime works in target V8 hosts | Node/V8, Chrome, shared Wasmtime parity, package, ABI, adversarial limits, and the typed/bundled Convex-compatible Action fixture are complete. Deploying or executing the example in a real Convex project is intentionally outside this repository's gate. |
 
 ## Phase 13: Add the optional VFS and file execution surface
 
@@ -901,16 +904,16 @@ Testing plan:
   missing entry files, and stack trace filenames.
 - Test the no-VFS negative surface and instrument the test VFS to prove every
   read/write/module request uses it.
-- Re-run the Phase 12 Node/Chrome/Convex smoke tests with no VFS to prevent an
-  accidental storage dependency.
+- Re-run the Phase 12 Node/Chrome and Convex-compatible bundle smoke tests with
+  no VFS to prevent an accidental storage dependency.
 
 Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 13A: synchronous portable `Vfs` contract and errno mapping | Missing: public TypeScript interface, dispatcher, and contract tests matching `src/vfs/mod.rs`. |
-| Incomplete | Work | 13B: capability-gated guest `fs` and CommonJS loader | Missing: no-VFS negative tests and VFS-enabled parity implementation. |
-| Incomplete | Work | 13C: `runFile()` entrypoint semantics | Missing: VFS read/eval implementation and argv/path/stack/relative-require tests. |
-| Incomplete | Test | cross-host `fs` and CommonJS parity corpus | Missing: focused scripts passing under Rust/Wasmtime and TypeScript/V8. |
-| Incomplete | Test | browser and Convex regressions remain storage-independent | Missing: Phase 12 smoke reruns without a VFS plus browser VFS example output. |
-| Incomplete | Gate | optional VFS/file execution complete without the rest of tinysandbox | Missing: all Phase 13 contract, parity, negative-capability, and host evidence. |
+| Complete | Work | 13A: synchronous portable `Vfs` contract and errno mapping | The package exports the 11-operation absolute-path, safe-integer handle/offset `Vfs` interface, `VfsOpenMode`, metadata/dir-entry shapes, all 13 supported errno strings, and `VfsError`. The per-run dispatcher reuses the existing guest JSON/base64 protocol, owns fd cursor/lifecycle state, maps exact libuv errno/message/syscall/path shapes, rejects async methods without leaking their Promise rejections, and leaves quotas/accounting to the supplied VFS. The deterministic `test/test-vfs.mjs` is excluded from the seven-file package. |
+| Complete | Work | 13B: capability-gated guest `fs` and CommonJS loader | A backwards-compatible `vfs` run-config flag gates `Buffer`, `require("fs")`, and file-module host calls while keeping ABI 12 imports/exports/arities and the 19-page floor unchanged. Rust always enables it; portable no-VFS runs fail both fs and path requires with `ERR_CAPABILITY_UNAVAILABLE` before a storage host call. VFS runs retain the existing fs surface, relative/absolute resolution, cache/cycles/JSON/depth behavior, and fd cleanup. |
+| Complete | Work | 13C: `runFile()` entrypoint semantics | `runFile()` requires a VFS, resolves against `cwd`, reads with `open`/`readAt`/`close` under `sourceBytes`, decodes UTF-8 fatally, and runs through the same bounded evaluator. Tests pin missing/invalid/oversized entries, resolved stack filenames, cwd/dirname, custom argv, and the default distinction between original argv path `./nested/../main.js` and normalized `/app/main.js` filename. |
+| Complete | Test | cross-host `fs` and CommonJS parity corpus | `tests/fixtures/js_vfs_portable_corpus.json` passes unchanged under Rust/Wasmtime and Node/V8 for file entry globals, UTF-8/CommonJS/JSON/cache, fd positional read/write/truncate, readdir, and errno. Portable tests add binary I/O, all 11 supplied-VFS operations, cycles, module-depth limit, deterministic entry errors, leaked-fd cleanup, strict-unhandled-rejection containment, and proof that VFS does not grant or receive fetch calls; 19/19 package tests and 65/65 focused Rust JS tests pass. |
+| Complete | Test | browser and Convex regressions remain storage-independent | The actual headless-Chrome example executes `runFile()` with fs plus relative CommonJS and reports `headless_chrome_smoke=PASS`; the same page first reruns the Phase 12 no-VFS/global smoke. Node's Phase 12 suite remains green and the no-VFS Convex-compatible bundle reports `convex_v8_bundle_smoke=PASS` at 871,568 bytes. Real Convex deployment is intentionally not part of this repository's test surface. |
+| Complete | Gate | optional VFS/file execution complete without the rest of tinysandbox | Two rebuilds match at 626,766 bytes/SHA-256 `9b7686bc01fc7f09a6109ac516fb1bbd04771803cc1dc2b2e18726a1d3e8c3af`; package test/typecheck/Chrome/Convex/pack gates pass, with exactly seven packed files and no concrete VFS. Full all-feature and no-default-feature Rust workspace tests/build, fmt, all-target Clippy, and warning-denied rustdoc pass. |

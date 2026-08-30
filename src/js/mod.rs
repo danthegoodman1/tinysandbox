@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use wasmtime::{
-    Caller, Engine, Extern, InstancePre, Linker, Memory, Module, ResourceLimiter, Store, Trap,
+    Caller, Engine, Extern, Linker, Memory, MemoryType, Module, ResourceLimiter, Store, Trap,
 };
 
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
@@ -49,8 +49,11 @@ const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
 #[cfg(quickjs_precompiled)]
 const QUICKJS_CWASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quickjs.cwasm"));
 const EPOCH_TICK: Duration = Duration::from_millis(5);
+const WASM_PAGE_BYTES: usize = 64 * 1024;
+const QUICKJS_INITIAL_MEMORY_PAGES: u32 = 19;
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+const OUTPUT_TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
 
 /// Registers the `js` command in a sandbox command registry.
 pub fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
@@ -93,6 +96,12 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
             limits: JsRuntimeLimits {
                 wasm_memory_bytes: limits.wasm_memory_bytes,
                 fetch_response_bytes: limits.fetch_response_bytes,
+                source_bytes: limits.wasm_memory_bytes,
+                // A serialized host response larger than the guest's entire
+                // linear-memory allowance can never cross successfully.
+                host_response_bytes: limits.wasm_memory_bytes,
+                stdout_bytes: limits.stdout_bytes,
+                stderr_bytes: limits.stderr_bytes,
                 wall_time: limits.wall_time,
             },
             host_runtime,
@@ -131,6 +140,10 @@ struct JsRunConfig {
 struct JsRuntimeLimits {
     wasm_memory_bytes: usize,
     fetch_response_bytes: usize,
+    source_bytes: usize,
+    host_response_bytes: usize,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
     wall_time: Duration,
 }
 
@@ -210,6 +223,7 @@ struct GuestConfig<'a> {
     cwd: &'a str,
     globals: &'a [String],
     prelude: &'a str,
+    vfs: bool,
 }
 
 struct JsRunResult {
@@ -250,6 +264,12 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         host_runtime,
     } = config;
     let compiled = compiled_runtime()?;
+    if invocation.code.len() > limits.source_bytes {
+        return Err(wasmtime::Error::msg(format!(
+            "script source exceeded limit of {} bytes",
+            limits.source_bytes
+        )));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .map_err(wasmtime::Error::new)?;
@@ -268,7 +288,21 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
     store.set_epoch_deadline(epoch_ticks(limits.wall_time));
     store.epoch_deadline_trap();
 
-    let instance = compiled.pre.instantiate(&mut store)?;
+    let max_pages = (limits.wasm_memory_bytes / WASM_PAGE_BYTES).min(65_536);
+    if max_pages < QUICKJS_INITIAL_MEMORY_PAGES as usize {
+        return Err(wasmtime::Error::msg(
+            "tinysandbox wasm memory limit exceeded",
+        ));
+    }
+    let memory = Memory::new(
+        &mut store,
+        MemoryType::new(QUICKJS_INITIAL_MEMORY_PAGES, Some(max_pages as u32)),
+    )?;
+    let mut linker = Linker::new(&compiled.engine);
+    define_tinysandbox_imports(&mut linker)?;
+    define_wasi_imports(&mut linker)?;
+    linker.define(&mut store, "env", "memory", memory)?;
+    let instance = linker.instantiate(&mut store, &compiled.module)?;
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| wasmtime::Error::msg("quickjs wasm did not export memory"))?;
@@ -282,7 +316,7 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
 
     let alloc = instance.get_typed_func::<i32, i32>(&mut store, "tinysandbox_alloc")?;
     let free = instance.get_typed_func::<i32, ()>(&mut store, "tinysandbox_free")?;
-    let run = instance.get_typed_func::<(i32, i32), i32>(&mut store, "tinysandbox_run")?;
+    let run = instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "tinysandbox_run")?;
 
     let global_names = store.data().globals.keys().cloned().collect::<Vec<_>>();
     let config = GuestConfig {
@@ -293,30 +327,40 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         cwd: &cwd,
         globals: &global_names,
         prelude: &js_prelude,
+        vfs: true,
     };
     let input = serde_json::to_vec(&config).map_err(wasmtime::Error::new)?;
     let len = i32::try_from(input.len()).map_err(|_| wasmtime::Error::msg("script too large"))?;
     let ptr = alloc.call(&mut store, len)?;
     memory.write(&mut store, ptr_usize(ptr)?, &input)?;
-    let exit_code = match run.call(&mut store, (ptr, len)) {
+    let heap_limit = i32::try_from(limits.wasm_memory_bytes).unwrap_or(i32::MAX);
+    let exit_code = match run.call(&mut store, (ptr, len, heap_limit)) {
         Ok(exit_code) => exit_code,
         Err(_) if store.data().limiter.limit_exceeded => {
             return Ok(JsRunResult {
                 exit_code: 1,
-                stdout: store.data().stdout.clone(),
+                stdout: store.data().stdout.finish_payload(),
                 stderr: b"js: wasm memory limit exceeded\n".to_vec(),
                 peak_wasm_memory_bytes: store.data().limiter.peak_memory_bytes,
             });
         }
-        Err(err) => return Err(err),
+        Err(err) => {
+            if store.data().timed_out {
+                return Err(Trap::Interrupt.into());
+            }
+            return Err(err);
+        }
     };
+    if store.data().timed_out {
+        return Err(Trap::Interrupt.into());
+    }
     free.call(&mut store, ptr)?;
 
     let state = store.data();
     Ok(JsRunResult {
         exit_code,
-        stdout: state.stdout.clone(),
-        stderr: state.stderr.clone(),
+        stdout: state.stdout.finish_payload(),
+        stderr: state.stderr.finish_payload(),
         peak_wasm_memory_bytes: state.limiter.peak_memory_bytes,
     })
 }
@@ -333,7 +377,7 @@ fn epoch_ticks(wall_time: Duration) -> u64 {
 
 struct CompiledRuntime {
     engine: Engine,
-    pre: InstancePre<HostState>,
+    module: Module,
     source: RuntimeSource,
 }
 
@@ -407,13 +451,9 @@ fn link_runtime(
     source: RuntimeSource,
 ) -> wasmtime::Result<CompiledRuntime> {
     start_epoch_thread(engine.clone());
-    let mut linker = Linker::new(&engine);
-    define_tinysandbox_imports(&mut linker)?;
-    define_wasi_imports(&mut linker)?;
-    let pre = linker.instantiate_pre(&module)?;
     Ok(CompiledRuntime {
         engine,
-        pre,
+        module,
         source,
     })
 }
@@ -503,16 +543,18 @@ struct HostState {
     host_runtime: tokio::runtime::Handle,
     globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     fetch: Option<Arc<dyn Fetch>>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: BoundedOutput,
+    stderr: BoundedOutput,
     response: Vec<u8>,
     fds: BTreeMap<i32, OpenFile>,
     next_fd: i32,
     limiter: WasmLimiter,
     fetch_response_bytes: usize,
+    host_response_bytes: usize,
     rng: u64,
     started: Instant,
     wall_time: Duration,
+    timed_out: bool,
 }
 
 struct HostStateConfig {
@@ -540,16 +582,18 @@ impl HostState {
             host_runtime,
             globals,
             fetch,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
+            stdout: BoundedOutput::new(limits.stdout_bytes),
+            stderr: BoundedOutput::new(limits.stderr_bytes),
             response: Vec::new(),
             fds: BTreeMap::new(),
             next_fd: 3,
             limiter: WasmLimiter::new(limits.wasm_memory_bytes),
             fetch_response_bytes: limits.fetch_response_bytes,
+            host_response_bytes: limits.host_response_bytes,
             rng: 0x7468_696e_626f_7821,
             started: Instant::now(),
             wall_time: limits.wall_time,
+            timed_out: false,
         }
     }
 
@@ -569,8 +613,12 @@ fn block_on_host_timeout<F, T>(
 where
     F: Future<Output = T>,
 {
-    // Fire before the outer command deadline so the guest can observe the host-call error.
-    let remaining = state.remaining_wall_time().saturating_sub(EPOCH_TICK * 2);
+    // Fire before the outer command deadline so the guest can observe the
+    // host-call error. A measured 50ms is sufficient for QuickJS to
+    // catch/render it, while the quarter-budget ceiling keeps short budgets
+    // useful instead of timing out immediately.
+    let headroom = (EPOCH_TICK * 10).min(state.wall_time / 4);
+    let remaining = state.remaining_wall_time().saturating_sub(headroom);
     state
         .host_runtime
         .block_on(async move { tokio::time::timeout(remaining, future).await })
@@ -587,6 +635,139 @@ struct WasmLimiter {
     max_memory_bytes: usize,
     peak_memory_bytes: usize,
     limit_exceeded: bool,
+}
+
+struct BoundedOutput {
+    cap: usize,
+    total: usize,
+    pre_truncation: Vec<u8>,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedOutput {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            total: 0,
+            pre_truncation: Vec::new(),
+            head: Vec::new(),
+            tail: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    fn plan(&self, len: usize) -> (usize, usize) {
+        if !self.truncated && len <= self.cap.saturating_sub(self.total) {
+            return (len, 0);
+        }
+        let prefix = if self.truncated {
+            0
+        } else {
+            self.cap.saturating_sub(self.total)
+        };
+        let tail_limit = self
+            .cap
+            .saturating_sub(OUTPUT_TRUNCATION_MARKER.len())
+            .div_ceil(2);
+        (prefix, len.min(tail_limit))
+    }
+
+    fn append(&mut self, len: usize, prefix: &[u8], suffix: &[u8]) {
+        if !self.truncated && len <= self.cap.saturating_sub(self.total) {
+            self.pre_truncation.extend_from_slice(prefix);
+            self.total = self.total.saturating_add(len);
+            return;
+        }
+        if !self.truncated {
+            self.pre_truncation.extend_from_slice(prefix);
+            self.truncated = true;
+            if self.cap > OUTPUT_TRUNCATION_MARKER.len() {
+                let keep = self.cap - OUTPUT_TRUNCATION_MARKER.len();
+                let head_len = keep / 2;
+                let tail_len = keep - head_len;
+                self.head.extend_from_slice(
+                    &self.pre_truncation[..head_len.min(self.pre_truncation.len())],
+                );
+                let preserved =
+                    self.pre_truncation[head_len.min(self.pre_truncation.len())..].to_vec();
+                self.push_tail(&preserved, tail_len);
+            }
+            self.pre_truncation.clear();
+        }
+        self.total = self.total.saturating_add(len);
+        if self.cap > OUTPUT_TRUNCATION_MARKER.len() {
+            let keep = self.cap - OUTPUT_TRUNCATION_MARKER.len();
+            self.push_tail(suffix, keep - keep / 2);
+        }
+    }
+
+    fn push_tail(&mut self, data: &[u8], limit: usize) {
+        if data.len() >= limit {
+            self.tail.clear();
+            self.tail.extend_from_slice(&data[data.len() - limit..]);
+        } else {
+            let overflow = self
+                .tail
+                .len()
+                .saturating_add(data.len())
+                .saturating_sub(limit);
+            self.tail.drain(..overflow);
+            self.tail.extend_from_slice(data);
+        }
+    }
+
+    fn finish_payload(&self) -> Vec<u8> {
+        if !self.truncated {
+            return self.pre_truncation.clone();
+        }
+        if self.cap <= OUTPUT_TRUNCATION_MARKER.len() {
+            return OUTPUT_TRUNCATION_MARKER.to_vec();
+        }
+        let mut out = Vec::with_capacity(self.cap + 1);
+        out.extend_from_slice(&self.head);
+        // The outer CaptureWriter remains the public source of the marker and
+        // truncated metric. Feed it one opaque byte over its cap, bracketed by
+        // the already-bounded head/tail, so its existing semantics stay exact.
+        out.resize(out.len() + OUTPUT_TRUNCATION_MARKER.len() + 1, 0);
+        out.extend_from_slice(&self.tail);
+        out
+    }
+}
+
+fn capture_output(
+    caller: &mut Caller<'_, HostState>,
+    memory: &Memory,
+    ptr: i32,
+    len: i32,
+    stdout: bool,
+) -> wasmtime::Result<i32> {
+    let len = usize_len(len)?;
+    let ptr = ptr_usize(ptr)?;
+    let (prefix_len, suffix_len) = {
+        let output = if stdout {
+            &caller.data().stdout
+        } else {
+            &caller.data().stderr
+        };
+        output.plan(len)
+    };
+    let mut prefix = vec![0; prefix_len];
+    memory.read(&*caller, ptr, &mut prefix)?;
+    let mut suffix = vec![0; suffix_len];
+    memory.read(
+        &*caller,
+        ptr.saturating_add(len.saturating_sub(suffix_len)),
+        &mut suffix,
+    )?;
+    let output = if stdout {
+        &mut caller.data_mut().stdout
+    } else {
+        &mut caller.data_mut().stderr
+    };
+    output.append(len, &prefix, &suffix);
+    Ok(i32::try_from(len).unwrap_or(i32::MAX))
 }
 
 impl WasmLimiter {
@@ -638,6 +819,18 @@ impl ResourceLimiter for WasmLimiter {
 fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Result<()> {
     linker.func_wrap(
         "tinysandbox",
+        "should_interrupt",
+        |mut caller: Caller<'_, HostState>| -> i32 {
+            if caller.data().started.elapsed() >= caller.data().wall_time {
+                caller.data_mut().timed_out = true;
+                1
+            } else {
+                0
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "tinysandbox",
         "host_call",
         |mut caller: Caller<'_, HostState>,
          op_ptr: i32,
@@ -652,8 +845,19 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
                 Ok(args) => handle_host_call(caller.data_mut(), &op, args),
                 Err(err) => HostResponse::error(HostCallError::invalid_json(err)),
             };
-            caller.data_mut().response =
-                serde_json::to_vec(&response).map_err(wasmtime::Error::new)?;
+            let mut bytes = serde_json::to_vec(&response).map_err(wasmtime::Error::new)?;
+            let cap = caller.data().host_response_bytes;
+            if bytes.len() > cap {
+                bytes = serde_json::to_vec(&HostResponse::error(HostCallError {
+                    code: "E2BIG",
+                    message: format!("host response exceeded limit of {cap} bytes"),
+                }))
+                .map_err(wasmtime::Error::new)?;
+                if bytes.len() > cap {
+                    bytes.clear();
+                }
+            }
+            caller.data_mut().response = bytes;
             Ok(0)
         },
     )?;
@@ -681,9 +885,7 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
         "write_stdout",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
             let memory = memory(&mut caller)?;
-            let data = read_bytes(&caller, &memory, ptr, len)?;
-            caller.data_mut().stdout.extend_from_slice(&data);
-            Ok(len)
+            capture_output(&mut caller, &memory, ptr, len, true)
         },
     )?;
     linker.func_wrap(
@@ -691,9 +893,7 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
         "write_stderr",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
             let memory = memory(&mut caller)?;
-            let data = read_bytes(&caller, &memory, ptr, len)?;
-            caller.data_mut().stderr.extend_from_slice(&data);
-            Ok(len)
+            capture_output(&mut caller, &memory, ptr, len, false)
         },
     )?;
     Ok(())
@@ -814,13 +1014,8 @@ fn wasi_fd_write(
         let base = ptr_usize(iovs)? + index * 8;
         let ptr = read_u32(&caller, &memory, base)? as i32;
         let len = read_u32(&caller, &memory, base + 4)? as i32;
-        let data = read_bytes(&caller, &memory, ptr, len)?;
-        total = total.saturating_add(u32::try_from(data.len()).unwrap_or(u32::MAX));
-        if fd == 1 {
-            caller.data_mut().stdout.extend_from_slice(&data);
-        } else {
-            caller.data_mut().stderr.extend_from_slice(&data);
-        }
+        let captured = capture_output(&mut caller, &memory, ptr, len, fd == 1)?;
+        total = total.saturating_add(captured as u32);
     }
     write_u32(&mut caller, &memory, nwritten, total)?;
     Ok(WASI_ERRNO_SUCCESS)

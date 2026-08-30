@@ -156,6 +156,23 @@ test("release versioning preserves unpublished optional packages and uses OIDC p
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN/)
 })
 
+test("portable JS runtime publishes independently after successful main CI", () => {
+  const job = workflow.match(
+    /\n  publish-portable-js-runtime:\n(?<body>[\s\S]*?)\n  build-linux-native:/
+  )?.groups?.body
+  assert.ok(job, "release workflow must define the portable runtime publish job")
+  assert.match(job, /github\.event\.workflow_run\.conclusion == 'success'/)
+  assert.match(job, /github\.event\.workflow_run\.head_branch == 'main'/)
+  assert.match(job, /cache-dependency-path: tinysandbox-js-runtime\/package-lock\.json/)
+  assert.match(job, /working-directory: tinysandbox-js-runtime/)
+  assert.match(job, /npm ci/)
+  assert.match(job, /npm test/)
+  assert.match(job, /npm pack --dry-run/)
+  assert.match(job, /npm view "\$\{package_name\}@\$\{package_version\}" version/)
+  assert.match(job, /npm publish --access public/)
+  assert.doesNotMatch(job, /needs: prepare/)
+})
+
 test("platform packages and optional dependencies stay in lockstep", () => {
   verifyNativePackages()
 
@@ -189,9 +206,9 @@ test("npm pack metadata supports npm 11 and npm 12 output", () => {
 })
 
 test("workflows pin npm CLIs compatible with their Node versions", () => {
-  assert.equal([...workflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 3)
+  assert.equal([...workflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 4)
   assert.equal([...ciWorkflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 1)
-  assert.equal([...ciWorkflow.matchAll(/npm install -g npm@11\.12\.1/g)].length, 3)
+  assert.equal([...ciWorkflow.matchAll(/npm install -g npm@11\.12\.1/g)].length, 4)
 })
 
 test("npm publishes native packages from explicit local paths", () => {

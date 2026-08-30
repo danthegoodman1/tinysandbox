@@ -1,0 +1,41 @@
+{
+  "name": "@tinysandbox/js-runtime",
+  "version": "0.1.0",
+  "description": "Stateless QuickJS runtime for standard WebAssembly hosts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./quickjs.wasm": "./quickjs.wasm"
+  },
+  "files": [
+    "dist/",
+    "quickjs.wasm",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && npm run typecheck && node --test test/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test:browser": "node test/browser-smoke.mjs",
+    "test:convex": "npm run build && npm run typecheck && node test/convex-smoke.mjs"
+  },
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/tinysandbox.git",
+    "directory": "tinysandbox-js-runtime"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

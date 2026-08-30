@@ -1,0 +1,47 @@
+[
+  {
+    "name": "console-process",
+    "code": "console.log(process.cwd(), process.argv[2], process.env.WHO)",
+    "argv": ["js", "-e", "arg"],
+    "env": { "WHO": "world" },
+    "cwd": "/work",
+    "exitCode": 0,
+    "stdout": "/work arg world\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "microtasks",
+    "code": "Promise.resolve().then(() => console.log('drained'))",
+    "exitCode": 0,
+    "stdout": "drained\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "unicode",
+    "code": "console.log('γειά 🙂')",
+    "exitCode": 0,
+    "stdout": "γειά 🙂\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "explicit-exit",
+    "code": "console.log('bye'); process.exit(7)",
+    "exitCode": 7,
+    "stdout": "bye\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "exception",
+    "code": "throw new Error('boom')",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: boom\n"
+  },
+  {
+    "name": "recursion",
+    "code": "function f(n) { return n === 0 ? 'ok' : f(n - 1) } console.log(f(2000))",
+    "exitCode": 0,
+    "stdout": "ok\n",
+    "stderrPrefix": ""
+  }
+]
