@@ -156,6 +156,23 @@ test("release versioning preserves unpublished optional packages and uses OIDC p
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN/)
 })
 
+test("release preparation repairs versioned files after rebasing onto main", () => {
+  const retry = workflow.match(
+    /git fetch origin main\n(?<body>[\s\S]*?)\n\s+done/
+  )?.groups?.body
+  assert.ok(retry, "release workflow must define a push retry after fetching main")
+  assert.match(retry, /git rebase origin\/main/)
+  assert.match(
+    retry,
+    /node scripts\/release-version\.mjs apply "\$\{\{ steps\.version\.outputs\.version \}\}"/
+  )
+  assert.match(
+    retry,
+    /node scripts\/release-version\.mjs check "\$\{\{ steps\.version\.outputs\.version \}\}"/
+  )
+  assert.match(retry, /git commit --amend --no-edit/)
+})
+
 test("portable JS runtime publishes independently after successful main CI", () => {
   const job = workflow.match(
     /\n  publish-portable-js-runtime:\n(?<body>[\s\S]*?)\n  build-linux-native:/
