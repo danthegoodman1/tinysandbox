@@ -127,6 +127,15 @@ jobs:
             echo "main advanced before the release commit could be pushed; rebasing release commit (attempt ${attempt})"
             git fetch origin main
             git rebase origin/main
+            # A preceding release can refresh its optional native-package
+            # lockfile entries while this release is preparing. Reapplying the
+            # version after the rebase replaces those now-stale resolved entries
+            # with placeholders for the version that has not been published yet.
+            node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
+            cargo update -w
+            node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
+            git add Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json tinysandbox-node/native.cjs tinysandbox-node/npm/*/package.json
+            git commit --amend --no-edit
           done
           git push origin HEAD:main
 
