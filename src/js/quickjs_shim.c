@@ -4,7 +4,7 @@
 
 #include "quickjs.h"
 
-#define TINYSANDBOX_QUICKJS_STACK_SIZE (3 * 1024 * 1024)
+#define TINYSANDBOX_QUICKJS_STACK_SIZE (768 * 1024)
 
 __attribute__((import_module("tinysandbox"), import_name("host_call")))
 int32_t tb_host_call(const uint8_t *op, int32_t op_len, const uint8_t *json, int32_t json_len);

@@ -10,6 +10,13 @@ VFS choices include memory, a local directory, and a prefix-rooted S3
 view. Node.js bindings (napi-rs) expose the same sandbox and built-in backends,
 including custom JS-implemented VFS backends.
 
+Extend that QuickJS implementation with a small, pure TypeScript companion
+package that runs the same wasm artifact through the standard WebAssembly API
+in V8 hosts such as Chrome and Convex Actions. The portable package executes
+JavaScript with explicit host globals and, optionally, the existing synchronous
+VFS/`fs` surface; it does not include the shell, coreutils, mounts, or native
+tinysandbox bindings.
+
 Non-goals: no real network access from inside the sandbox, no Python runtime,
 no container/microVM tiers, and no writable remote-object-store filesystem.
 
@@ -29,6 +36,14 @@ no container/microVM tiers, and no writable remote-object-store filesystem.
   sequentially with buffered pipes until streaming is needed.
 - Wasm isolation only for agent-authored code (JS). Builtins are trusted
   native functions over the VFS.
+- Keep one QuickJS wasm artifact and host-call ABI shared by Wasmtime and V8;
+  do not adopt a second QuickJS wrapper or duplicate the guest semantics.
+- The portable runtime is capability-empty by default, uses only standard
+  WebAssembly and web-platform APIs, and accepts a precompiled
+  `WebAssembly.Module` so hosts own asset loading and bundling.
+- Start stateless: compile once, instantiate one hard-bounded wasm instance per
+  run, and dispose it afterward. Persistent isolates and shared-memory realms
+  require a later demonstrated need.
 - No test reaches a public cloud service. Filesystem tests use temp dirs;
   remote-backend tests use deterministic fakes or an isolated local
   S3-compatible container.
@@ -43,6 +58,10 @@ no container/microVM tiers, and no writable remote-object-store filesystem.
 - Property tests (proptest) for VFS operation sequences and shell lexing;
   fuzz target for the shell parser (no panics on arbitrary input).
 - End-to-end pipeline tests through the public `Sandbox` API.
+- Run a focused portable-JS conformance corpus against both the Rust/Wasmtime
+  host and the TypeScript/V8 host, including limits and global bindings.
+- Track exact wasm artifact size and initial linear-memory pages; use a real
+  Chrome smoke test and a Convex Action example for portable-host acceptance.
 - Network-backed VFS tests split into deterministic protocol-independent fake
   tests and a local S3-compatible interoperability test; no real AWS account or
   credentials are used.
@@ -704,3 +723,194 @@ Status ledger:
 | Complete | Doc | Rust/TypeScript usage, staging model, and IAM documentation | `README.md` replaces the read-only section with an S3 VFS section carrying a staging table, the edit-limit rule, precondition and directory-rename semantics, read-only configuration, and the added `s3:PutObject`/`s3:DeleteObject`/`s3:AbortMultipartUpload` IAM scope. `tinysandbox-node/README.md`, the backend table, and the feature table match. |
 | Complete | Test | deterministic fake-backed writable S3 suite | `src/vfs/s3.rs`: 41 tests covering staging modes, streaming, preconditions, directory lifecycle, rename conflicts, prefix containment, and `EFBIG`. `cargo test --features s3 vfs::s3::tests` passes 41/41. |
 | Complete | Test | local S3-compatible interoperability suite | `scripts/test-s3-compat.sh` against pinned MinIO passes Rust 1/1 and Node 12/12, exercising conditional writes, a 12 MiB multipart upload, copy, delete, directory rename, `EFBIG`, and read-only refusal on a real wire. Container, network, and volume are removed on exit. |
+
+## Phase 11: Reduce the QuickJS wasm memory floor
+
+Goal:
+Reduce the initial linear memory of every active JavaScript execution without
+changing the existing `/bin/js` API, guest-visible behavior, or hard memory and
+timeout enforcement.
+
+Scope:
+- Add a repeatable artifact inspection command that reports wasm byte size,
+  imports/exports, and initial linear-memory pages, and record the current
+  626,384-byte/67-page baseline before changing it.
+- Reduce the linked C stack from 4 MiB toward 1 MiB and reduce
+  `TINYSANDBOX_QUICKJS_STACK_SIZE` from 3 MiB toward 768 KiB. If the proposed
+  values fail the existing 2,000-call recursion contract, choose the smallest
+  pair that preserves it while keeping initial memory at or below 1.5 MiB.
+- Rebuild `assets/quickjs.wasm` through the existing reproducible build script
+  and update provenance and JavaScript-runtime performance documentation.
+- Preserve the existing Wasmtime `ResourceLimiter`, epoch deadline, clean
+  allocation failure, and catchable QuickJS stack-exhaustion behavior.
+
+Out of scope:
+- Changing public `Limits`, lowering the default 64 MiB per-run cap, changing
+  JavaScript semantics, or retaining a QuickJS instance between commands.
+- Optimizing the QuickJS engine, adding a new allocator, or pursuing an RSS
+  target that cannot be measured reproducibly.
+
+Completion gate:
+The checked-in artifact starts with at most 1.5 MiB of linear memory, the
+existing finite and unbounded recursion tests retain their behavior, the 4 MiB
+allocation-bomb test reaches the growth limit rather than failing initial
+instantiation, and the complete Rust/Node regression matrix remains green.
+
+Testing plan:
+- Run the focused recursion, timeout, OOM, CommonJS-depth, and large-buffer JS
+  tests before the full workspace suite.
+- Run the artifact inspection twice around independent rebuilds and verify the
+  bytes remain reproducible.
+- Run `cargo test --workspace --all-features --locked`, the no-default-feature
+  build/tests, Clippy, rustdoc, `npm test`, and Node examples.
+- Record an informational before/after in-flight RSS sample, but use exact
+  linear-memory pages—not noisy RSS—as the completion gate.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 11A: reproducible artifact inspection and baseline | `node scripts/inspect-quickjs-wasm.mjs` uses only standard Node/WebAssembly APIs and reports artifact bytes, exact initial pages/bytes, and every import/export. `assets/PROVENANCE.md` durably records the pre-change 626,384-byte, 67-page/4,390,912-byte baseline and final ABI. |
+| Complete | Work | 11B: reduce linked and QuickJS stack limits together | `scripts/build-quickjs-wasm.sh` now links a 1,048,576-byte C stack and `src/js/quickjs_shim.c` sets a 786,432-byte QuickJS limit. The stripped artifact is 626,383 bytes and starts at 19 pages/1,245,184 bytes (1.1875 MiB), SHA-256 `784d9fe7db0db23e4250874920a5661916be3e0c7d007d22ea3ec86934a94e3c`. Two independent rebuilds were byte-for-byte identical by `cmp` and SHA-256. |
+| Complete | Work | 11C: preserve Wasmtime memory/timeout failure behavior | Focused locked tests pass: `js_recursion_uses_catchable_quickjs_stack_limit` preserves `f(2000)` and catchable unbounded recursion without a wasm trap; `js_cpu_and_memory_limits_fail_cleanly` preserves exit 124 for `while(true)` and reports the Wasmtime growth limit under a 4 MiB cap. The OOM assertion now requires peak memory to be greater than the 1,245,184-byte initial floor and no more than 4 MiB, proving successful instantiation and accepted growth before refusal. `js_commonjs_deep_require_chains_are_bounded_cleanly` and the 8 MiB `js_fs_large_binary_payloads_round_trip_under_memory_cap` test pass unchanged. ResourceLimiter and epoch code were not changed. |
+| Complete | Doc | 11D: update provenance and performance measurements | `assets/PROVENANCE.md` records source/toolchain, final stack values, exact size/pages/hash, inspection command, baseline, and rebuild evidence. README distinguishes the deterministic 3,145,728-byte linear-memory floor reduction from RSS. Existing RSS samples predate this change; no repeatable in-flight-JavaScript RSS harness exists in the repository, so an informational before/after RSS claim was deliberately not invented. |
+| Complete | Test | full Rust and Node regression matrix | Green: `cargo fmt --all -- --check`; `cargo test --workspace --all-features --locked`; `cargo build --workspace --no-default-features --locked`; `cargo test --workspace --no-default-features --locked`; Clippy for the full workspace/all targets/all features with `-D warnings`; rustdoc for the workspace/all features/no dependencies with `-D warnings`; `npm test` (48 passed, 7 live-S3 skips); and all seven `npm run examples` programs. |
+| Complete | Gate | initial wasm memory is at most 1.5 MiB with no behavior regression | Artifact inspection proves 19 pages/1,245,184 bytes, 327,680 bytes below the 1.5 MiB ceiling and 48 pages below baseline. Focused limit/stack/CommonJS/buffer tests, reproducible rebuilds, and the complete Rust/Node matrix are green with no public `Limits` or guest semantics changes. |
+
+## Phase 12: Extract the stateless V8 runtime core
+
+Goal:
+Ship a zero-runtime-dependency TypeScript package, provisionally
+`@tinysandbox/js-runtime`, that runs arbitrary guest JavaScript using the same
+QuickJS-ng wasm and guest glue as tinysandbox through standard WebAssembly APIs
+available in Node/V8, Chrome, and Convex's default runtime.
+
+Scope:
+- Add an ESM TypeScript package that accepts either wasm bytes or a precompiled
+  `WebAssembly.Module`. Export the wasm file as a package subpath; never read a
+  file or call `fetch` implicitly.
+- Expose one small stateless API: compile an engine once, then `runCode()`
+  creates a fresh wasm instance/QuickJS runtime, captures its result, and
+  disposes it. Return `exitCode`, `stdout`, `stderr`, and peak/initial wasm
+  memory where the host can report them.
+- Rebuild the shared wasm ABI to import its linear memory. Each run supplies a
+  `WebAssembly.Memory` whose initial pages match the artifact and whose maximum
+  pages implement `wasmMemoryBytes`; reject limits below the artifact minimum
+  before instantiation.
+- Set a QuickJS heap limit before context creation and retain the separate
+  QuickJS stack limit. Treat a hard wasm trap/OOM as terminal for that run.
+- Add a QuickJS interrupt handler backed by a synchronous host import that
+  checks a monotonic deadline, so `while (true) {}` is bounded even though a
+  V8 event loop cannot fire during a synchronous wasm call. Keep Wasmtime epoch
+  interruption as defense in depth.
+- Expose the existing dotted-path custom-global behavior as synchronous
+  one-argument functions with JSON-safe input/output and deterministic
+  collision errors. Enforce source, host-response, stdout, and stderr byte
+  caps before copying data across the boundary.
+- Adapt the Rust/Wasmtime host to the imported-memory and interrupt ABI so both
+  hosts continue to consume the exact same artifact.
+- Include minimal Node, browser, and Convex Action examples. The Convex example
+  imports the `.wasm` subpath as a `WebAssembly.Module`, awaits any Convex work
+  before entering QuickJS, and then provides synchronous guest capabilities.
+
+Out of scope:
+- Persistent isolates, multiple QuickJS runtimes in one wasm instance,
+  snapshots, workers, Asyncify, JSPI, guest-to-host asynchronous functions,
+  timers, networking/fetch, ESM, TypeScript transpilation, or arbitrary V8
+  object sharing.
+- The VFS and CommonJS file loader, which land separately in Phase 13.
+- Automated npm publication or adding the new package to lockstep release
+  automation before its API is proven.
+
+Completion gate:
+The same artifact runs the focused JS corpus under Wasmtime and Node/V8; a
+headless Chrome page executes `runCode()`; a Convex default-runtime Action
+imports the packaged wasm module and executes a smoke script; infinite loops,
+allocation bombs, oversized host responses, and global collisions fail with
+the documented bounded behavior.
+
+Testing plan:
+- Unit-test wasm loading, fresh-state isolation, UTF-8 I/O, exception/exit
+  shapes, dotted globals, serialization errors, and every byte-limit boundary.
+- Adversarial tests prove the supplied `WebAssembly.Memory.maximum`, QuickJS
+  heap cap, and interrupt deadline are enforced in Node/V8.
+- Run a small shared script corpus under both hosts for console/process,
+  microtask draining, errors, recursion, and custom globals.
+- Serve a dependency-free browser fixture and execute it in headless Chrome;
+  bundle/type-check a Convex Action fixture and record one real default-runtime
+  smoke run without putting credentials in CI.
+- Run `npm pack --dry-run` and inspect the tarball for only the ESM/types,
+  README/license, and wasm artifact.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 12A: zero-dependency ESM package and explicit wasm loading | Missing: package scaffold, public types, bytes/module loading tests, and inspected pack output. |
+| Incomplete | Work | 12B: shared imported-memory and interrupt ABI | Missing: C exports/imports, V8 host adapter, Rust host adaptation, and ABI inspection evidence. |
+| Incomplete | Work | 12C: stateless `runCode()` with bounded result capture | Missing: implementation proving fresh physical instance/runtime per call and explicit disposal. |
+| Incomplete | Work | 12D: synchronous dotted custom globals | Missing: JSON bridge, collision/exception/size validation, and parity tests against tinysandbox. |
+| Incomplete | Test | hard memory, heap, timeout, and output/response limits | Missing: adversarial Node/V8 results plus unchanged Wasmtime limit tests. |
+| Incomplete | Test | Node/V8 and headless Chrome execution | Missing: shared corpus results in Node and actual Chrome smoke output. |
+| Incomplete | Test | Convex Action compatibility | Missing: bundled/type-checked example and recorded default-runtime action smoke using direct `.wasm` import. Convex documents `WebAssembly.Module` imports and standard WebAssembly support at `https://docs.convex.dev/functions/runtimes`. |
+| Incomplete | Gate | portable stateless runtime works in target V8 hosts | Missing: all Phase 12 host, limit, corpus, and package evidence. |
+
+## Phase 13: Add the optional VFS and file execution surface
+
+Goal:
+Allow the portable runtime to opt into tinysandbox's existing synchronous
+Node-compatible `fs`/CommonJS behavior and execute entry files from a supplied
+VFS, without bringing the shell or any concrete storage backend into the
+package.
+
+Scope:
+- Define a synchronous TypeScript `Vfs` interface matching the existing
+  handle-and-offset operations: `stat`, `readdir`, `mkdir`, `rename`, `unlink`,
+  `rmdir`, `open`, `readAt`, `writeAt`, `truncate`, and `close`, with stable
+  errno-shaped failures.
+- Install the existing guest `fs`, `Buffer`, and CommonJS loader only when a
+  VFS is supplied. With no VFS, `require("fs")` and file module loading fail as
+  unavailable capabilities rather than reaching placeholder hostcalls.
+- Add `runFile(path, options)`: resolve and read the UTF-8 entry through the
+  VFS, then call the same evaluator with the resolved path as `scriptPath` so
+  `process.argv`, `__filename`, `__dirname`, stack traces, and relative
+  `require()` resolution match `/bin/js`.
+- Port only the TypeScript host dispatcher needed by the already-existing
+  guest host-call protocol. Keep filesystem quotas and storage accounting the
+  responsibility of the supplied VFS implementation.
+- Add a small deterministic test VFS for conformance and examples; do not ship
+  a second production in-memory filesystem implementation in this phase.
+
+Out of scope:
+- Async VFS implementations, `fs.promises`, IndexedDB, OPFS, local-disk or S3
+  backends, mounts, snapshots, watchers, permissions, symlinks, `node_modules`,
+  package.json resolution, or additional Node built-ins.
+- Executing shell commands, coreutils, or any other part of tinysandbox.
+
+Completion gate:
+With a supplied test VFS, `runFile("/app/main.js")` and relative/absolute
+CommonJS imports produce the same results and error shapes as `/bin/js`; all
+guest file access goes through the supplied interface; omitting the VFS leaves
+the runtime filesystem-capability-free; the Node and Chrome examples pass.
+
+Testing plan:
+- Reuse focused VFS scripts for UTF-8/binary reads, fd positional reads and
+  writes, truncation, directory entries, errno shapes, CommonJS cache/cycles,
+  JSON modules, and module-depth limits under both hosts.
+- Test `runFile()` path resolution, argv and filename globals, invalid UTF-8,
+  missing entry files, and stack trace filenames.
+- Test the no-VFS negative surface and instrument the test VFS to prove every
+  read/write/module request uses it.
+- Re-run the Phase 12 Node/Chrome/Convex smoke tests with no VFS to prevent an
+  accidental storage dependency.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 13A: synchronous portable `Vfs` contract and errno mapping | Missing: public TypeScript interface, dispatcher, and contract tests matching `src/vfs/mod.rs`. |
+| Incomplete | Work | 13B: capability-gated guest `fs` and CommonJS loader | Missing: no-VFS negative tests and VFS-enabled parity implementation. |
+| Incomplete | Work | 13C: `runFile()` entrypoint semantics | Missing: VFS read/eval implementation and argv/path/stack/relative-require tests. |
+| Incomplete | Test | cross-host `fs` and CommonJS parity corpus | Missing: focused scripts passing under Rust/Wasmtime and TypeScript/V8. |
+| Incomplete | Test | browser and Convex regressions remain storage-independent | Missing: Phase 12 smoke reruns without a VFS plus browser VFS example output. |
+| Incomplete | Gate | optional VFS/file execution complete without the rest of tinysandbox | Missing: all Phase 13 contract, parity, negative-capability, and host evidence. |

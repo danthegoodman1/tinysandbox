@@ -1711,6 +1711,9 @@ async fn js_pipeline_and_redirects_use_command_stdio() {
 
 #[tokio::test]
 async fn js_cpu_and_memory_limits_fail_cleanly() {
+    const INITIAL_WASM_MEMORY_BYTES: usize = 19 * 64 * 1024;
+    const OOM_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
     // Epoch interruption should stop tight loops promptly with the same 124
     // timeout status used by the sandbox wall-clock guard.
     let sandbox = Sandbox::builder()
@@ -1726,7 +1729,7 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
 
     let oom = Sandbox::builder()
         .limits(Limits {
-            wasm_memory_bytes: 4 * 1024 * 1024,
+            wasm_memory_bytes: OOM_LIMIT_BYTES,
             ..Limits::default()
         })
         .build()
@@ -1735,7 +1738,12 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
     assert_ne!(oom.exit_code, 0);
     assert_ne!(oom.exit_code, 124);
     assert!(oom.stderr.contains("wasm memory limit exceeded"));
-    assert!(oom.metrics.peak_wasm_memory_bytes.unwrap_or_default() <= 4 * 1024 * 1024);
+    let peak = oom.metrics.peak_wasm_memory_bytes.unwrap_or_default();
+    assert!(
+        peak > INITIAL_WASM_MEMORY_BYTES,
+        "the allocation bomb must instantiate the 19-page module and grow it before reaching the limit; peak={peak}"
+    );
+    assert!(peak <= OOM_LIMIT_BYTES);
 }
 
 fn shell_single_quote(input: &str) -> String {
