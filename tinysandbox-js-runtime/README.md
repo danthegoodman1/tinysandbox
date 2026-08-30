@@ -70,7 +70,7 @@ The site is entirely static. In a Cloudflare Pages Git integration, use:
 | --- | --- |
 | Framework preset | `None` |
 | Root directory | `tinysandbox-js-runtime` |
-| Build command | `npm ci && npm run build:site` |
+| Build command | `npm run build:site` |
 | Build output directory | `site-dist` |
 
 No environment variables, Pages Functions, Wrangler configuration, or separate
