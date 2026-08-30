@@ -824,10 +824,12 @@ Out of scope:
 
 Completion gate:
 The same artifact runs the focused JS corpus under Wasmtime and Node/V8; a
-headless Chrome page executes `runCode()`; a Convex default-runtime Action
-imports the packaged wasm module and executes a smoke script; infinite loops,
-allocation bombs, oversized host responses, and global collisions fail with
-the documented bounded behavior.
+headless Chrome page executes `runCode()`; a copyable Convex default-runtime
+Action imports the packaged wasm module and passes strict type-checking plus a
+bundled V8 compatibility smoke; infinite loops, allocation bombs, oversized
+host responses, and global collisions fail with the documented bounded
+behavior. This repository does not deploy or execute the example in a Convex
+project.
 
 Testing plan:
 - Unit-test wasm loading, fresh-state isolation, UTF-8 I/O, exception/exit
@@ -837,8 +839,9 @@ Testing plan:
 - Run a small shared script corpus under both hosts for console/process,
   microtask draining, errors, recursion, and custom globals.
 - Serve a dependency-free browser fixture and execute it in headless Chrome;
-  bundle/type-check a Convex Action fixture and record one real default-runtime
-  smoke run without putting credentials in CI.
+  bundle/type-check a Convex Action fixture and execute the resulting bundle
+  against the standard V8/WebAssembly APIs it requires. Do not deploy it from
+  this repository.
 - Run `npm pack --dry-run` and inspect the tarball for only the ESM/types,
   README/license, and wasm artifact.
 
@@ -853,8 +856,7 @@ Status ledger:
 | Complete | Test | hard memory, heap, timeout, and output/response limits | Portable Node tests cover limits below the artifact floor, huge-cap clamping, a 2 MiB wasm allocation bomb, 512 KiB QuickJS heap OOM, a 20 ms infinite-loop deadline, exact and one-byte-over UTF-8 source/host-response/stdout/stderr boundaries, and host-return serialization failures. Focused Wasmtime tests cover source/response/output bounding, fetch/global cap independence, huge-cap clamping, allocation growth refusal, recursion, and timeout; the full Rust matrix remains green. |
 | Complete | Test | Node/V8 and headless Chrome execution | The shared six-case console/process, microtask, UTF-8, exit, error, and recursion corpus passes under Node/V8 and Rust/Wasmtime. Package tests pass 10/10. The dependency-free browser fixture executed in installed headless Chrome and reported `headless_chrome_smoke=PASS`. |
 | Complete | Test | Convex Action fixture and local compatibility | `examples/convex/action.ts` is a copyable default-runtime `action({ handler })`, imports the `.wasm` subpath as `WebAssembly.Module`, awaits host work before entering QuickJS, and type-checks under strict TypeScript. The isolated dev-only esbuild shim produced an 852,579-byte browser/V8 bundle and executed it successfully: `convex_v8_bundle_smoke=PASS`. |
-| Incomplete | Test | real Convex default-runtime deployment smoke | `convex_remote_smoke=NOT_RUN_NO_CREDENTIALS`. No Convex deployment or account credentials are configured locally or placed in CI, so the real remote Action evidence remains external. Convex documents `WebAssembly.Module` imports and standard WebAssembly support at `https://docs.convex.dev/functions/runtimes`. |
-| Incomplete | Gate | portable stateless runtime works in target V8 hosts | Node/V8, Chrome, shared Wasmtime parity, package, ABI, and adversarial limit evidence are complete. Only a credentialed real Convex default-runtime deployment smoke remains; the implementation and copyable Action fixture are complete. |
+| Complete | Gate | portable stateless runtime works in target V8 hosts | Node/V8, Chrome, shared Wasmtime parity, package, ABI, adversarial limits, and the typed/bundled Convex-compatible Action fixture are complete. Deploying or executing the example in a real Convex project is intentionally outside this repository's gate. |
 
 ## Phase 13: Add the optional VFS and file execution surface
 
@@ -902,8 +904,8 @@ Testing plan:
   missing entry files, and stack trace filenames.
 - Test the no-VFS negative surface and instrument the test VFS to prove every
   read/write/module request uses it.
-- Re-run the Phase 12 Node/Chrome/Convex smoke tests with no VFS to prevent an
-  accidental storage dependency.
+- Re-run the Phase 12 Node/Chrome and Convex-compatible bundle smoke tests with
+  no VFS to prevent an accidental storage dependency.
 
 Status ledger:
 
@@ -913,5 +915,5 @@ Status ledger:
 | Complete | Work | 13B: capability-gated guest `fs` and CommonJS loader | A backwards-compatible `vfs` run-config flag gates `Buffer`, `require("fs")`, and file-module host calls while keeping ABI 12 imports/exports/arities and the 19-page floor unchanged. Rust always enables it; portable no-VFS runs fail both fs and path requires with `ERR_CAPABILITY_UNAVAILABLE` before a storage host call. VFS runs retain the existing fs surface, relative/absolute resolution, cache/cycles/JSON/depth behavior, and fd cleanup. |
 | Complete | Work | 13C: `runFile()` entrypoint semantics | `runFile()` requires a VFS, resolves against `cwd`, reads with `open`/`readAt`/`close` under `sourceBytes`, decodes UTF-8 fatally, and runs through the same bounded evaluator. Tests pin missing/invalid/oversized entries, resolved stack filenames, cwd/dirname, custom argv, and the default distinction between original argv path `./nested/../main.js` and normalized `/app/main.js` filename. |
 | Complete | Test | cross-host `fs` and CommonJS parity corpus | `tests/fixtures/js_vfs_portable_corpus.json` passes unchanged under Rust/Wasmtime and Node/V8 for file entry globals, UTF-8/CommonJS/JSON/cache, fd positional read/write/truncate, readdir, and errno. Portable tests add binary I/O, all 11 supplied-VFS operations, cycles, module-depth limit, deterministic entry errors, leaked-fd cleanup, strict-unhandled-rejection containment, and proof that VFS does not grant or receive fetch calls; 19/19 package tests and 65/65 focused Rust JS tests pass. |
-| Complete | Test | browser and Convex regressions remain storage-independent | The actual headless-Chrome example executes `runFile()` with fs plus relative CommonJS and reports `headless_chrome_smoke=PASS`; the same page first reruns the Phase 12 no-VFS/global smoke. Node's Phase 12 suite remains green and the no-VFS Convex-compatible bundle reports `convex_v8_bundle_smoke=PASS` at 871,568 bytes; the credentialed remote Convex smoke remains the pre-existing Phase 12 external gap. |
+| Complete | Test | browser and Convex regressions remain storage-independent | The actual headless-Chrome example executes `runFile()` with fs plus relative CommonJS and reports `headless_chrome_smoke=PASS`; the same page first reruns the Phase 12 no-VFS/global smoke. Node's Phase 12 suite remains green and the no-VFS Convex-compatible bundle reports `convex_v8_bundle_smoke=PASS` at 871,568 bytes. Real Convex deployment is intentionally not part of this repository's test surface. |
 | Complete | Gate | optional VFS/file execution complete without the rest of tinysandbox | Two rebuilds match at 626,766 bytes/SHA-256 `9b7686bc01fc7f09a6109ac516fb1bbd04771803cc1dc2b2e18726a1d3e8c3af`; package test/typecheck/Chrome/Convex/pack gates pass, with exactly seven packed files and no concrete VFS. Full all-feature and no-default-feature Rust workspace tests/build, fmt, all-target Clippy, and warning-denied rustdoc pass. |

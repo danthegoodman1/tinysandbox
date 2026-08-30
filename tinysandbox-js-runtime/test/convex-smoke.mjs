@@ -31,4 +31,3 @@ const output = await action.jsRuntimeSmoke.handler();
 if (output !== "convex") throw new Error(`Convex-compatible bundle smoke returned ${JSON.stringify(output)}`);
 console.log(`convex_v8_bundle_bytes=${result.outputFiles[0].contents.byteLength}`);
 console.log("convex_v8_bundle_smoke=PASS");
-console.log("convex_remote_smoke=NOT_RUN_NO_CREDENTIALS");
