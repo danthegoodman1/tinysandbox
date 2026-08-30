@@ -312,7 +312,8 @@ capacity floor; it is not an RSS measurement and unused pages may be committed
 lazily by the operating system.
 
 The separate zero-runtime-dependency
-[`@tinysandbox/js-runtime`](tinysandbox-js-runtime/README.md) package runs the
+[`@tinysandbox/js-runtime`](https://www.npmjs.com/package/@tinysandbox/js-runtime)
+package runs the
 same artifact and guest glue through standard WebAssembly APIs in Node/V8,
 Chrome, and Convex-compatible V8 hosts. It accepts wasm bytes or a precompiled
 `WebAssembly.Module` explicitly, then creates fresh physical wasm and QuickJS
@@ -323,7 +324,8 @@ synchronous VFS additionally enables `runFile()`, the supported `fs` subset,
 `Buffer`, and CommonJS file loading; omitting it leaves the runtime without
 filesystem capability. The package does not include the shell, coreutils,
 native bindings, a concrete storage backend, or ambient network access. Its
-package README documents the small API and host examples.
+[package README](tinysandbox-js-runtime/README.md) documents the small API and
+host examples.
 
 Not there on purpose: timers, an event loop, direct networking,
 `child_process`/process spawning, built-in shell command execution from

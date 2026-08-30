@@ -1,7 +1,8 @@
 # Required repository setup:
 # - CARGO_REGISTRY_TOKEN must allow publishing the tinysandbox crate.
 # - npm trusted publishing must trust this workflow for @tinysandbox/tinysandbox
-#   and its four @tinysandbox/tinysandbox-{platform} native packages.
+#   and its four @tinysandbox/tinysandbox-{platform} native packages, plus the
+#   independently versioned @tinysandbox/js-runtime package.
 # - Branch protection must allow github-actions[bot] to push the release commit to main.
 # - External contributor Actions runs should require maintainer approval before CI runs.
 name: Release
@@ -133,6 +134,51 @@ jobs:
         if: steps.eligibility.outputs.release == 'true'
         id: release_ref
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish-portable-js-runtime:
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+          cache-dependency-path: tinysandbox-js-runtime/package-lock.json
+
+      - name: Install trusted-publishing npm CLI
+        run: npm install -g npm@12.0.2
+
+      - name: Install portable runtime dependencies
+        run: npm ci
+        working-directory: tinysandbox-js-runtime
+
+      - name: Verify portable runtime package
+        run: |
+          npm test
+          npm pack --dry-run
+        working-directory: tinysandbox-js-runtime
+
+      - name: Publish portable runtime when its manifest version is new
+        working-directory: tinysandbox-js-runtime
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC request environment is missing" >&2
+            exit 1
+          fi
+
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+            echo "${package_name} ${package_version} is already published"
+          else
+            npm publish --access public
+          fi
 
   build-linux-native:
     needs: prepare
