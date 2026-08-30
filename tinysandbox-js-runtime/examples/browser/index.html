@@ -53,14 +53,36 @@
       color: var(--muted);
     }
 
-    .runtime {
+    .header-meta {
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
       flex: none;
+    }
+
+    .runtime,
+    .repository {
       border: 1px solid var(--line);
       padding: 8px 10px;
-      color: var(--accent);
       font-size: 11px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
+    }
+
+    .runtime { color: var(--accent); }
+
+    .repository {
+      display: flex;
+      align-items: center;
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .repository:hover,
+    .repository:focus-visible {
+      border-color: var(--accent);
+      color: var(--accent);
+      outline: none;
     }
 
     .workspace {
@@ -150,7 +172,7 @@
     @media (max-width: 760px) {
       main { padding: 18px; }
       header { display: block; }
-      .runtime { display: inline-block; margin-top: 16px; }
+      .header-meta { display: inline-flex; margin-top: 16px; }
       .workspace { grid-template-columns: 1fr; }
       section + section { border-left: 0; border-top: 1px solid var(--line); }
       textarea { height: 42vh; min-height: 280px; }
@@ -164,7 +186,10 @@
         <h1>tinysandbox / js</h1>
         <p>Source runs in a fresh QuickJS instance inside WebAssembly. Browser globals, DOM, filesystem, and network capabilities are not exposed.</p>
       </div>
-      <div class="runtime">host: V8 · guest: QuickJS/WASM</div>
+      <div class="header-meta">
+        <div class="runtime">host: V8 · guest: QuickJS/WASM</div>
+        <a class="repository" href="https://github.com/danthegoodman1/tinysandbox" target="_blank" rel="noreferrer">GitHub ↗</a>
+      </div>
     </header>
 
     <div class="workspace">
