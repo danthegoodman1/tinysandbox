@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/tinysandbox-linux-x64-gnu",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "cpu": [
     "x64"
   ],
