@@ -11,6 +11,66 @@ use tinysandbox::sandbox::{FetchRequest, FetchResponse, HostError, JsGlobals, Li
 use tinysandbox::vfs::{InMemoryVfs, OpenMode, Vfs, VfsQuota};
 
 #[tokio::test]
+async fn js_runs_shared_vfs_and_commonjs_portable_corpus() {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FileFixture {
+        path: String,
+        text: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Case {
+        name: String,
+        entry: String,
+        argv: Vec<String>,
+        files: Vec<FileFixture>,
+        exit_code: i32,
+        stdout: String,
+        stderr_prefix: String,
+    }
+
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("fixtures/js_vfs_portable_corpus.json"))
+            .expect("valid portable VFS corpus");
+    for case in cases {
+        let vfs = Arc::new(InMemoryVfs::default());
+        vfs.mkdir("/app").expect("create app directory");
+        for file in &case.files {
+            let path = file
+                .path
+                .strip_prefix("/workspace")
+                .expect("portable fixture lives under /workspace");
+            write_vfs_file(vfs.as_ref(), path, file.text.as_bytes());
+        }
+        let sandbox_vfs: Arc<dyn Vfs> = vfs;
+        let sandbox = Sandbox::builder()
+            .mount_arc("workspace", sandbox_vfs)
+            .build();
+        let arguments = case.argv.iter().skip(2).cloned().collect::<Vec<_>>();
+        let command = std::iter::once("js".to_owned())
+            .chain(std::iter::once(case.entry.clone()))
+            .chain(arguments)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = sandbox.exec(&command).await;
+        assert_eq!(
+            result.exit_code, case.exit_code,
+            "{}: {}",
+            case.name, result.stderr
+        );
+        assert_eq!(result.stdout, case.stdout, "{}", case.name);
+        assert!(
+            result.stderr.starts_with(&case.stderr_prefix),
+            "{}: {}",
+            case.name,
+            result.stderr
+        );
+    }
+}
+
+#[tokio::test]
 async fn js_eval_console_process_and_node_verified_shape() {
     // The console/process subset used here was checked against Node:
     // multiple console args are space-joined, argv carries user args, and env

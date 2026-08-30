@@ -13,7 +13,7 @@ const server = createServer(async (request, response) => {
     const path = normalize(join(root.pathname, pathname));
     if (!path.startsWith(root.pathname)) throw new Error("outside fixture root");
     const content = await readFile(path);
-    response.setHeader("content-type", extname(path) === ".wasm" ? "application/wasm" : extname(path) === ".js" ? "text/javascript" : "text/html");
+    response.setHeader("content-type", extname(path) === ".wasm" ? "application/wasm" : [".js", ".mjs"].includes(extname(path)) ? "text/javascript" : "text/html");
     response.end(content);
   } catch (error) {
     response.statusCode = 404;
@@ -24,16 +24,16 @@ await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const { port } = server.address();
 
 try {
-  const output = await new Promise((resolve, reject) => {
-    const child = spawn(chrome, ["--headless", "--disable-gpu", "--no-first-run", "--virtual-time-budget=5000", "--dump-dom", `http://127.0.0.1:${port}/`]);
+  const { stdout: output, stderr: chromeStderr } = await new Promise((resolve, reject) => {
+    const child = spawn(chrome, ["--headless", "--disable-gpu", "--no-first-run", "--enable-logging=stderr", "--virtual-time-budget=5000", "--dump-dom", `http://127.0.0.1:${port}/`]);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", chunk => { stdout += chunk; });
     child.stderr.on("data", chunk => { stderr += chunk; });
     child.on("error", reject);
-    child.on("close", code => code === 0 ? resolve(stdout) : reject(new Error(`Chrome exited ${code}: ${stderr}`)));
+    child.on("close", code => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(`Chrome exited ${code}: ${stderr}`)));
   });
-  if (!output.includes('<pre id="result">PASS</pre>')) throw new Error(`browser smoke failed:\n${output}`);
+  if (!output.includes('<pre id="result">PASS</pre>')) throw new Error(`browser smoke failed:\n${output}\n${chromeStderr}`);
   console.log("headless_chrome_smoke=PASS");
 } finally {
   server.close();

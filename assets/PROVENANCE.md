@@ -12,7 +12,7 @@
 - QuickJS stack limit: 786,432 bytes (`768 KiB`), leaving headroom inside the linked 1 MiB C stack
 - QuickJS sources linked: `quickjs.c`, `dtoa.c`, `libregexp.c`, `libunicode.c`
 - Tinysandbox shim: `src/js/quickjs_shim.c`
-- Artifact: 626,558 bytes, SHA-256 `486eae877cf3274ce36e74ba30c5e9231d312d08572bed508a92872e57f9923b`
+- Artifact: 626,766 bytes, SHA-256 `9b7686bc01fc7f09a6109ac516fb1bbd04771803cc1dc2b2e18726a1d3e8c3af`
 - Initial linear memory: 19 WebAssembly pages, 1,245,184 bytes (1.1875 MiB)
 
 Inspect the artifact without installing `wasm-tools` or another package:
@@ -45,4 +45,13 @@ The artifact exports `tinysandbox_abi_version()` with value `12`. The portable
 host checks that marker, the exact import/export contract and exported function
 arities, then performs a fixed-minimum/full-wasm32-maximum probe instantiation
 before accepting either bytes or a precompiled module. Two independent final
-Phase 12 rebuilds produced the SHA-256 above byte for byte.
+Phase 12 rebuilds produced SHA-256
+`486eae877cf3274ce36e74ba30c5e9231d312d08572bed508a92872e57f9923b`
+byte for byte.
+
+Phase 13 keeps ABI version 12 and the exact import/export/function-arity and
+19-page memory contracts. It adds only a backwards-compatible `vfs` boolean to
+the host-supplied JSON run configuration so the shared guest glue can avoid
+installing filesystem capabilities for portable runs without a VFS; Rust's
+`/bin/js` always sends `vfs: true`. Two independent final Phase 13 rebuilds on
+macOS arm64 produced the current SHA-256 above byte for byte.

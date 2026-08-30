@@ -4,12 +4,22 @@
 <pre id="result">RUNNING</pre>
 <script type="module">
   import { createEngine } from "../../dist/index.js";
+  import { TestVfs } from "../../test/test-vfs.mjs";
 
   const wasm = await fetch("../../quickjs.wasm").then(response => response.arrayBuffer());
   const engine = await createEngine(wasm);
   const result = engine.runCode("console.log(greet({ name: 'browser' }))", {
     globals: { greet: ({ name }) => `hello ${name}` },
   });
+  const vfs = new TestVfs({
+    "/app/main.js": "console.log(__filename, require('./message').text)",
+    "/app/message.js": "exports.text = require('fs').readFileSync('./value', 'utf8')",
+    "/app/value": "from-vfs",
+  });
+  const file = engine.runFile("main.js", { vfs, cwd: "/app" });
   document.querySelector("#result").textContent =
-    result.exitCode === 0 && result.stdout === "hello browser\n" ? "PASS" : JSON.stringify(result);
+    result.exitCode === 0 && result.stdout === "hello browser\n" &&
+    file.exitCode === 0 && file.stdout === "/app/main.js from-vfs\n"
+      ? "PASS"
+      : JSON.stringify({ result, file });
 </script>

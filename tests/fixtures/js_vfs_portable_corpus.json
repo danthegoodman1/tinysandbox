@@ -1,0 +1,28 @@
+[
+  {
+    "name": "fs-commonjs-file-entry",
+    "entry": "/workspace/app/main.js",
+    "argv": ["js", "/workspace/app/main.js", "arg"],
+    "files": [
+      {
+        "path": "/workspace/app/main.js",
+        "text": "const fs=require('fs')\nconst first=require('./counter')\nconst second=require('/workspace/app/counter.js')\nconst data=require('./data.json')\nconst fd=fs.openSync('/workspace/io','r+')\nconst buf=Buffer.alloc(3)\nconst n=fs.readSync(fd,buf,0,3,1)\nfs.writeSync(fd,Buffer.from('XY'),0,2,2)\nfs.ftruncateSync(fd,5)\nfs.closeSync(fd)\nconsole.log(__filename,__dirname,process.argv[2])\nconsole.log(first===second,first.count,data.answer)\nconsole.log(n,buf.toString(),fs.readFileSync('/workspace/io','utf8'))\nconsole.log(fs.readdirSync('/workspace/app').join(','))\ntry{fs.statSync('/workspace/missing')}catch(error){console.log(error.code,error.errno)}"
+      },
+      {
+        "path": "/workspace/app/counter.js",
+        "text": "globalThis.loads=(globalThis.loads||0)+1;exports.count=globalThis.loads"
+      },
+      {
+        "path": "/workspace/app/data.json",
+        "text": "{\"answer\":42}"
+      },
+      {
+        "path": "/workspace/io",
+        "text": "abcdef"
+      }
+    ],
+    "exitCode": 0,
+    "stdout": "/workspace/app/main.js /workspace/app arg\ntrue 1 42\n3 bcd abXYe\ncounter.js,data.json,main.js\nENOENT -2\n",
+    "stderrPrefix": ""
+  }
+]

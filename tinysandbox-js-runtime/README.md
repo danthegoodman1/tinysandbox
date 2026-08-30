@@ -59,8 +59,40 @@ conflicts, and runtime-global shadowing fail deterministically. Complete awaited
 host work before calling `runCode()`; wasm execution is synchronous and blocks
 the V8 event loop until it finishes.
 
-This stateless package does not provide a VFS, file execution, filesystem or
-network access, timers, guest ESM, TypeScript transpilation, Asyncify/JSPI, or
-persistent isolates. The guest compatibility glue still defines `fetch` and
-`require("fs")`, but without a host capability their operations fail with
-`ENOSYS`; neither reaches ambient V8 `fetch` or filesystem APIs.
+## Optional filesystem capability
+
+Pass a synchronous `Vfs` implementation to enable the same `Buffer`, `fs`
+subset, and relative/absolute CommonJS loader as tinysandbox's `/bin/js`:
+
+```ts
+const result = engine.runFile("main.js", {
+  vfs,
+  cwd: "/app",
+  argv: ["js", "main.js", "one"],
+});
+```
+
+`runFile()` resolves the entry against `cwd`, reads it through
+`open`/`readAt`/`close`, rejects invalid UTF-8, and evaluates it with the
+resolved path as `__filename` and the stack filename. If `argv` is omitted, it
+defaults to `["js", originalPath]`, preserving the path string passed by the
+caller. Relative `require()` resolves from the requiring module; direct `fs`
+paths resolve from `cwd`.
+
+The exported `Vfs` interface is deliberately small and synchronous: `stat`,
+`readdir`, `mkdir`, `rename`, `unlink`, `rmdir`, `open`, `readAt`, `writeAt`,
+`truncate`, and `close`. Paths delivered to it are normalized absolute paths;
+handles and offsets are non-negative safe integers, and positional operations
+do not change the guest fd cursor. Implementations report one of the exported
+`VfsErrno` strings by throwing `new VfsError(code)`. Quotas and storage
+accounting belong to the supplied implementation. The package provides no
+production filesystem or storage backend; the repository's `TestVfs` exists
+only under `test/` for examples and conformance tests.
+
+Omitting `vfs` leaves the run storage-independent: `Buffer` is absent and both
+`require("fs")` and file-module requests throw
+`ERR_CAPABILITY_UNAVAILABLE` before any filesystem host call. This stateless
+package also does not provide network access, timers, guest ESM, TypeScript
+transpilation, Asyncify/JSPI, or persistent isolates. The compatibility glue's
+`fetch` never reaches ambient V8 networking and fails with unavailable-host
+capability behavior.

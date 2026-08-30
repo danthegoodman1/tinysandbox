@@ -223,6 +223,7 @@ struct GuestConfig<'a> {
     cwd: &'a str,
     globals: &'a [String],
     prelude: &'a str,
+    vfs: bool,
 }
 
 struct JsRunResult {
@@ -326,6 +327,7 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         cwd: &cwd,
         globals: &global_names,
         prelude: &js_prelude,
+        vfs: true,
     };
     let input = serde_json::to_vec(&config).map_err(wasmtime::Error::new)?;
     let len = i32::try_from(input.len()).map_err(|_| wasmtime::Error::msg("script too large"))?;
