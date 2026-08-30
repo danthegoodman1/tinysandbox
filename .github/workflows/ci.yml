@@ -58,6 +58,32 @@ jobs:
       - name: Test Rust and Node against loopback S3-compatible API
         run: scripts/test-s3-compat.sh
 
+  portable-js-runtime:
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: tinysandbox-js-runtime/package-lock.json
+      - name: Install pinned npm CLI
+        run: npm install -g npm@11.12.1
+      - run: npm ci
+        working-directory: tinysandbox-js-runtime
+      - run: npm test
+        working-directory: tinysandbox-js-runtime
+      - run: npm run test:convex
+        working-directory: tinysandbox-js-runtime
+      - name: Verify Chrome is installed
+        run: test -x /usr/bin/google-chrome
+      - name: Test in headless Chrome
+        run: CHROME_PATH=/usr/bin/google-chrome npm run test:browser
+        working-directory: tinysandbox-js-runtime
+      - run: npm pack --dry-run
+        working-directory: tinysandbox-js-runtime
+
   node-linux:
     name: node (${{ matrix.os }})
     strategy:

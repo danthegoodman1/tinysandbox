@@ -5,6 +5,7 @@
 #include "quickjs.h"
 
 #define TINYSANDBOX_QUICKJS_STACK_SIZE (768 * 1024)
+#define TINYSANDBOX_ABI_VERSION 12
 
 __attribute__((import_module("tinysandbox"), import_name("host_call")))
 int32_t tb_host_call(const uint8_t *op, int32_t op_len, const uint8_t *json, int32_t json_len);
@@ -20,6 +21,16 @@ int32_t tb_write_stdout(const uint8_t *ptr, int32_t len);
 
 __attribute__((import_module("tinysandbox"), import_name("write_stderr")))
 int32_t tb_write_stderr(const uint8_t *ptr, int32_t len);
+
+__attribute__((import_module("tinysandbox"), import_name("should_interrupt")))
+int32_t tb_should_interrupt(void);
+
+static int quickjs_should_interrupt(JSRuntime *rt, void *opaque)
+{
+    (void)rt;
+    (void)opaque;
+    return tb_should_interrupt() != 0;
+}
 
 static const char TINYSANDBOX_GLUE[] =
 "(() => {\n"
@@ -684,6 +695,12 @@ void tinysandbox_free(void *ptr)
     free(ptr);
 }
 
+__attribute__((export_name("tinysandbox_abi_version")))
+int32_t tinysandbox_abi_version(void)
+{
+    return TINYSANDBOX_ABI_VERSION;
+}
+
 static JSValue js_host_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     (void)this_val;
@@ -990,14 +1007,18 @@ static int32_t drain_pending_jobs(JSRuntime *rt, JSContext *ctx, UnhandledReject
 }
 
 __attribute__((export_name("tinysandbox_run")))
-int32_t tinysandbox_run(const uint8_t *input, int32_t input_len)
+int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_limit)
 {
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) {
         tb_write_stderr((const uint8_t *)"quickjs: failed to create runtime\n", 34);
         return 1;
     }
+    if (heap_limit > 0) {
+        JS_SetMemoryLimit(rt, (size_t)heap_limit);
+    }
     JS_SetMaxStackSize(rt, TINYSANDBOX_QUICKJS_STACK_SIZE);
+    JS_SetInterruptHandler(rt, quickjs_should_interrupt, NULL);
     JS_UpdateStackTop(rt);
     UnhandledRejectionState rejections = { NULL, NULL };
     JS_SetHostPromiseRejectionTracker(rt, promise_rejection_tracker, &rejections);
