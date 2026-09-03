@@ -303,9 +303,9 @@ identical output):
 | Limits | Per-run memory cap (default 64 MB) with clean OOM errors, CPU deadline via epoch interruption (`while(true){}` exits 124), fetch response body cap, catchable `RangeError` on stack exhaustion |
 
 The checked-in module starts with 19 WebAssembly pages (1,245,184 bytes, or
-1.1875 MiB) of linear memory, down from the previous 67-page/4.19 MiB floor.
-The build links a 1 MiB C stack and gives QuickJS a 768 KiB stack limit so
-exhaustion remains a catchable JavaScript exception. Run
+1.1875 MiB) of linear memory. The build links a 1 MiB C stack and gives QuickJS
+a 768 KiB stack limit so exhaustion remains a catchable JavaScript exception.
+Run
 `node scripts/inspect-quickjs-wasm.mjs` to report the exact artifact size,
 initial memory, imports, and exports. Initial linear memory is a deterministic
 capacity floor; it is not an RSS measurement and unused pages may be committed
@@ -1279,24 +1279,22 @@ RSS includes runtime and allocator overhead for that process.
 
 Nothing compiles wasm at run time. The build script turns `quickjs.wasm` into
 machine code for the crate's target and the binary embeds the result, so the
-first `js` command loads an artifact that is already executable. Doing that work
-during the build is worth about 425 ms and 29 MiB per process.
+first `js` command loads an artifact that is already executable.
 
-What a process pays, measured on Linux x86_64 with `wasmtime` 46:
+Runtime behavior with `wasmtime` 46:
 
-| Step | When | Cost |
-| --- | --- | --- |
-| First `js` command in a process | loads the artifact | ~9 ms, ~8.4 MiB RSS |
-| The same first command, on the fallback path | only when the artifact is refused | ~430 ms, ~31 MiB RSS |
-| One in-flight `js` command | every run | ~3.4 ms, ~0.5 MiB RSS |
-| Sandbox with no `js` command running | — | ~7 KiB, no runtime cost |
+| Step | Behavior |
+| --- | --- |
+| First `js` command in a process | Loads the embedded precompiled artifact. |
+| Fallback first command | Compiles the checked-in wasm when the embedded artifact is refused. |
+| One in-flight `js` command | Owns fresh wasm and QuickJS state for that run. |
+| Sandbox with no `js` command running | Retains no per-command QuickJS state. |
 
-These RSS samples predate the reduction from 67 initial wasm pages to 19. The
-repository does not currently have a repeatable in-flight-JavaScript RSS
-harness, so no RSS saving is inferred from the page reduction: the hard,
-reproducible change is a 3,145,728-byte reduction in initial linear-memory
-capacity per active run. The runtime still creates and destroys QuickJS for
-each `js` command, so idle sandbox memory is unchanged.
+Each active run starts with 1,245,184 bytes of linear-memory capacity. This is a
+deterministic capacity floor, not an RSS measurement, and unused pages may be
+committed lazily by the operating system. The repository does not have a
+repeatable in-flight-JavaScript RSS harness, so it does not publish an RSS
+estimate for active JavaScript runs.
 
 The artifact is pinned to the target triple with that architecture's baseline
 CPU features, so it runs on any CPU of that architecture rather than only one as
