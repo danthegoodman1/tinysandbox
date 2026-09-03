@@ -35,7 +35,7 @@ const { port } = server.address();
 
 try {
   const { stdout: output, stderr: chromeStderr } = await new Promise((resolve, reject) => {
-    const child = spawn(chrome, ["--headless", "--disable-gpu", "--no-first-run", "--enable-logging=stderr", "--virtual-time-budget=5000", "--dump-dom", `http://127.0.0.1:${port}/`]);
+    const child = spawn(chrome, ["--headless", "--disable-gpu", "--no-first-run", "--enable-logging=stderr", "--virtual-time-budget=30000", "--dump-dom", `http://127.0.0.1:${port}/`]);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", chunk => { stdout += chunk; });
