@@ -17,12 +17,38 @@ await new Promise((resolve, reject) => {
   child.on("close", code => code === 0 ? resolve() : reject(new Error(`site build exited ${code}`)));
 });
 
+const indexHtml = await readFile(join(root.pathname, "index.html"), "utf8");
+if (!indexHtml.includes('<body data-runtime="quickjs-wasm">')) throw new Error("browser example must identify the guest runtime");
+if (!indexHtml.includes('href="https://github.com/danthegoodman1/tinysandbox"')) throw new Error("browser example must link to the repository");
+
+let reportSmoke;
+const smokeResult = new Promise(resolve => { reportSmoke = resolve; });
 const server = createServer(async (request, response) => {
   try {
-    const pathname = request.url === "/" ? "/index.html" : request.url;
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (requestUrl.pathname === "/__smoke__") {
+      response.end("ok");
+      reportSmoke(requestUrl.searchParams.get("result") ?? "");
+      return;
+    }
+    const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
     const path = normalize(join(root.pathname, pathname));
     if (!path.startsWith(root.pathname)) throw new Error("outside fixture root");
-    const content = await readFile(path);
+    let content = await readFile(path);
+    if (pathname === "/index.html") {
+      content = Buffer.from(content.toString("utf8").replace("</body>", `<script>
+        const smokeResult = document.querySelector("#result");
+        let smokeReported = false;
+        const report = () => {
+          if (!smokeReported && smokeResult.textContent !== "RUNNING") {
+            smokeReported = true;
+            fetch("/__smoke__?result=" + encodeURIComponent(smokeResult.textContent));
+          }
+        };
+        new MutationObserver(report).observe(smokeResult, { childList: true });
+        report();
+      </script>\n</body>`));
+    }
     response.setHeader("content-type", extname(path) === ".wasm" ? "application/wasm" : [".js", ".mjs"].includes(extname(path)) ? "text/javascript" : "text/html");
     response.end(content);
   } catch (error) {
@@ -33,20 +59,29 @@ const server = createServer(async (request, response) => {
 await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const { port } = server.address();
 
+let child;
+let timeout;
 try {
-  const { stdout: output, stderr: chromeStderr } = await new Promise((resolve, reject) => {
-    const child = spawn(chrome, ["--headless", "--disable-gpu", "--no-first-run", "--enable-logging=stderr", "--virtual-time-budget=30000", "--dump-dom", `http://127.0.0.1:${port}/`]);
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", chunk => { stdout += chunk; });
-    child.stderr.on("data", chunk => { stderr += chunk; });
-    child.on("error", reject);
-    child.on("close", code => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(`Chrome exited ${code}: ${stderr}`)));
-  });
-  if (!/<pre id="result"[^>]*>PASS<\/pre>/u.test(output)) throw new Error(`browser smoke failed:\n${output}\n${chromeStderr}`);
-  if (!output.includes('<body data-runtime="quickjs-wasm">')) throw new Error("browser example must identify the guest runtime");
-  if (!output.includes('href="https://github.com/danthegoodman1/tinysandbox"')) throw new Error("browser example must link to the repository");
+  child = spawn(chrome, ["--headless", "--disable-gpu", "--no-first-run", "--enable-logging=stderr", `http://127.0.0.1:${port}/`], { stdio: ["ignore", "ignore", "pipe"] });
+  let chromeStderr = "";
+  child.stderr.on("data", chunk => { chromeStderr += chunk; });
+  const result = await Promise.race([
+    smokeResult,
+    new Promise((_, reject) => {
+      child.on("error", reject);
+      child.on("close", code => reject(new Error(`Chrome exited ${code}: ${chromeStderr}`)));
+    }),
+    new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`browser smoke timed out:\n${chromeStderr}`)), 60_000);
+    }),
+  ]);
+  if (result !== "PASS") throw new Error(`browser smoke failed: ${result}\n${chromeStderr}`);
   console.log("headless_chrome_smoke=PASS");
 } finally {
-  server.close();
+  clearTimeout(timeout);
+  if (child && child.exitCode === null && child.signalCode === null) {
+    child.kill();
+    await new Promise(resolve => child.once("close", resolve));
+  }
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
