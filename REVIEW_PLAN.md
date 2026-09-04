@@ -119,7 +119,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 15A: Execution scope and deadline propagation (F03) | `src/sandbox/control.rs`; `js_does_not_start_a_filesystem_mutation_after_the_exec_deadline`; canceled Fs calls reject new work. |
 | Complete | Decision | 15B: Timeout, pending work and cleanup contract | README Limits/security sections distinguish result delivery, trusted in-flight effects, fixed admission and eventual cleanup. |
-| Complete | Work | 15C: Owned handle and finish/abort lifecycle (F04) | `src/sandbox/fs.rs` registry/OpenHandoff; five gated `tests/resource_lifecycle.rs` regressions; S3 abort/cancellation tests. |
+| Complete | Work | 15C: Owned handle and finish/abort lifecycle (F04) | `src/sandbox/fs.rs` registry/OpenHandoff; eight `tests/resource_lifecycle.rs` regressions; S3 abort/cancellation tests. |
 | Complete | Work | 15D: Handle-based reads in both JS hosts (F05) | Rust JS identity test and portable real-Node oracle cover rename/path reuse; teardown tests cover success/error/timeout. |
 | Complete | Test / Gate | Phase 15 validation | Gated late-open, dropped-host-open, retained-Fs, redirect cancellation/flush, JS teardown and fake-S3 tests pass. |
 
@@ -138,7 +138,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 16A: Streaming JS output with terminal-only capture (F06) | Capacity-one acknowledged transport with 16 KiB chunks; 4,097-byte file/pipe regression, early-reader exit and capture tests. |
-| Complete | Work | 16B: Shared open redirect descriptions (F07) | `RedirectFile` shares one handle/offset and one queued chunk; gated canceled-write/flush tests prevent byte misattribution. |
+| Complete | Work | 16B: Shared open redirect descriptions (F07) | `RedirectFile` shares one handle/offset and one queued chunk; gated canceled-write/flush tests prevent byte misattribution; duplicated pipes fan out readiness and preserve independent shutdown. |
 | Complete | Work | 16C: Preserve S3 write mode and single finish (F07) | Fake-S3 tests prove ABC merging, 31-byte replacement above 16-byte edit cap, multipart, null/superseded redirects and abort. |
 | Complete | Test / Gate | Phase 16 validation | Existing streaming/e2e and 45 fake-S3 tests pass. Real S3 compatibility is a CI gate. |
 
@@ -237,5 +237,5 @@ Status ledger:
 | Complete | Work | 21C: Checked implementation and public type contract | Removed blanket ts-nocheck/manual portable declarations; strict tsc emits JS/declarations from implementation/interfaces.26 portable tests, Convex and package smoke pass. |
 | Complete | Doc | 21D: Precise guarantees and current plan evidence | README documents cancellation, staging, native jq, local capability assumptions, all new limits and artifact trust; this ledger and benchmark evidence replace prospective claims. |
 | Complete | Work | 21E: Deterministic release-test boundary | Offline fresh-cache placeholder test; live registry smoke separately opt-in and bounded. 31 deterministic release tests pass; live smoke also verified. |
-| In Progress | Test / Gate | Phase 21 validation | Local suites are passing; remote PR platform/browser/S3 checks are pending and must be green before this gate closes. |
+| Complete | Test / Gate | Phase 21 validation | [CI run 33929163678](https://github.com/danthegoodman1/tinysandbox/actions/runs/33929163678) passed all seven jobs for implementation commit `e4c1bfd`: Rust release gates, Linux x64/arm64, macOS arm64/Intel, portable Chrome/Convex, and live S3. [PR #24](https://github.com/danthegoodman1/tinysandbox/pull/24) tracks subsequent checks. |
 
