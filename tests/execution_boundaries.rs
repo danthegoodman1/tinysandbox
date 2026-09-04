@@ -27,6 +27,8 @@ async fn null_commands_assignments_and_status_match_bash_effects() {
         "false && echo no; echo $?",
         "false || false || echo $?",
         "X=before; X=after > assignment | cat; echo X=$X",
+        "X=first; X=second > $X",
+        "X=first; X=second > $X | cat",
         "echo data | X=pipe; echo X=$X",
     ] {
         let temp = Scratch::new("bash");
@@ -398,4 +400,21 @@ async fn pipeline_expansion_budget_covers_all_retained_stages_before_redirects()
             "a rejected pipeline created redirect {index}"
         );
     }
+}
+
+#[tokio::test]
+async fn null_redirect_admission_uses_assigned_variable_values() {
+    let sandbox = Sandbox::builder()
+        .env("X", "x".repeat(128))
+        .limits(Limits {
+            shell_input_bytes: 1024,
+            host_input_bytes: 1024,
+            ..Limits::default()
+        })
+        .build();
+    let program = format!("Y=$X > \"{}\"", "$Y".repeat(64));
+    let result = sandbox.exec(&program).await;
+    assert_eq!(result.exit_code, 125);
+    assert!(result.stderr.contains("expansion limit"));
+    assert!(sandbox.fs().readdir("/workspace").await.unwrap().is_empty());
 }

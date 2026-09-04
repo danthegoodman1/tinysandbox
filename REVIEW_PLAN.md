@@ -156,7 +156,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 17A: Parser, expansion, stage and loop budgets (F03/F08) | `execution_boundaries.rs`: all-stage/no-pipe rejection, cumulative pipeline expansion, variable doubling/field amplification and no redirect mutations. |
+| Complete | Work | 17A: Parser, expansion, stage and loop budgets (F03/F08) | `execution_boundaries.rs`: all-stage/no-pipe rejection, cumulative pipeline expansion, variable doubling/field amplification, assignment-aware redirect admission and no redirect mutations. |
 | Complete | Work | 17B: Bounded host reads, retention and serialization (F08) | Incremental sort, retained tail byte ring, bounded whole-file helpers, Rust/portable host transfer tests, streamed sed and jq serialization. |
 | Complete | Decision | 17C: Bounded worker and jq policy | Independent 16-slot JS/jq pools retain permits through worker exit; jq admission test covers full-pool timeout and a one-slot pipeline. README states evaluator limits and exclusion API. |
 | Complete | Work | 17D: Capped Node command adapter | `hostInputBytes` limits input before callback and output before transport; Node tests verify rejection, exact cap, no callback on oversized input, and pre-allocation raw read checks. |
@@ -168,7 +168,7 @@ Goal: Match Bash for supported null commands, assignments, redirects, status and
 
 Scope: 18A, 18B.
 
-Completion gate: Ten independent Bash scripts compare status, stdout/stderr, file contents and persistent session effects; existing shell/e2e/streaming suites pass.
+Completion gate: Twelve independent Bash scripts compare status, stdout/stderr, file contents and persistent session effects; existing shell/e2e/streaming suites pass.
 
 Testing plan: Maintain the named regressions below and run the shared configuration matrix.
 
@@ -178,7 +178,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 18A: Shared preparation and session policy (F09) | Single and pipeline paths share redirect preparation; null assignments persist on redirect failure as Bash does; parent-session builtin path intentionally retained. |
 | Complete | Work | 18B: Status propagation and null-stage closure (F09) | Status updates after each pipeline; null stages drop stdin immediately; command budget includes null/assignment stages. |
-| Complete | Test / Gate | Phase 18 validation | Ten independent Bash scripts compare status, stdout/stderr, file contents and persistent session effects; existing shell/e2e/streaming suites pass. |
+| Complete | Test / Gate | Phase 18 validation | Twelve independent Bash scripts compare status, stdout/stderr, file contents and persistent session effects; existing shell/e2e/streaming suites pass. |
 
 ## Phase 19: Make tree operations safe and bounded
 

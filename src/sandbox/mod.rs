@@ -695,13 +695,19 @@ impl Sandbox {
             session.cwd.clone(),
             Some(Arc::clone(&exec.control)),
         );
-        let redirects = match prepare_redirects(simple, &fs, &session.env, exec.last_status).await {
+        let mut env = session.env.clone();
+        for (name, value) in assignment_values {
+            env.insert(name, value);
+        }
+        env.insert("?".to_owned(), exec.last_status.to_string());
+        let redirect_env = if words.is_empty() { &env } else { &session.env };
+        let redirects = match prepare_redirects(simple, &fs, redirect_env, exec.last_status).await {
             Ok(redirects) => redirects,
             Err((path, err)) => {
                 return PreparedStage {
                     name: name.clone(),
                     args: Vec::new(),
-                    env: session.env.clone(),
+                    env,
                     cwd: session.cwd.clone(),
                     fs,
                     command: None,
@@ -722,11 +728,6 @@ impl Sandbox {
                 };
             }
         };
-        let mut env = session.env.clone();
-        for (name, value) in assignment_values {
-            env.insert(name, value);
-        }
-        env.insert("?".to_owned(), exec.last_status.to_string());
 
         let kind = if words.is_empty() {
             StageKind::AssignmentOnly
@@ -2145,18 +2146,39 @@ fn expansion_cost(
             return None;
         }
     }
+    let mut assigned = BTreeMap::new();
     for assignment in &simple.assignments {
-        if !charge(assignment.name.len()) {
+        if !charge(
+            assignment
+                .name
+                .len()
+                .saturating_add(2 * std::mem::size_of::<String>()),
+        ) {
             return None;
         }
+        let mut bytes = 0usize;
+        for segment in &assignment.value.segments {
+            let value = match segment {
+                Segment::Literal { value, .. } => std::borrow::Cow::Borrowed(value.as_str()),
+                Segment::Expansion { name, .. } => expansion_value(name, env, last_status),
+            };
+            bytes = bytes.saturating_add(value.len());
+            if bytes > limit {
+                return None;
+            }
+        }
+        assigned.insert(
+            assignment.name.as_str(),
+            (&assignment.value, bytes, None::<usize>),
+        );
     }
-    for (word, split) in simple
+    for (word, split, redirect) in simple
         .assignments
         .iter()
-        .map(|a| (&a.value, false))
-        .chain(simple.words.iter().map(|w| (w, true)))
+        .map(|a| (&a.value, false, false))
+        .chain(simple.words.iter().map(|w| (w, true, false)))
         .chain(simple.redirects.iter().filter_map(|r| match &r.target {
-            RedirectTarget::Word(w) => Some((w, true)),
+            RedirectTarget::Word(w) => Some((w, true, true)),
             _ => None,
         }))
     {
@@ -2172,21 +2194,49 @@ fn expansion_cost(
                     (expansion_value(name, env, last_status), split && !quoted)
                 }
             };
-            if !charge(value.len()) {
+            // Null commands apply assignments before redirect expansion.
+            // Cache estimates by variable and admit bytes before scanning for
+            // fields. Repeated references cannot cause quadratic rescanning of
+            // assignment syntax or materialize an amplified redirect string.
+            let assigned_value = if redirect && let Segment::Expansion { name, .. } = segment {
+                assigned.get_mut(name.as_str())
+            } else {
+                None
+            };
+            let bytes = assigned_value
+                .as_ref()
+                .map_or(value.len(), |(_, n, _)| value.len().max(*n));
+            if !charge(bytes) {
                 return None;
             }
-            if fields
-                && !charge(
-                    value
-                        .split_whitespace()
-                        .count()
-                        .saturating_add(2)
-                        .saturating_mul(
-                            std::mem::size_of::<String>() + std::mem::size_of::<&str>(),
-                        ),
-                )
-            {
-                return None;
+            if fields {
+                let mut field_count = value.split_whitespace().count().saturating_add(2);
+                if let Some((word, _, cached_fields)) = assigned_value {
+                    let count = cached_fields.get_or_insert_with(|| {
+                        let mut count = 1usize;
+                        for segment in &word.segments {
+                            let value = match segment {
+                                Segment::Literal { value, .. } => {
+                                    std::borrow::Cow::Borrowed(value.as_str())
+                                }
+                                Segment::Expansion { name, .. } => {
+                                    expansion_value(name, env, last_status)
+                                }
+                            };
+                            count = count
+                                .saturating_add(value.split_whitespace().count().saturating_add(2));
+                        }
+                        count
+                    });
+                    field_count = field_count.max(*count);
+                }
+                if !charge(
+                    field_count.saturating_mul(
+                        std::mem::size_of::<String>() + std::mem::size_of::<&str>(),
+                    ),
+                ) {
+                    return None;
+                }
             }
         }
     }
