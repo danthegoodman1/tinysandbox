@@ -224,3 +224,235 @@ fn root_must_be_an_existing_directory() {
 
     let _ = std::fs::remove_dir_all(&parent);
 }
+
+#[test]
+fn replacing_the_root_path_preserves_the_opened_directory() {
+    let (parent, root) = scratch_dirs("root-replacement");
+    let outside = parent.join("outside");
+    let original = parent.join("original-root");
+    std::fs::create_dir(&outside).expect("create outside directory");
+    std::fs::write(outside.join("sentinel"), b"outside").expect("write outside sentinel");
+    let vfs = LocalVfs::new(&root).expect("open local vfs");
+    write_file(&vfs, "/sentinel", b"inside").expect("write inside sentinel");
+
+    std::fs::rename(&root, &original).expect("move opened root");
+    std::os::unix::fs::symlink(&outside, &root).expect("replace original path with symlink");
+
+    assert_eq!(
+        read_file(&vfs, "/sentinel").expect("read anchored file"),
+        b"inside"
+    );
+    vfs.mkdir("/new-dir").expect("mkdir in opened root");
+    write_file(&vfs, "/new-dir/new-file", b"new").expect("write in opened root");
+    vfs.rename("/new-dir/new-file", "/renamed")
+        .expect("rename in opened root");
+    vfs.rmdir("/new-dir").expect("rmdir in opened root");
+    assert_eq!(vfs.readdir("/").expect("read opened root").len(), 2);
+    assert_eq!(
+        vfs.refresh().expect("scan opened root"),
+        VfsStats {
+            used_bytes: 9,
+            file_count: 2
+        }
+    );
+    vfs.unlink("/sentinel").expect("unlink in opened root");
+    assert_eq!(
+        std::fs::read(outside.join("sentinel")).expect("outside unchanged"),
+        b"outside"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside)
+            .expect("outside listing")
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read(original.join("renamed")).expect("write retained in original root"),
+        b"new"
+    );
+
+    // Replacing the path with another real directory also cannot redirect it.
+    std::fs::remove_file(&root).expect("remove replacement symlink");
+    std::fs::create_dir(&root).expect("create replacement root directory");
+    assert_eq!(
+        read_file(&vfs, "/renamed").expect("same opened root"),
+        b"new"
+    );
+    assert!(
+        std::fs::read_dir(&root)
+            .expect("replacement root listing")
+            .next()
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn concurrent_ancestor_replacement_cannot_reach_outside_files() {
+    use std::sync::{Arc, Barrier};
+
+    let (parent, root) = scratch_dirs("ancestor-race");
+    let outside = parent.join("outside");
+    std::fs::create_dir(&outside).expect("create outside");
+    std::fs::write(outside.join("sentinel"), b"outside").expect("write outside sentinel");
+    std::fs::create_dir(outside.join("empty")).expect("create outside directory sentinel");
+    let vfs = LocalVfs::new(&root).expect("open local vfs");
+    vfs.mkdir("/ancestor").expect("create inside ancestor");
+    write_file(&vfs, "/ancestor/sentinel", b"inside").expect("write inside sentinel");
+    let ready = Arc::new(Barrier::new(2));
+    std::thread::scope(|scope| {
+        let ready_writer = Arc::clone(&ready);
+        let root = &root;
+        let outside = &outside;
+        scope.spawn(move || {
+            ready_writer.wait();
+            for _ in 0..1_000 {
+                std::fs::rename(root.join("ancestor"), root.join("parked")).expect("park ancestor");
+                std::os::unix::fs::symlink(outside, root.join("ancestor")).expect("swap symlink");
+                std::thread::yield_now();
+                std::fs::remove_file(root.join("ancestor")).expect("remove symlink");
+                std::fs::rename(root.join("parked"), root.join("ancestor"))
+                    .expect("restore ancestor");
+            }
+        });
+        ready.wait();
+        for _ in 0..1_000 {
+            if let Ok(handle) = vfs.open("/ancestor/sentinel", OpenMode::read_write()) {
+                let mut bytes = [0; 7];
+                let count = vfs
+                    .read_at(handle, 0, &mut bytes)
+                    .expect("read anchored handle");
+                assert_eq!(&bytes[..count], b"inside");
+                vfs.write_at(handle, 0, b"inside")
+                    .expect("write anchored handle");
+                vfs.close(handle).expect("close anchored handle");
+            }
+            if let Ok(entries) = vfs.readdir("/ancestor") {
+                assert!(!entries.iter().any(|entry| entry.name == "empty"));
+            }
+            let _ = vfs.mkdir("/ancestor/new-dir");
+            let _ = vfs.rename("/ancestor/new-dir", "/ancestor/renamed-dir");
+            let _ = vfs.rmdir("/ancestor/renamed-dir");
+            let _ = vfs.rmdir("/ancestor/empty");
+            let _ = vfs.refresh();
+        }
+    });
+    assert_eq!(
+        std::fs::read(outside.join("sentinel")).expect("outside unchanged"),
+        b"outside"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside)
+            .expect("outside listing")
+            .count(),
+        2
+    );
+    assert!(outside.join("empty").is_dir());
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn special_files_are_invisible_and_cannot_block_open() {
+    let (parent, root) = scratch_dirs("special-files");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(root.join("fifo"))
+            .status()
+            .expect("run mkfifo")
+            .success()
+    );
+    let _socket =
+        std::os::unix::net::UnixListener::bind(root.join("socket")).expect("create socket");
+    let vfs = LocalVfs::new(&root).expect("open local vfs");
+    for path in ["/fifo", "/socket"] {
+        assert_errno(vfs.stat(path), Errno::ENOENT);
+        assert_errno(vfs.open(path, OpenMode::read_only()), Errno::EACCES);
+        assert_errno(
+            vfs.open(path, OpenMode::write_only().truncate()),
+            Errno::EACCES,
+        );
+        assert_errno(vfs.unlink(path), Errno::ENOENT);
+    }
+    assert!(vfs.readdir("/").expect("list root").is_empty());
+    assert_eq!(
+        vfs.refresh().expect("scan root"),
+        VfsStats {
+            used_bytes: 0,
+            file_count: 0
+        }
+    );
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn renaming_over_an_empty_directory_releases_its_quota_slot() {
+    let (parent, root) = scratch_dirs("rename-directory-quota");
+    let vfs = LocalVfs::with_quota(
+        &root,
+        VfsQuota {
+            max_files: 2,
+            ..VfsQuota::unlimited()
+        },
+    )
+    .expect("open local vfs");
+    vfs.mkdir("/source").expect("create source");
+    vfs.mkdir("/target").expect("create target");
+    vfs.rename("/source", "/target")
+        .expect("replace empty target");
+    assert_eq!(vfs.stats().expect("stats").file_count, 1);
+    vfs.mkdir("/reuses-slot")
+        .expect("replacement released one slot");
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn scans_reject_host_trees_beyond_the_vfs_depth_limit() {
+    let (parent, root) = scratch_dirs("scan-depth");
+    let mut deepest = root.clone();
+    for _ in 0..256 {
+        deepest.push("d");
+        std::fs::create_dir(&deepest).expect("create bounded host tree");
+    }
+    let vfs = LocalVfs::new(&root).expect("maximum-depth tree is supported");
+    assert_eq!(vfs.stats().expect("stats").file_count, 256);
+    std::fs::write(deepest.join("too-deep"), b"x").expect("extend host tree beyond limit");
+    assert_errno(vfs.refresh(), Errno::EINVAL);
+    assert_eq!(
+        vfs.stats()
+            .expect("failed refresh retains baseline")
+            .file_count,
+        256
+    );
+    assert_eq!(
+        LocalVfs::new(&root)
+            .expect_err("reject excessive depth")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn quota_scan_counts_regular_files_with_non_utf8_names() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let (parent, root) = scratch_dirs("scan-non-utf8");
+    std::fs::write(root.join(OsString::from_vec(vec![0xff])), b"data")
+        .expect("write unrepresentable name");
+    let vfs = LocalVfs::new(&root).expect("open local vfs");
+    assert!(
+        vfs.readdir("/")
+            .expect("inexpressible name is hidden")
+            .is_empty()
+    );
+    assert_eq!(
+        vfs.stats().expect("contents remain charged"),
+        VfsStats {
+            used_bytes: 4,
+            file_count: 1
+        }
+    );
+    let _ = std::fs::remove_dir_all(&parent);
+}

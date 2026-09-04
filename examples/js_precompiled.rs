@@ -56,7 +56,8 @@ async fn main() {
     // Installing one replaces the embedded runtime, and only works before the
     // first `js` command, which already ran above. A stale or foreign artifact
     // is refused the same way, leaving the embedded runtime in place.
-    match tinysandbox::js::use_precompiled(&artifact) {
+    // SAFETY: use the unmodified artifact produced above, never arbitrary bytes.
+    match unsafe { tinysandbox::js::use_precompiled(&artifact) } {
         Ok(()) => println!("installed the artifact"),
         Err(err) => println!("kept the embedded runtime: {err}"),
     }

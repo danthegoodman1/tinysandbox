@@ -917,3 +917,9 @@ Status ledger:
 | Complete | Test | cross-host `fs` and CommonJS parity corpus | `tests/fixtures/js_vfs_portable_corpus.json` passes unchanged under Rust/Wasmtime and Node/V8 for file entry globals, UTF-8/CommonJS/JSON/cache, fd positional read/write/truncate, readdir, and errno. Portable tests add binary I/O, all 11 supplied-VFS operations, cycles, module-depth limit, deterministic entry errors, leaked-fd cleanup, strict-unhandled-rejection containment, and proof that VFS does not grant or receive fetch calls; 19/19 package tests and 65/65 focused Rust JS tests pass. |
 | Complete | Test | browser and Convex regressions remain storage-independent | The actual headless-Chrome example executes `runFile()` with fs plus relative CommonJS and reports `headless_chrome_smoke=PASS`; the same page first reruns the Phase 12 no-VFS/global smoke. Node's Phase 12 suite remains green and the no-VFS Convex-compatible bundle reports `convex_v8_bundle_smoke=PASS` at 871,568 bytes. Real Convex deployment is intentionally not part of this repository's test surface. |
 | Complete | Gate | optional VFS/file execution complete without the rest of tinysandbox | Two rebuilds match at 626,766 bytes/SHA-256 `9b7686bc01fc7f09a6109ac516fb1bbd04771803cc1dc2b2e18726a1d3e8c3af`; package test/typecheck/Chrome/Convex/pack gates pass, with exactly seven packed files and no concrete VFS. Full all-feature and no-default-feature Rust workspace tests/build, fmt, all-target Clippy, and warning-denied rustdoc pass. |
+
+## Follow-up architecture review
+
+[REVIEW_PLAN.md](REVIEW_PLAN.md) tracks phases14–21 and the additional containment,
+execution lifecycle, streaming, admission, and verification regressions found
+after the historical completion ledgers above.

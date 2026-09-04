@@ -275,11 +275,12 @@ stdin and files are parsed first and passed to the filter as one array.
 limit between output values and inside the tinysandbox-provided `range`, and
 stops promptly when a downstream pipe closes, so
 `jq -n 'range(0;1000000000)' | head` does not buffer unbounded output. jaq
-does not expose a fully preemptive evaluator or an allocator limit, so some
-non-output-producing filters only time out at the command boundary while the
-blocking worker runs until jaq yields again, and evaluation memory is bounded
-by wall time plus host memory rather than a jq-specific heap cap. Hosts
-running untrusted filters should set `wall_time` conservatively.
+does not expose a fully preemptive evaluator or an allocator limit. A filter
+can allocate host memory or keep its blocking worker busy between checkpoints,
+even after `exec` returns 124. Wall time is not a heap bound. Hosts requiring
+hard isolation for untrusted filters must use an OS-isolated worker or exclude
+`jq` with `Sandbox::builder().without_command("jq")` (Node:
+`disabledCommands: ['jq']`). Removing a command also removes it from `/bin`.
 
 **Not included.** User-defined jq functions (`def ...`), external module
 loading, color output, and CLI flags outside the listed subset. Diagnostics
@@ -465,6 +466,8 @@ be both a function and a namespace: `tools` and `tools.search` conflict.
 **Rust**
 
 ```rust no_run
+# #[cfg(feature = "js")]
+# fn example() {
 use serde_json::json;
 use tinysandbox::sandbox::{HostError, Sandbox};
 
@@ -487,6 +490,8 @@ async fn main() {
         .await;
     assert_eq!(result.stdout, "agent-1\nvalue-for-a\n");
 }
+# }
+# fn main() {}
 ```
 
 **TypeScript**
@@ -523,6 +528,8 @@ sandbox can also change it, which is what an agent loop wants when each turn
 grants a different set of tools:
 
 ```rust no_run
+# #[cfg(feature = "js")]
+# fn example() {
 use serde_json::json;
 use tinysandbox::sandbox::{JsGlobals, Sandbox};
 
@@ -551,6 +558,8 @@ async fn main() {
     assert!(sandbox.remove_js_global("whoami"));
     assert_eq!(sandbox.js_global_names().len(), 3);
 }
+# }
+# fn main() {}
 ```
 
 Every `js` command snapshots the registry when it starts, which fixes what the
@@ -604,6 +613,8 @@ so use it to define globals or wrap capabilities, not to `require()` modules.
 **Rust**
 
 ```rust no_run
+# #[cfg(feature = "js")]
+# fn example() {
 use serde_json::json;
 use tinysandbox::sandbox::Sandbox;
 
@@ -623,6 +634,8 @@ async fn main() {
         .await;
     assert_eq!(result.stdout, "redacted undefined\n");
 }
+# }
+# fn main() {}
 ```
 
 **TypeScript**
@@ -659,6 +672,8 @@ body accepted from the host before it reaches the guest.
 **Rust**
 
 ```rust no_run
+# #[cfg(feature = "js")]
+# fn example() {
 use tinysandbox::sandbox::{FetchResponse, HostError, Sandbox};
 
 #[tokio::main]
@@ -682,6 +697,8 @@ async fn main() {
         .await;
     assert_eq!(result.stdout, "true\n");
 }
+# }
+# fn main() {}
 ```
 
 **TypeScript**
@@ -888,6 +905,8 @@ cargo add tokio --features macros,rt-multi-thread
 ```
 
 ```rust no_run
+# #[cfg(feature = "s3")]
+# fn example() {
 use aws_sdk_s3::Client;
 use tinysandbox::sandbox::Sandbox;
 use tinysandbox::vfs::{S3Vfs, S3VfsConfig};
@@ -918,11 +937,15 @@ async fn run_read_only(client: Client) -> Result<(), Box<dyn std::error::Error>>
     println!("{}", sandbox.exec("cat /input/spec.md").await.stdout);
     Ok(())
 }
+# }
+# fn main() {}
 ```
 
 Tune the write policy with `S3Vfs::with_config`:
 
 ```rust no_run
+# #[cfg(feature = "s3")]
+# fn example() {
 use tinysandbox::vfs::S3VfsConfig;
 
 let config = S3VfsConfig {
@@ -932,6 +955,8 @@ let config = S3VfsConfig {
     directory_rename: false,
     ..S3VfsConfig::default()
 };
+# }
+# fn main() {}
 ```
 
 `S3Vfs` accepts an already configured `aws_sdk_s3::Client`; endpoint,
@@ -1145,11 +1170,40 @@ VFS adapters can still validate the non-snapshot contract with
 
 ## Limits and observability
 
-Every `Sandbox` enforces wall-clock timeouts (exit 124, like GNU `timeout`),
-stdout/stderr caps with head+tail truncation, a per-exec command budget,
-VFS byte/file quotas (surfacing as `ENOSPC`), a wasm memory cap for JS, and a
-fetch response body cap for embedder-backed `fetch`. All configurable via
-`Limits`:
+`Sandbox` uses one wall-clock deadline for parsing, commands, hostcall
+admission, and JS execution. Exhausting it returns exit 124 and discards partial
+captures and session changes. Dropping the exec future also cancels its
+capabilities. New filesystem operations are rejected after cancellation;
+already-running trusted VFS operations or callbacks may finish and their effects
+are not rolled back. Cancellation releases handles and aborts staged S3 writes;
+slow cleanup can outlive the result. Custom backends should override `Vfs::abort`
+when closing would publish staged data; the default delegates to `close`.
+
+Capture caps apply only to returned stdout/stderr. Pipes and files receive the
+original byte stream, with bounded chunks and backpressure. Duplicated output
+fds share one open handle and offset, including a single S3 commit.
+
+`Limits` defaults include 1 MiB of shell source, 8 MiB per whole-file/host-input
+operation, 8 MiB retained by `tail`, 1,024 simple command stages (including null
+and assignment-only stages), and 1,024 simultaneously open files. `sort` and
+`jq` have separate cumulative input caps. Shell expansion admits a whole pipeline
+against the larger of `shell_input_bytes` and `host_input_bytes`, including
+retained environment copies and field storage, before opening any redirects.
+Normalized paths have a hard depth
+ceiling of 256, which `max_path_depth` can lower per exec. Host `sandbox.fs()`
+operations use the default whole-file and per-I/O caps; stream large files with
+handles. Raw reads/writes allow at least one 64 KiB stream chunk even under a
+smaller whole-file cap.
+
+JS workers are admitted through 16 process-wide slots; synchronous filesystem
+work through 128 slots; native jq evaluation through 16 slots. Slots remain
+occupied until running work finishes. Jq input buffers are separately capped
+per command and collected before worker admission to let downstream pipes drain.
+Fallback handle cleanup uses four workers and shares a process-wide 16,384-open-
+file ceiling. Trusted host callbacks and VFS implementations must bound their
+own work. Native `jq` has the limitations described above. VFS quotas are
+backend-configured (memory quotas are unlimited unless set), and JS memory and
+fetch-response limits are independently configurable:
 
 #### Rust
 
@@ -1189,20 +1243,30 @@ reports VFS usage and total commands run.
 
 ## Security model
 
-- **Native code never runs agent input.** The shell and builtins only
-  interpret command text against the VFS; the only thing that executes
-  agent-authored *code* is the wasm guest.
+- The shell and builtins interpret input in native Rust. JavaScript source
+  executes inside the wasm guest. Native jq evaluation and trusted custom
+  commands need the separate resource policy described above.
 - **The wasm guest is capability-free.** The vendored QuickJS module
   (see [assets/PROVENANCE.md](https://github.com/danthegoodman1/tinysandbox/blob/main/assets/PROVENANCE.md) for the reproducible build) imports no WASI
   filesystem functions — no preopens, no `path_open`. Its only window to
   the world is the audited hostcall ABI, which routes through the same
   VFS, quotas, and path containment as everything else.
-- **Resources are bounded** per execution: memory (ResourceLimiter), CPU
-  (epoch interruption), wall clock, output size, file quotas.
+- JS linear memory is capped by Wasmtime, with CPU interruption, bounded
+  host transfers, and an execution-wide deadline. These are not a total-process
+  heap cap or preemption guarantee for native evaluators and host callbacks.
+- Precompiled JS artifacts contain native machine code. Rust's
+  `unsafe use_precompiled` and Node's host-only `usePrecompiledJs` require
+  authentic artifacts from the same build and target. A format/version check
+  does not make untrusted bytes safe.
 - `..` traversal is contained at the virtual root. `/bin` and mount points are
   read-only. With
-  the local directory VFS, containment also refuses symlinks and special
-  files, so the sandbox cannot reach outside its host directory.
+  the local directory VFS, each component is opened relative to an already-open
+  directory without following symlinks; special files are refused. Replacing
+  root or ancestor names cannot redirect traversal. An opened directory remains
+  the same capability if the host moves it. The host must dedicate the tree to
+  the sandbox and must not insert hard links or mounted content granting access
+  to outside files. Hard links are unsupported; other external mutations make
+  namespace/quota accounting stale until refreshed.
 
 tinysandbox is one layer, not the whole story: for hostile multi-tenant
 workloads you should still run your process under OS-level defense in depth
@@ -1227,13 +1291,12 @@ but the designs differ in ways that matter:
   command runs. just-bash buffers command output before it can be consumed or
   written back; tinysandbox can run `cat /huge | head -n 1` without
   materializing the full input or output.
-- **Agent code always runs in WebAssembly.** In tinysandbox, the only thing
-  that executes agent-authored code is the capability-free QuickJS wasm
-  guest, with hard memory and CPU limits enforced by Wasmtime. just-bash
-  interprets the shell and its commands in the host JavaScript engine and
-  relies on language-level hardening against engine breakouts.
+- **JavaScript runs in WebAssembly.** QuickJS executes JavaScript inside a
+  capability-free wasm guest, with linear-memory and CPU limits enforced by
+  Wasmtime. Shell commands and jq filters are interpreted by native Rust;
+  their resource boundaries are described above.
 - **Host language.** tinysandbox is a Rust crate with Node.js bindings;
-  just-bash is TypeScript and runs in Node or the browser.s
+  just-bash is TypeScript and runs in Node or the browser.
 
 ## Performance
 
@@ -1315,14 +1378,20 @@ embedded one:
 **Rust**
 
 ```rust no_run
+# #[cfg(feature = "js")]
+# fn example() {
 // Build step, for example in a packaging job.
 let artifact = tinysandbox::js::precompile().expect("precompile quickjs");
 std::fs::write("target/quickjs.cwasm", &artifact).expect("write artifact");
 
 // Later process, before the first `js` command runs.
 if let Ok(artifact) = std::fs::read("target/quickjs.cwasm") {
-    let _ = tinysandbox::js::use_precompiled(&artifact);
+    // SAFETY: These bytes come from our trusted build above, and the artifact
+    // file must remain protected from modification by untrusted writers.
+    let _ = unsafe { tinysandbox::js::use_precompiled(&artifact) };
 }
+# }
+# fn main() {}
 ```
 
 **TypeScript**

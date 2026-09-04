@@ -17,25 +17,30 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use regex::{Captures, Regex, RegexBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use super::jq::{self, JqError};
 use crate::sandbox::command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult,
 };
-use crate::sandbox::fs::{Fs, errno_message, join_path};
-use crate::vfs::{Errno, FileType, Metadata, VfsError};
+use crate::sandbox::fs::{Fs, STREAM_CHUNK_BYTES, errno_message, join_path};
+use crate::vfs::{DirEntry, Errno, FileType, Metadata, OpenMode, VfsError};
 
 const MAX_STREAM_LINE_BYTES: usize = 1024 * 1024;
 const LINE_TOO_LONG: &str = "line too long";
 const MAX_JQ_JSON_NESTING: usize = 1024;
+// Independent from JS admission: a native evaluator that outlives an exec
+// retains its slot until it actually exits. Collect bounded stdin before
+// admission so a queued downstream jq can drain an admitted producer's pipe.
+const MAX_JQ_WORKERS: usize = 16;
+static JQ_WORKERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_JQ_WORKERS)));
 
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     insert(commands, "cat", cat);
@@ -288,6 +293,7 @@ async fn cat_stream(
     let mut buf = vec![0; 64 * 1024];
     if flags.plain() {
         loop {
+            tokio::task::yield_now().await;
             let n = reader.read(&mut buf).await?;
             if n == 0 {
                 return Ok(());
@@ -296,9 +302,8 @@ async fn cat_stream(
         }
     }
 
-    let mut pending = Vec::new();
-    let mut eof = false;
-    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+    let mut pending = LineBuffer::default();
+    while let Some(line) = read_line(reader, &mut pending).await? {
         let mut out = Vec::new();
         cat_transform(&line, flags, state, &mut out);
         stdout.write_all(&out).await?;
@@ -438,14 +443,26 @@ fn jq_cmd(ctx: CommandContext) -> CommandFuture {
             }
         };
 
+        let permit = Arc::clone(&JQ_WORKERS)
+            .acquire_owned()
+            .await
+            .expect("jq admission semaphore remains open");
+        if fs.checkpoint().await.is_err() {
+            return CommandResult::new(124);
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = JqCancelOnDrop {
             cancelled: Arc::clone(&cancelled),
         };
-        let deadline =
-            Instant::now().checked_add(limits.wall_time.saturating_add(Duration::from_secs(1)));
+        if fs.checkpoint().await.is_err() {
+            return CommandResult::new(124);
+        }
+        let deadline = fs
+            .remaining_wall_time()
+            .and_then(|remaining| Instant::now().checked_add(remaining));
         let (tx, mut rx) = mpsc::channel(4);
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             run_jq_program(options, inputs, tx, deadline, cancelled);
         });
 
@@ -784,9 +801,8 @@ fn grep(ctx: CommandContext) -> CommandFuture {
                 return CommandResult::new(2);
             }
         };
-        let (files, mut had_error) =
-            collect_input_files(&fs, &positional, flags.recursive, "grep", &mut stderr).await;
-        let show_path = flags.recursive || files.len() > 1 || positional.len() > 1;
+        let show_path = flags.recursive || positional.len() > 1;
+        let mut had_error = false;
         let mut matched_any = false;
         if positional.is_empty() {
             match grep_reader(&mut stdout, &mut stdin, "", &regex, flags, false).await {
@@ -799,7 +815,16 @@ fn grep(ctx: CommandContext) -> CommandFuture {
                 }
             }
         } else {
-            for path in files {
+            let mut inputs = GrepInputs::new(positional, flags.recursive);
+            while let Some(input) = inputs.next(&fs).await {
+                let path = match input {
+                    Ok(path) => path,
+                    Err((path, err)) => {
+                        had_error = true;
+                        write_vfs_error(&mut stderr, "grep", &path, err).await;
+                        continue;
+                    }
+                };
                 let label = if path == "-" {
                     "(standard input)"
                 } else {
@@ -892,25 +917,32 @@ fn sort(ctx: CommandContext) -> CommandFuture {
         }
         // Sorting is the one text builtin that must see the full input before
         // it can produce GNU-compatible ordering.
-        let input = match read_inputs(&fs, &files, &mut stdin, "sort", &mut stderr).await {
+        let input = match read_inputs(
+            &fs,
+            &files,
+            &mut stdin,
+            limits.sort_input_bytes,
+            "sort",
+            &mut stderr,
+        )
+        .await
+        {
             Ok(input) => input,
             Err(()) => return CommandResult::new(2),
         };
-        if input.len() > limits.sort_input_bytes {
-            let _ = stderr
-                .write_all(b"sort: input too large for tinysandbox sort\n")
-                .await;
-            return CommandResult::new(2);
+        if fs.checkpoint().await.is_err() {
+            return CommandResult::new(124);
         }
-        let mut lines = text_lines_lossy(&input);
+        let text = String::from_utf8_lossy(&input);
+        let mut lines: Vec<_> = text.lines().collect();
         if numeric {
-            lines.sort_by(|a, b| {
+            lines.sort_unstable_by(|a, b| {
                 numeric_key(a)
                     .total_cmp(&numeric_key(b))
                     .then_with(|| a.cmp(b))
             });
         } else {
-            lines.sort();
+            lines.sort_unstable();
         }
         if unique {
             if numeric {
@@ -922,9 +954,15 @@ fn sort(ctx: CommandContext) -> CommandFuture {
         if reverse {
             lines.reverse();
         }
-        for line in lines {
-            let _ = stdout.write_all(line.as_bytes()).await;
-            let _ = stdout.write_all(b"\n").await;
+        for (index, line) in lines.into_iter().enumerate() {
+            if index.is_multiple_of(1024) && fs.checkpoint().await.is_err() {
+                return CommandResult::new(124);
+            }
+            if stdout.write_all(line.as_bytes()).await.is_err()
+                || stdout.write_all(b"\n").await.is_err()
+            {
+                return CommandResult::failure();
+            }
         }
         CommandResult::success()
     })
@@ -1228,6 +1266,7 @@ async fn head_tail(ctx: CommandContext, head_mode: bool) -> CommandResult {
     let CommandContext {
         args,
         fs,
+        limits,
         mut stdin,
         mut stdout,
         mut stderr,
@@ -1271,14 +1310,18 @@ async fn head_tail(ctx: CommandContext, head_mode: bool) -> CommandResult {
         i += 1;
     }
     let show_headers = verbose || files.len() > 1;
+    let settings = HeadTailSettings {
+        count: n,
+        head_mode,
+        window_bytes: limits.tail_input_bytes,
+    };
     if files.is_empty() {
         if let Err(err) = head_tail_reader(
             &mut stdin,
             &mut stdout,
             "standard input",
             false,
-            n,
-            head_mode,
+            settings,
             0,
         )
         .await
@@ -1291,16 +1334,7 @@ async fn head_tail(ctx: CommandContext, head_mode: bool) -> CommandResult {
     } else {
         for (index, file) in files.iter().enumerate() {
             let result = if file == "-" {
-                head_tail_reader(
-                    &mut stdin,
-                    &mut stdout,
-                    file,
-                    show_headers,
-                    n,
-                    head_mode,
-                    index,
-                )
-                .await
+                head_tail_reader(&mut stdin, &mut stdout, file, show_headers, settings, index).await
             } else {
                 match fs.stream_reader(file).await {
                     Ok(mut reader) => {
@@ -1309,8 +1343,7 @@ async fn head_tail(ctx: CommandContext, head_mode: bool) -> CommandResult {
                             &mut stdout,
                             file,
                             show_headers,
-                            n,
-                            head_mode,
+                            settings,
                             index,
                         )
                         .await
@@ -1337,10 +1370,14 @@ async fn head_tail_reader(
     stdout: &mut BoxAsyncWrite,
     label: &str,
     show_header: bool,
-    count: TailCount,
-    head_mode: bool,
+    settings: HeadTailSettings,
     index: usize,
 ) -> io::Result<()> {
+    let HeadTailSettings {
+        count,
+        head_mode,
+        window_bytes,
+    } = settings;
     if show_header {
         if index > 0 {
             stdout.write_all(b"\n").await?;
@@ -1350,34 +1387,46 @@ async fn head_tail_reader(
             .await?;
     }
 
-    let mut pending = Vec::new();
-    let mut eof = false;
+    let mut pending = LineBuffer::default();
     match count {
         TailCount::Last(limit) if head_mode => {
             for _ in 0..limit {
-                let Some(line) = read_line(reader, &mut pending, &mut eof).await? else {
+                let Some(line) = read_line(reader, &mut pending).await? else {
                     break;
                 };
                 stdout.write_all(&line).await?;
             }
         }
         TailCount::Last(limit) => {
-            let mut lines = VecDeque::new();
-            while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+            let mut window = VecDeque::new();
+            let mut retained_lines = 0usize;
+            while let Some(line) = read_line(reader, &mut pending).await? {
                 if limit > 0 {
-                    lines.push_back(line);
-                    while lines.len() > limit {
-                        lines.pop_front();
+                    if retained_lines == limit {
+                        while let Some(byte) = window.pop_front() {
+                            if byte == b'\n' {
+                                break;
+                            }
+                        }
+                        retained_lines -= 1;
                     }
+                    if window.len().saturating_add(line.len()) > window_bytes {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "retained input too large for tinysandbox tail",
+                        ));
+                    }
+                    window.extend(line);
+                    retained_lines += 1;
                 }
             }
-            for line in lines {
-                stdout.write_all(&line).await?;
-            }
+            let (front, back) = window.as_slices();
+            stdout.write_all(front).await?;
+            stdout.write_all(back).await?;
         }
         TailCount::From(start) => {
             let mut line_no = 1_usize;
-            while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+            while let Some(line) = read_line(reader, &mut pending).await? {
                 if line_no >= start {
                     stdout.write_all(&line).await?;
                 }
@@ -1433,6 +1482,12 @@ async fn report_stream_error(
     }
     if is_line_too_long(&err) {
         write_line_too_long(stderr, cmd, path).await;
+        return true;
+    }
+    if err.kind() == io::ErrorKind::InvalidData {
+        let _ = stderr
+            .write_all(format!("{cmd}: {path}: {err}\n").as_bytes())
+            .await;
         return true;
     }
     if let Some(err) = io_error_to_vfs(err) {
@@ -1731,6 +1786,7 @@ async fn read_jq_reader(
 ) -> io::Result<()> {
     let mut buf = [0_u8; 64 * 1024];
     loop {
+        tokio::task::yield_now().await;
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             return Ok(());
@@ -1859,15 +1915,19 @@ fn run_jq_input_value(
     for value in program.output_iter(input, vars) {
         let value = value.map_err(jq_error_outcome)?;
         *last_output = Some(jq_truthy(&value));
-        let mut chunk = Vec::new();
-        write_jq_value(&mut chunk, &value, options).map_err(|err| JqRunDone {
-            exit_code: 5,
-            stderr: format!("jq: output error: {err}\n").into_bytes(),
-        })?;
-        tx.blocking_send(JqStreamMessage::Stdout(chunk))
-            .map_err(|_| JqRunDone {
-                exit_code: 1,
-                stderr: Vec::new(),
+        let mut writer = JqOutputWriter {
+            tx,
+            pending: Vec::new(),
+        };
+        write_jq_value(&mut writer, &value, options)
+            .and_then(|()| io::Write::flush(&mut writer))
+            .map_err(|err| JqRunDone {
+                exit_code: if is_broken_pipe(&err) { 1 } else { 5 },
+                stderr: if is_broken_pipe(&err) {
+                    Vec::new()
+                } else {
+                    format!("jq: output error: {err}\n").into_bytes()
+                },
             })?;
     }
     Ok(())
@@ -1885,11 +1945,44 @@ fn jq_exit_code(exit_status: bool, last_output: Option<bool>) -> i32 {
     }
 }
 
-fn write_jq_value(out: &mut Vec<u8>, value: &jaq_json::Val, options: &JqOptions) -> io::Result<()> {
+// Bound serialization buffers even when one evaluator value is very large.
+// This does not impose a heap limit on jaq's own evaluation; its documented
+// cooperative evaluator limit still applies.
+struct JqOutputWriter<'a> {
+    tx: &'a mpsc::Sender<JqStreamMessage>,
+    pending: Vec<u8>,
+}
+
+impl io::Write for JqOutputWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = bytes.len().min(STREAM_CHUNK_BYTES - self.pending.len());
+        self.pending.extend_from_slice(&bytes[..n]);
+        if self.pending.len() == STREAM_CHUNK_BYTES {
+            self.flush()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            let chunk = std::mem::take(&mut self.pending);
+            self.tx
+                .blocking_send(JqStreamMessage::Stdout(chunk))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "jq output closed"))?;
+        }
+        Ok(())
+    }
+}
+
+fn write_jq_value(
+    out: &mut impl io::Write,
+    value: &jaq_json::Val,
+    options: &JqOptions,
+) -> io::Result<()> {
     if options.raw_output {
         match value {
             jaq_json::Val::TStr(bytes) | jaq_json::Val::BStr(bytes) => {
-                out.extend_from_slice(bytes);
+                out.write_all(bytes)?;
             }
             _ => write_jq_json(out, value, options)?,
         }
@@ -1897,12 +1990,16 @@ fn write_jq_value(out: &mut Vec<u8>, value: &jaq_json::Val, options: &JqOptions)
         write_jq_json(out, value, options)?;
     }
     if !options.join_output {
-        out.push(b'\n');
+        out.write_all(b"\n")?;
     }
     Ok(())
 }
 
-fn write_jq_json(out: &mut Vec<u8>, value: &jaq_json::Val, options: &JqOptions) -> io::Result<()> {
+fn write_jq_json(
+    out: &mut impl io::Write,
+    value: &jaq_json::Val,
+    options: &JqOptions,
+) -> io::Result<()> {
     let pp = jaq_json::write::Pp {
         indent: (!options.compact_output).then(|| options.indent.clone()),
         sort_keys: options.sort_keys,
@@ -1985,15 +2082,12 @@ async fn list_dir(fs: &Fs, path: &str, all: bool) -> Result<Vec<(String, Metadat
 }
 
 async fn mkdir_p(fs: &Fs, path: &str) -> Result<(), VfsError> {
+    let path = fs.resolve(path);
     let mut current = String::new();
     for part in path.split('/').filter(|part| !part.is_empty()) {
         current.push('/');
         current.push_str(part);
-        match fs.mkdir(&current).await {
-            Ok(()) => {}
-            Err(err) if err.errno() == Errno::EEXIST => {}
-            Err(err) => return Err(err),
-        }
+        ensure_directory(fs, &current).await?;
     }
     Ok(())
 }
@@ -2029,82 +2123,194 @@ async fn destination_for(fs: &Fs, source: &str, dest: &str) -> String {
 }
 
 async fn copy_path(fs: &Fs, source: &str, dest: &str, recursive: bool) -> Result<(), VfsError> {
-    let metadata = fs.stat(source).await?;
-    if metadata.file_type == FileType::Directory {
-        if !recursive {
-            return Err(VfsError::new(Errno::EISDIR));
+    let source = fs.resolve(source);
+    let dest = fs.resolve(dest);
+    let metadata = fs.stat(&source).await?;
+    // Check the effective, normalized target before mkdir/open can mutate it.
+    // The opened-handle VFS interface has no inode identity; backend aliases
+    // such as host-created hard links remain part of the backend contract.
+    if source == dest
+        || (metadata.file_type == FileType::Directory
+            && (source == "/" || dest.starts_with(&format!("{source}/"))))
+    {
+        return Err(VfsError::new(Errno::EINVAL));
+    }
+    if metadata.file_type != FileType::Directory {
+        return copy_file(fs, &source, &dest).await;
+    }
+    if !recursive {
+        return Err(VfsError::new(Errno::EISDIR));
+    }
+    ensure_directory(fs, &dest).await?;
+
+    // Keep one directory iterator per depth rather than recursive futures or
+    // a worklist of the entire tree. Fs enforces the shared path-depth limit.
+    let entries = fs.readdir(&source).await?.into_iter();
+    let mut stack = vec![(source, dest, entries)];
+    while let Some((source, dest, entries)) = stack.last_mut() {
+        fs.checkpoint().await?;
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let child_source = join_path(source, &entry.name);
+        let child_dest = join_path(dest, &entry.name);
+        if entry.metadata.file_type == FileType::Directory {
+            ensure_directory(fs, &child_dest).await?;
+            let entries = fs.readdir(&child_source).await?.into_iter();
+            stack.push((child_source, child_dest, entries));
+        } else {
+            copy_file(fs, &child_source, &child_dest).await?;
         }
-        match fs.mkdir(dest).await {
-            Ok(()) => {}
-            Err(err) if err.errno() == Errno::EEXIST => {}
-            Err(err) => return Err(err),
-        }
-        for entry in fs.readdir(source).await? {
-            let child_source = join_path(source, &entry.name);
-            let child_dest = join_path(dest, &entry.name);
-            Box::pin(copy_path(fs, &child_source, &child_dest, recursive)).await?;
-        }
-    } else {
-        let data = fs.read_file(source).await?;
-        fs.write_file(dest, &data, false).await?;
     }
     Ok(())
 }
 
+async fn ensure_directory(fs: &Fs, path: &str) -> Result<(), VfsError> {
+    match fs.mkdir(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.errno() == Errno::EEXIST => {
+            if fs.stat(path).await?.file_type == FileType::Directory {
+                Ok(())
+            } else {
+                Err(VfsError::new(Errno::ENOTDIR))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn copy_file(fs: &Fs, source: &str, dest: &str) -> Result<(), VfsError> {
+    let source_handle = fs.open(source, OpenMode::read_only()).await?;
+    let dest_handle = match fs
+        .open(dest, OpenMode::write_only().create().truncate())
+        .await
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            let _ = fs.close(source_handle).await;
+            return Err(err);
+        }
+    };
+    let result = async {
+        let mut offset = 0u64;
+        let mut buf = vec![0; STREAM_CHUNK_BYTES];
+        loop {
+            fs.checkpoint().await?;
+            let (bytes, n) = fs.read_at(source_handle, offset, buf).await?;
+            buf = bytes;
+            if n == 0 {
+                return Ok(());
+            }
+            if n > buf.len() {
+                return Err(VfsError::new(Errno::EIO));
+            }
+            let mut written = 0;
+            while written < n {
+                fs.checkpoint().await?;
+                let count = fs
+                    .write_at(
+                        dest_handle,
+                        offset + written as u64,
+                        buf[written..n].to_vec(),
+                    )
+                    .await?;
+                if count == 0 || count > n - written {
+                    return Err(VfsError::new(Errno::EIO));
+                }
+                written += count;
+            }
+            offset = offset
+                .checked_add(n as u64)
+                .ok_or_else(|| VfsError::new(Errno::EFBIG))?;
+        }
+    }
+    .await;
+    let result = result.and(fs.close(source_handle).await);
+    if let Err(err) = result {
+        // A staged destination must not commit a partial object on failure.
+        let _ = fs.abort(dest_handle).await;
+        return Err(err);
+    }
+    fs.close(dest_handle).await
+}
+
 async fn remove_path(fs: &Fs, path: &str, recursive: bool) -> Result<(), VfsError> {
     let metadata = fs.stat(path).await?;
-    if metadata.file_type == FileType::Directory {
-        if !recursive {
-            return Err(VfsError::new(Errno::EISDIR));
-        }
-        for entry in fs.readdir(path).await? {
-            let child = join_path(path, &entry.name);
-            Box::pin(remove_path(fs, &child, recursive)).await?;
-        }
-        fs.rmdir(path).await
-    } else {
-        fs.unlink(path).await
+    if metadata.file_type != FileType::Directory {
+        return fs.unlink(path).await;
     }
-}
-
-async fn collect_input_files(
-    fs: &Fs,
-    paths: &[String],
-    recursive: bool,
-    cmd: &str,
-    stderr: &mut BoxAsyncWrite,
-) -> (Vec<String>, bool) {
-    let mut out = Vec::new();
-    let mut had_error = false;
-    for path in paths {
-        if path == "-" {
-            out.push(path.clone());
+    if !recursive {
+        return Err(VfsError::new(Errno::EISDIR));
+    }
+    let mut stack = vec![(path.to_owned(), fs.readdir(path).await?.into_iter())];
+    while let Some((path, entries)) = stack.last_mut() {
+        fs.checkpoint().await?;
+        let Some(entry) = entries.next() else {
+            let (path, _) = stack.pop().expect("directory frame exists");
+            fs.rmdir(&path).await?;
             continue;
-        }
-        match fs.stat(path).await {
-            Ok(meta) if meta.file_type == FileType::Directory && recursive => {
-                collect_files_recursive(fs, path, &mut out).await;
-            }
-            Ok(_) => out.push(path.clone()),
-            Err(err) => {
-                had_error = true;
-                write_vfs_error(stderr, cmd, path, err).await;
-            }
-        }
-    }
-    (out, had_error)
-}
-
-async fn collect_files_recursive(fs: &Fs, path: &str, out: &mut Vec<String>) {
-    let Ok(entries) = fs.readdir(path).await else {
-        return;
-    };
-    for entry in entries {
+        };
         let child = join_path(path, &entry.name);
         if entry.metadata.file_type == FileType::Directory {
-            Box::pin(collect_files_recursive(fs, &child, out)).await;
+            let entries = fs.readdir(&child).await?.into_iter();
+            stack.push((child, entries));
         } else {
-            out.push(child);
+            fs.unlink(&child).await?;
+        }
+    }
+    Ok(())
+}
+
+// Discover the next file only when grep is ready to consume it. Retaining an
+// eager list of every path made a wide tree an unnecessary working-memory cost.
+struct GrepInputs {
+    roots: std::vec::IntoIter<String>,
+    directories: Vec<(String, std::vec::IntoIter<DirEntry>)>,
+    recursive: bool,
+}
+
+impl GrepInputs {
+    fn new(paths: Vec<String>, recursive: bool) -> Self {
+        Self {
+            roots: paths.into_iter(),
+            directories: Vec::new(),
+            recursive,
+        }
+    }
+
+    async fn next(&mut self, fs: &Fs) -> Option<Result<String, (String, VfsError)>> {
+        loop {
+            let path = if let Some((parent, entries)) = self.directories.last_mut() {
+                match entries.next() {
+                    Some(entry) => join_path(parent, &entry.name),
+                    None => {
+                        self.directories.pop();
+                        continue;
+                    }
+                }
+            } else {
+                self.roots.next()?
+            };
+            if let Err(err) = fs.checkpoint().await {
+                self.roots = Vec::new().into_iter();
+                self.directories.clear();
+                return Some(Err((path, err)));
+            }
+            if path == "-" {
+                return Some(Ok(path));
+            }
+            let metadata = match fs.stat(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) => return Some(Err((path, err))),
+            };
+            if !self.recursive || metadata.file_type != FileType::Directory {
+                return Some(Ok(path));
+            }
+            match fs.readdir(&path).await {
+                Ok(entries) => self.directories.push((path, entries.into_iter())),
+                Err(err) => return Some(Err((path, err))),
+            }
         }
     }
 }
@@ -2117,11 +2323,10 @@ async fn grep_reader(
     flags: GrepFlags,
     show_path: bool,
 ) -> io::Result<bool> {
-    let mut pending = Vec::new();
-    let mut eof = false;
+    let mut pending = LineBuffer::default();
     let mut matched = 0_usize;
     let mut line_no = 0_usize;
-    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+    while let Some(line) = read_line(reader, &mut pending).await? {
         line_no += 1;
         let line = line_text_lossy(&line);
         let is_match = regex.is_match(&line) ^ flags.invert;
@@ -2152,72 +2357,120 @@ async fn grep_reader(
 async fn read_inputs(
     fs: &Fs,
     files: &[String],
-    stdin: &mut Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+    stdin: &mut BoxAsyncRead,
+    limit: usize,
     cmd: &str,
     stderr: &mut BoxAsyncWrite,
 ) -> Result<Vec<u8>, ()> {
     let mut input = Vec::new();
-    if files.is_empty() {
-        stdin.read_to_end(&mut input).await.map_err(|_| ())?;
-        return Ok(input);
-    }
-    for file in files {
-        let data = if file == "-" {
-            let mut data = Vec::new();
-            match stdin.read_to_end(&mut data).await {
-                Ok(_) => Ok(data),
-                Err(_) => Err(VfsError::new(Errno::EINVAL)),
-            }
+    let default_files = ["-".to_owned()];
+    for file in if files.is_empty() {
+        &default_files[..]
+    } else {
+        files
+    } {
+        let result = if file == "-" {
+            read_input_bounded(fs, stdin, &mut input, limit).await
         } else {
-            fs.read_file(file).await
-        };
-        match data {
-            Ok(mut data) => input.append(&mut data),
-            Err(err) => {
-                write_vfs_error(stderr, cmd, file, err).await;
-                return Err(());
+            match fs.stream_reader(file).await {
+                Ok(mut reader) => read_input_bounded(fs, &mut reader, &mut input, limit).await,
+                Err(err) => Err(io::Error::other(err)),
             }
+        };
+        if let Err(err) = result {
+            if err.kind() == io::ErrorKind::InvalidData {
+                let _ = stderr
+                    .write_all(format!("{cmd}: input too large for tinysandbox {cmd}\n").as_bytes())
+                    .await;
+            } else {
+                report_stream_error(stderr, cmd, file, err).await;
+            }
+            return Err(());
         }
     }
     Ok(input)
 }
 
+async fn read_input_bounded(
+    fs: &Fs,
+    reader: &mut BoxAsyncRead,
+    input: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<()> {
+    let mut buf = [0u8; STREAM_CHUNK_BYTES];
+    loop {
+        fs.checkpoint().await.map_err(io::Error::other)?;
+        // Probe one byte past the remaining budget, never materialize a file
+        // before admission, and share the budget across every input source.
+        let want = buf
+            .len()
+            .min(limit.saturating_sub(input.len()).saturating_add(1));
+        let n = reader.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        if n > limit.saturating_sub(input.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "input too large",
+            ));
+        }
+        input.extend_from_slice(&buf[..n]);
+    }
+}
+
+#[derive(Default)]
+struct LineBuffer {
+    bytes: Vec<u8>,
+    start: usize,
+    scanned: usize,
+    eof: bool,
+}
+
 async fn read_line(
     reader: &mut BoxAsyncRead,
-    pending: &mut Vec<u8>,
-    eof: &mut bool,
+    pending: &mut LineBuffer,
 ) -> io::Result<Option<Vec<u8>>> {
     loop {
-        if let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
-            if pos + 1 > MAX_STREAM_LINE_BYTES {
+        if let Some(pos) = pending.bytes[pending.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = pending.scanned + pos + 1;
+            if end - pending.start > MAX_STREAM_LINE_BYTES {
                 return Err(line_too_long_error());
             }
-            return Ok(Some(pending.drain(..=pos).collect()));
+            let line = pending.bytes[pending.start..end].to_vec();
+            pending.start = end;
+            pending.scanned = end;
+            return Ok(Some(line));
         }
-        if pending.len() > MAX_STREAM_LINE_BYTES {
+        pending.scanned = pending.bytes.len();
+        if pending.bytes.len() - pending.start > MAX_STREAM_LINE_BYTES {
             return Err(line_too_long_error());
         }
-        if *eof {
-            if pending.is_empty() {
+        if pending.eof {
+            if pending.start == pending.bytes.len() {
                 return Ok(None);
             }
-            return Ok(Some(std::mem::take(pending)));
+            let line = pending.bytes[pending.start..].to_vec();
+            pending.start = pending.bytes.len();
+            return Ok(Some(line));
         }
 
-        let mut buf = [0_u8; 8192];
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            *eof = true;
-        } else {
-            if let Some(pos) = buf[..n].iter().position(|byte| *byte == b'\n') {
-                if pending.len() + pos + 1 > MAX_STREAM_LINE_BYTES {
-                    return Err(line_too_long_error());
-                }
-            } else if pending.len() + n > MAX_STREAM_LINE_BYTES {
-                return Err(line_too_long_error());
-            }
-            pending.extend_from_slice(&buf[..n]);
+        // Avoid shifting the unread suffix for every short line. A buffer is
+        // compacted only when another read is required; long lines are scanned
+        // incrementally instead of rescanning their entire prefix each time.
+        if pending.start > 0 {
+            pending.bytes.drain(..pending.start);
+            pending.scanned -= pending.start;
+            pending.start = 0;
         }
+        let mut buf = [0_u8; 8192];
+        tokio::task::yield_now().await;
+        let n = reader.read(&mut buf).await?;
+        pending.eof = n == 0;
+        pending.bytes.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -2232,6 +2485,7 @@ async fn counts_reader(reader: &mut BoxAsyncRead) -> io::Result<Counts> {
     let mut in_word = false;
     let mut buf = vec![0; 64 * 1024];
     loop {
+        tokio::task::yield_now().await;
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             return Ok(counts);
@@ -2258,11 +2512,27 @@ async fn sed_reader(
     regex: &Regex,
     sub: &SedSubstitution,
 ) -> io::Result<()> {
-    let mut pending = Vec::new();
-    let mut eof = false;
-    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
-        let out = apply_sed_substitution(&line, regex, sub);
-        stdout.write_all(out.as_bytes()).await?;
+    let mut pending = LineBuffer::default();
+    while let Some(line) = read_line(reader, &mut pending).await? {
+        let text = String::from_utf8_lossy(&line);
+        let (body, ending) = text
+            .strip_suffix('\n')
+            .map_or((text.as_ref(), ""), |body| (body, "\n"));
+        let mut copied = 0;
+        for (index, captures) in regex.captures_iter(body).enumerate() {
+            if index.is_multiple_of(1024) {
+                tokio::task::yield_now().await;
+            }
+            let matched = captures.get(0).expect("whole match exists");
+            write_sed_piece(stdout, &body.as_bytes()[copied..matched.start()]).await?;
+            write_sed_replacement(stdout, &sub.replacement, &captures).await?;
+            copied = matched.end();
+            if !sub.global {
+                break;
+            }
+        }
+        write_sed_piece(stdout, &body.as_bytes()[copied..]).await?;
+        stdout.write_all(ending.as_bytes()).await?;
     }
     Ok(())
 }
@@ -2274,10 +2544,9 @@ async fn uniq_reader(
     repeated: bool,
     unique_only: bool,
 ) -> io::Result<()> {
-    let mut pending = Vec::new();
-    let mut eof = false;
+    let mut pending = LineBuffer::default();
     let mut current: Option<(String, usize)> = None;
-    while let Some(line) = read_line(reader, &mut pending, &mut eof).await? {
+    while let Some(line) = read_line(reader, &mut pending).await? {
         let line = line_text_lossy(&line);
         if let Some((last, n)) = &mut current
             && *last == line
@@ -2317,28 +2586,6 @@ async fn write_uniq_line(
     } else {
         stdout.write_all(format!("{line}\n").as_bytes()).await
     }
-}
-
-fn lines_with_endings(input: &[u8]) -> Vec<Vec<u8>> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for (index, byte) in input.iter().enumerate() {
-        if *byte == b'\n' {
-            lines.push(input[start..=index].to_vec());
-            start = index + 1;
-        }
-    }
-    if start < input.len() {
-        lines.push(input[start..].to_vec());
-    }
-    lines
-}
-
-fn text_lines_lossy(input: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(input)
-        .lines()
-        .map(str::to_owned)
-        .collect()
 }
 
 async fn write_counts(
@@ -2568,57 +2815,60 @@ fn split_sed_parts(input: &str, delimiter: char) -> Option<(String, String, Stri
     Some((parts.remove(0), parts.remove(0), current))
 }
 
-fn apply_sed_substitution(input: &[u8], regex: &Regex, sub: &SedSubstitution) -> String {
-    let mut out = String::new();
-    for line in lines_with_endings(input) {
-        let text = String::from_utf8_lossy(&line);
-        let (body, ending) = text
-            .strip_suffix('\n')
-            .map_or((text.as_ref(), ""), |body| (body, "\n"));
-        if sub.global {
-            let replaced = regex.replace_all(body, |captures: &Captures<'_>| {
-                expand_sed_replacement(&sub.replacement, captures)
-            });
-            out.push_str(&replaced);
-        } else {
-            let replaced = regex.replace(body, |captures: &Captures<'_>| {
-                expand_sed_replacement(&sub.replacement, captures)
-            });
-            out.push_str(&replaced);
-        }
-        out.push_str(ending);
+// Stream replacement segments rather than allocating match_count × replacement
+// bytes (or capture_length × ampersand_count) into one expanded line.
+async fn write_sed_piece(stdout: &mut BoxAsyncWrite, bytes: &[u8]) -> io::Result<()> {
+    for chunk in bytes.chunks(STREAM_CHUNK_BYTES) {
+        tokio::task::yield_now().await;
+        stdout.write_all(chunk).await?;
     }
-    out
+    Ok(())
 }
 
-fn expand_sed_replacement(replacement: &str, captures: &Captures<'_>) -> String {
-    let mut out = String::new();
-    let mut chars = replacement.chars();
-    while let Some(ch) = chars.next() {
+async fn write_sed_replacement(
+    stdout: &mut BoxAsyncWrite,
+    replacement: &str,
+    captures: &Captures<'_>,
+) -> io::Result<()> {
+    let mut rest = replacement;
+    let mut tokens = 0usize;
+    while let Some(index) = rest.find(['&', '\\']) {
+        if tokens.is_multiple_of(1024) {
+            tokio::task::yield_now().await;
+        }
+        tokens += 1;
+        write_sed_piece(stdout, &rest.as_bytes()[..index]).await?;
+        rest = &rest[index..];
+        if rest.starts_with('&') {
+            if let Some(matched) = captures.get(0) {
+                write_sed_piece(stdout, matched.as_str().as_bytes()).await?;
+            }
+            rest = &rest[1..];
+            continue;
+        }
+        rest = &rest[1..];
+        let Some(ch) = rest.chars().next() else {
+            return stdout.write_all(b"\\").await;
+        };
+        rest = &rest[ch.len_utf8()..];
         match ch {
-            '&' => {
-                if let Some(matched) = captures.get(0) {
-                    out.push_str(matched.as_str());
+            'n' => stdout.write_all(b"\n").await?,
+            't' => stdout.write_all(b"\t").await?,
+            digit @ '1'..='9' => {
+                let index = digit.to_digit(10).expect("decimal capture") as usize;
+                if let Some(group) = captures.get(index) {
+                    write_sed_piece(stdout, group.as_str().as_bytes()).await?;
                 }
             }
-            '\\' => match chars.next() {
-                Some('&') => out.push('&'),
-                Some('\\') => out.push('\\'),
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(digit @ '1'..='9') => {
-                    let index = digit.to_digit(10).expect("decimal capture") as usize;
-                    if let Some(group) = captures.get(index) {
-                        out.push_str(group.as_str());
-                    }
-                }
-                Some(other) => out.push(other),
-                None => out.push('\\'),
-            },
-            _ => out.push(ch),
+            ch => {
+                let mut encoded = [0u8; 4];
+                stdout
+                    .write_all(ch.encode_utf8(&mut encoded).as_bytes())
+                    .await?;
+            }
         }
     }
-    out
+    write_sed_piece(stdout, rest.as_bytes()).await
 }
 
 fn validate_sed_replacement(replacement: &str, captures_len: usize) -> Result<(), usize> {
@@ -2690,6 +2940,13 @@ struct SedSubstitution {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct HeadTailSettings {
+    count: TailCount,
+    head_mode: bool,
+    window_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum TailCount {
     Last(usize),
     From(usize),
@@ -2713,6 +2970,57 @@ impl std::ops::AddAssign for Counts {
 #[cfg(test)]
 mod tests {
     use super::basename;
+
+    #[tokio::test]
+    async fn jq_waiting_for_worker_admission_obeys_exec_deadline() {
+        use crate::sandbox::{Limits, Sandbox};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let occupied = Arc::clone(&super::JQ_WORKERS)
+            .acquire_many_owned(super::MAX_JQ_WORKERS as u32)
+            .await
+            .unwrap();
+        let sandbox = Sandbox::builder()
+            .limits(Limits {
+                wall_time: Duration::from_millis(20),
+                ..Limits::default()
+            })
+            .build();
+        let result = sandbox.exec("jq -n '1'").await;
+        assert_eq!(
+            result.exit_code, 124,
+            "a full worker pool must defer evaluation"
+        );
+        drop(occupied);
+        let result = Sandbox::builder().build().exec("jq -n '1'").await;
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.stdout, "1\n");
+
+        // Leave one worker slot for a two-jq pipeline whose output exceeds
+        // both the pipe and message-channel buffers. The downstream reader
+        // must drain input before waiting for its own evaluator slot.
+        let occupied = Arc::clone(&super::JQ_WORKERS)
+            .acquire_many_owned((super::MAX_JQ_WORKERS - 1) as u32)
+            .await
+            .unwrap();
+        let sandbox = Sandbox::builder()
+            .limits(Limits {
+                wall_time: Duration::from_secs(2),
+                ..Limits::default()
+            })
+            .build();
+        let result = sandbox
+            .exec("jq -nc '\"x\" * 1000000' | jq -c . | wc -c")
+            .await;
+        assert_eq!(
+            result.exit_code, 0,
+            "queued jq must drain its input: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout.trim(), "1000003");
+        drop(occupied);
+    }
 
     #[test]
     fn basename_handles_root_and_trailing_slashes() {

@@ -1873,6 +1873,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
     let source = Sandbox::builder()
         .limits(Limits {
             wasm_memory_bytes: INITIAL_BYTES,
+            shell_input_bytes: 2 * INITIAL_BYTES,
             ..Limits::default()
         })
         .build()
@@ -2174,5 +2175,194 @@ async fn js_runs_on_machine_code_built_ahead_of_time() {
     assert_eq!(
         tinysandbox::js::runtime_source().expect("runtime source"),
         tinysandbox::js::RuntimeSource::Precompiled
+    );
+}
+
+#[tokio::test]
+async fn js_output_preserves_bytes_through_pipes_and_redirects() {
+    let vfs = Arc::new(InMemoryVfs::default());
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .limits(Limits {
+            stdout_bytes: 128,
+            stderr_bytes: 128,
+            ..Limits::default()
+        })
+        .build();
+    let piped = sandbox
+        .exec("js -e 'console.log(\"x\".repeat(4096))' | wc -c")
+        .await;
+    assert_eq!(piped.exit_code, 0, "{}", piped.stderr);
+    assert_eq!(piped.stdout.trim(), "4097");
+    let redirected = sandbox.exec("js -e 'console.log(\"x\".repeat(4096)); console.error(\"y\".repeat(4096))' > /workspace/out 2> /workspace/err").await;
+    assert_eq!(redirected.exit_code, 0, "{}", redirected.stderr);
+    for (path, byte) in [("/out", b'x'), ("/err", b'y')] {
+        let data = read_vfs_file(vfs.as_ref(), path);
+        assert_eq!(data.len(), 4097);
+        assert!(data[..4096].iter().all(|value| *value == byte));
+        assert_eq!(data[4096], b'\n');
+    }
+}
+
+#[tokio::test]
+async fn js_output_stops_when_the_downstream_reader_exits() {
+    tinysandbox::js::runtime_source().expect("warm runtime");
+    let sandbox = Sandbox::builder()
+        .limits(Limits {
+            wall_time: Duration::from_secs(3),
+            ..Limits::default()
+        })
+        .build();
+    let started = Instant::now();
+    let result = sandbox
+        .exec("js -e 'while (true) console.log(\"x\".repeat(4096))' | head -n 1")
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    assert_eq!(result.stdout, format!("{}\n", "x".repeat(4096)));
+    assert!(result.stderr.is_empty(), "{}", result.stderr);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "producer waited for its wall deadline"
+    );
+}
+
+#[tokio::test]
+async fn js_open_descriptors_keep_identity_after_path_reuse() {
+    for replace in [
+        "fs.renameSync('/workspace/f', '/workspace/g')",
+        "fs.unlinkSync('/workspace/f')",
+    ] {
+        let sandbox = Sandbox::builder().build();
+        let script = format!(
+            r#"
+const fs = require('fs');
+fs.writeFileSync('/workspace/f', 'abcdef');
+const fd = fs.openSync('/workspace/f', 'r');
+{replace};
+fs.writeFileSync('/workspace/f', '');
+const buffer = Buffer.alloc(10);
+const n = fs.readSync(fd, buffer, 0, buffer.length, null);
+console.log(n, buffer.toString('utf8').slice(0, n));
+fs.closeSync(fd);
+"#
+        );
+        let result = sandbox
+            .exec(&format!("js -e '{}'", shell_single_quote(&script)))
+            .await;
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.stdout, "6 abcdef\n");
+    }
+}
+
+#[tokio::test]
+async fn js_releases_unclosed_files_on_success_errors_and_timeout() {
+    tinysandbox::js::runtime_source().expect("warm runtime");
+    for (ending, expected) in [
+        ("", 0),
+        ("throw new Error('stop')", 1),
+        ("process.exit(7)", 7),
+        ("while (true) {}", 124),
+    ] {
+        let vfs = Arc::new(InMemoryVfs::new(VfsQuota {
+            max_bytes: 4,
+            ..VfsQuota::unlimited()
+        }));
+        write_vfs_file(vfs.as_ref(), "/file", b"data");
+        let sandbox = Sandbox::builder()
+            .mount_arc("workspace", vfs.clone())
+            .limits(Limits {
+                wall_time: Duration::from_millis(300),
+                ..Limits::default()
+            })
+            .build();
+        let script = format!(
+            "const fs = require('fs'); fs.openSync('/workspace/file', 'r'); fs.unlinkSync('/workspace/file'); {ending}"
+        );
+        let result = sandbox
+            .exec(&format!("js -e '{}'", shell_single_quote(&script)))
+            .await;
+        assert_eq!(result.exit_code, expected, "{ending}: {}", result.stderr);
+        let started = Instant::now();
+        while vfs.stats().unwrap().used_bytes != 0 && started.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            vfs.stats().unwrap().used_bytes,
+            0,
+            "{ending} leaked an unlinked open file"
+        );
+        write_vfs_file(vfs.as_ref(), "/replacement", b"full");
+    }
+}
+
+#[tokio::test]
+async fn js_host_file_reads_and_open_files_have_explicit_budgets() {
+    let vfs = Arc::new(InMemoryVfs::default());
+    write_vfs_file(vfs.as_ref(), "/exact", &[b'x'; 512]);
+    write_vfs_file(vfs.as_ref(), "/over", &[b'x'; 513]);
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs)
+        .limits(Limits {
+            host_input_bytes: 512,
+            max_open_files: 2,
+            ..Limits::default()
+        })
+        .build();
+    let reads = sandbox.exec(r#"js -e 'const fs = require("fs"); console.log(fs.readFileSync("/workspace/exact").length); try { fs.readFileSync("/workspace/over") } catch (e) { console.log(e.code) }'"#).await;
+    assert_eq!(reads.exit_code, 0, "{}", reads.stderr);
+    assert_eq!(reads.stdout, "512\nEFBIG\n");
+    let source = sandbox.exec("js /workspace/over").await;
+    assert_eq!(source.exit_code, 1);
+    assert!(
+        source.stderr.contains("file too large"),
+        "{}",
+        source.stderr
+    );
+    let fds = sandbox.exec(r#"js -e 'const fs = require("fs"); const a = fs.openSync("/workspace/exact", "r"); fs.openSync("/workspace/exact", "r"); try { fs.openSync("/workspace/exact", "r") } catch (e) { console.log(e.code) } fs.closeSync(a); console.log(fs.openSync("/workspace/exact", "r") > a)'"#).await;
+    assert_eq!(fds.exit_code, 0, "{}", fds.stderr);
+    assert_eq!(fds.stdout, "ENOSPC\ntrue\n");
+}
+
+#[tokio::test]
+async fn js_does_not_start_a_filesystem_mutation_after_the_exec_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tinysandbox::sandbox::CommandResult;
+    tinysandbox::js::runtime_source().expect("warm runtime");
+    let entered = Arc::new(AtomicBool::new(false));
+    let vfs = Arc::new(InMemoryVfs::default());
+    let sandbox = Sandbox::builder()
+        .mount_arc("workspace", vfs.clone())
+        .limits(Limits {
+            wall_time: Duration::from_millis(300),
+            ..Limits::default()
+        })
+        .command("pause", |_| async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            CommandResult::success()
+        })
+        .js_global("slow", {
+            let entered = entered.clone();
+            move |_| {
+                let entered = entered.clone();
+                async move {
+                    entered.store(true, Ordering::SeqCst);
+                    // Deliberately non-cooperative embedder code. Its future
+                    // cannot be interrupted mid-poll, but it must never grant
+                    // the guest a fresh wall budget after returning.
+                    std::thread::sleep(Duration::from_millis(250));
+                    Ok(Value::Null)
+                }
+            }
+        })
+        .build();
+    let result = sandbox
+        .exec("pause; js -e 'slow(); require(\"fs\").writeFileSync(\"/workspace/late\", \"bad\")'")
+        .await;
+    assert_eq!(result.exit_code, 124, "{}", result.stderr);
+    assert!(entered.load(Ordering::SeqCst), "host callback did not run");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        vfs.stat("/late").is_err(),
+        "timed-out JS wrote after exec returned"
     );
 }

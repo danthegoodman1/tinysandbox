@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import { createEngine, VfsError } from "../dist/index.js";
@@ -52,6 +55,7 @@ test("guest fs preserves binary, positional fd, directory, and errno behavior", 
   });
   const result = engine.runCode(`
 const fs = require('fs')
+fs.statSync('/data/utf8')
 console.log(fs.readFileSync('/data/utf8', 'utf8'))
 console.log(Array.from(fs.readFileSync('/data/binary')).join(','))
 const fd = fs.openSync('/data/io', 'r+')
@@ -170,4 +174,96 @@ test("VFS failures use stable errno mapping and rejecting async implementations 
   const asyncResult = engine.runCode("const fs=require('fs'); try { fs.statSync('/x') } catch (e) { console.log(e.code, e.errno) }", { vfs: asynchronous });
   assert.equal(asyncResult.stdout, "EIO -5\n");
   await new Promise(resolve => setImmediate(resolve));
+});
+
+
+test("open descriptor identity after rename and unlink matches real Node", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "tinysandbox-fd-"));
+  try {
+    for (const replacement of ["fs.renameSync('f', 'g')", "fs.unlinkSync('f')"]) {
+      const code = `
+const fs = require('fs');
+fs.writeFileSync('f', 'abcdef');
+const fd = fs.openSync('f', 'r');
+${replacement};
+fs.writeFileSync('f', '');
+const buffer = Buffer.alloc(10);
+const count = fs.readSync(fd, buffer, 0, 10, null);
+console.log(count, buffer.toString().slice(0, count));
+fs.closeSync(fd);
+`;
+      const oracle = spawnSync(process.execPath, ["-e", code], { cwd: directory, encoding: "utf8" });
+      assert.equal(oracle.status, 0, oracle.stderr);
+      assert.equal(oracle.stdout, "6 abcdef\n");
+      const vfs = new TestVfs();
+      const result = engine.runCode(code, { vfs });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(result.stdout, oracle.stdout);
+      assert.equal(vfs.handles.size, 0);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("teardown finishes success and aborts failed or timed out staged handles", () => {
+  for (const [ending, expected] of [["", 0], ["process.exit(7)", 7], ["throw new Error('stop')", 1], ["while (true) {}", 124]]) {
+    const vfs = new TestVfs({ "/file": "data" });
+    let finished = 0, aborted = 0;
+    const close = vfs.close.bind(vfs);
+    vfs.close = handle => { finished++; close(handle); };
+    vfs.abort = handle => { aborted++; close(handle); };
+    const result = engine.runCode(`require('fs').openSync('/file', 'r'); ${ending}`, { vfs, timeoutMs: 100 });
+    assert.equal(result.exitCode, expected, result.stderr);
+    assert.equal(vfs.handles.size, 0);
+    assert.equal(finished, expected === 0 ? 1 : 0);
+    assert.equal(aborted, expected === 0 ? 0 : 1);
+  }
+});
+
+test("teardown reports close failures and still releases every descriptor", () => {
+  const vfs = new TestVfs({ "/file": "data" });
+  const close = vfs.close.bind(vfs);
+  vfs.close = handle => { close(handle); throw new VfsError("EIO"); };
+  const result = engine.runCode("const fs = require('fs'); fs.openSync('/file', 'r'); fs.openSync('/file', 'r')", { vfs });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /i\/o error/);
+  assert.equal(vfs.handles.size, 0);
+});
+
+test("whole-file reads, descriptor reads and opens enforce explicit host budgets", () => {
+  const vfs = new TestVfs({ "/exact": "x".repeat(512), "/over": "x".repeat(513) });
+  const result = engine.runCode(`
+const fs = require('fs');
+console.log(fs.readFileSync('/exact').length);
+try { fs.readFileSync('/over') } catch (e) { console.log(e.code); }
+const a = fs.openSync('/exact', 'r');
+fs.openSync('/exact', 'r');
+try { fs.openSync('/exact', 'r') } catch (e) { console.log(e.code); }
+const buffer = Buffer.alloc(4096);
+console.log(fs.readSync(a, buffer, 0, 4096, 0));
+`, { vfs, hostInputBytes: 512, maxOpenFiles: 2 });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "512\nEFBIG\nENOSPC\n512\n");
+  assert.ok(vfs.calls.filter(call => call.method === "readAt").every(call => call.args[2] <= 513));
+  assert.equal(vfs.handles.size, 0);
+});
+
+test("a slow host callback cannot authorize a filesystem mutation after deadline", () => {
+  const vfs = new TestVfs();
+  const result = engine.runCode("slow(); require('fs').writeFileSync('/late', 'bad')", {
+    vfs, timeoutMs: 30,
+    globals: { slow: () => { const end = performance.now() + 50; while (performance.now() < end) {} return null; } },
+  });
+  assert.equal(result.exitCode, 124, result.stderr);
+  assert.ok(!vfs.nodes.has('/late'));
+  assert.equal(vfs.handles.size, 0);
+});
+
+test("runFile deadline includes source loading", () => {
+  const vfs = new TestVfs({ "/script.js": "require('fs').writeFileSync('/late', 'bad')" });
+  const read = vfs.readAt.bind(vfs);
+  vfs.readAt = (...args) => { const end = performance.now() + 40; while (performance.now() < end) {} return read(...args); };
+  const result = engine.runFile('/script.js', { vfs, timeoutMs: 20 });
+  assert.equal(result.exitCode, 124, result.stderr);
+  assert.ok(!vfs.nodes.has('/late'));
+  assert.equal(vfs.handles.size, 0);
 });

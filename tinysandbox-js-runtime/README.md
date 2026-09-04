@@ -115,7 +115,11 @@ paths resolve from `cwd`.
 
 The exported `Vfs` interface is deliberately small and synchronous: `stat`,
 `readdir`, `mkdir`, `rename`, `unlink`, `rmdir`, `open`, `readAt`, `writeAt`,
-`truncate`, and `close`. Paths delivered to it are normalized absolute paths;
+`truncate`, and `close`, plus optional `abort` for discarding staged writes.
+Successful runs close any remaining descriptors; failed or timed-out runs call
+`abort` when supplied, otherwise `close`. Handles must continue to refer to the
+same file after its original path is renamed, unlinked, or reused.
+Paths delivered to it are normalized absolute paths;
 handles and offsets are non-negative safe integers, and positional operations
 do not change the guest fd cursor. Implementations report one of the exported
 `VfsErrno` strings by throwing `new VfsError(code)`. Quotas and storage
@@ -130,3 +134,23 @@ package also does not provide network access, timers, guest ESM, TypeScript
 transpilation, Asyncify/JSPI, or persistent isolates. The compatibility glue's
 `fetch` never reaches ambient V8 networking and fails with unavailable-host
 capability behavior.
+
+
+## Host resource budgets
+
+`hostInputBytes` bounds whole-file reads and decoded guest writes (default
+8 MiB). `hostResponseBytes` bounds serialized host responses (default 1 MiB),
+including JSON framing and base64 expansion. Oversized reads fail before their
+entire contents are copied into the host or encoded. `maxOpenFiles` bounds guest
+descriptors (default 1,024). Positional reads can return fewer bytes than
+requested to stay within the response budget. Paths and recursive traversal
+are limited to 256 components.
+
+The monotonic `timeoutMs` budget covers source loading in `runFile`, guest
+execution, and synchronous host calls. A host callback already executing cannot
+be interrupted mid-call; further guest filesystem operations are rejected after
+it returns if the deadline has expired.
+
+The package build type-checks the implementation with strict TypeScript and
+emits JavaScript and declarations together. Run `npm test` for the shared guest
+corpus, independent Node filesystem comparisons, and resource-limit regressions.

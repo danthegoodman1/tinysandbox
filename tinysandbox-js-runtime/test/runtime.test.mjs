@@ -153,3 +153,17 @@ test("enforces wasm maximum, QuickJS heap, and monotonic deadline", async () => 
   assert.equal(timeout.stderr, "js: command timed out\n");
   assert.ok(performance.now() - started < 1_000);
 });
+
+
+test("bounded JSON retains exact UTF-8 and escape semantics", async () => {
+  const engine = await createEngine(bytes);
+  for (const value of ["a".repeat(100), "λ🙂".repeat(30), "\u0000\b\t\n\f\r\\\"".repeat(20), "\ud800".repeat(20), { "λ🙂": [false, 1.5, null, "hello"] }]) {
+    const cap = new TextEncoder().encode(JSON.stringify({ value })).byteLength;
+    const exact = engine.runCode("console.log(JSON.stringify(value()))", { globals: { value: () => value }, hostResponseBytes: cap });
+    assert.equal(exact.exitCode, 0, exact.stderr);
+    assert.equal(exact.stdout, `${JSON.stringify(value)}\n`);
+    const over = engine.runCode("try { value() } catch (e) { console.log(e.code) }", { globals: { value: () => value }, hostResponseBytes: cap - 1 });
+    if (cap >= 100) assert.equal(over.stdout, "E2BIG\n");
+    else assert.equal(over.exitCode, 1);
+  }
+});

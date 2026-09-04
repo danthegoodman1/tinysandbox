@@ -533,3 +533,40 @@ function waitForChild(child, timeoutMs) {
 function singleQuote(value) {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
+
+test('host callbacks have bounded buffered input and output', async () => {
+  let calls = 0
+  const sandbox = new Sandbox({
+    limits: { hostInputBytes: 4 },
+    commands: {
+      inspect: () => { calls++; return { stdout: 'ok' } },
+      large: () => ({ stdout: '12345' })
+    }
+  })
+  const oversized = await sandbox.exec('echo 12345 | inspect')
+  assert.notEqual(oversized.exitCode, 0)
+  assert.match(oversized.stderr, /input limit/)
+  assert.equal(calls, 0)
+  assert.equal((await sandbox.exec('echo 123 | inspect')).stdout, 'ok')
+  assert.equal(calls, 1)
+  assert.match((await sandbox.exec('large')).stderr, /output limit/)
+})
+
+test('disabled commands are absent from execution and bin', async () => {
+  const sandbox = new Sandbox({ disabledCommands: ['jq', 'cd'] })
+  assert.equal((await sandbox.exec("jq -n '1'")).exitCode, 127)
+  assert.equal((await sandbox.exec('cd /')).exitCode, 127)
+  assert.doesNotMatch((await sandbox.exec('ls /bin')).stdout, /\bjq\b|\bcd\b/)
+})
+
+test('host descriptors survive distinct fs facade calls and large reads fail before allocation', async () => {
+  const sandbox = new Sandbox()
+  await sandbox.fs.writeFile('/workspace/f', Buffer.from('abcdef'))
+  const fd = await sandbox.fs.open('/workspace/f', { read: true })
+  await sandbox.fs.rename('/workspace/f', '/workspace/g')
+  await sandbox.fs.writeFile('/workspace/f', Buffer.alloc(0))
+  assert.equal((await sandbox.fs.readAt(fd, 0, 6)).toString(), 'abcdef')
+  await assert.rejects(() => sandbox.fs.readAt(fd, 0, 1024 ** 3), { code: 'EFBIG' })
+  await sandbox.fs.close(fd)
+  assert.throws(() => new Sandbox({ limits: { wallTimeMs: Number.MAX_VALUE } }), /wallTimeMs/)
+})

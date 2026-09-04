@@ -55,6 +55,8 @@ export interface SandboxOptions {
   cwd?: string
   persistSession?: boolean
   commands?: Record<string, JsCommand>
+  /** Commands removed after registration; e.g. ["jq"] to exclude native filter evaluation. */
+  disabledCommands?: Array<string>
   /**
    * Host functions bound into the sandboxed JavaScript global scope. Each key
    * is a dotted path: `search` becomes `globalThis.search`, `tools.search`
@@ -163,6 +165,16 @@ export interface LimitsOptions {
   stdoutBytes?: number
   stderrBytes?: number
   maxCommands?: number
+  /** Maximum source bytes admitted before shell parsing (default 1 MiB). */
+  shellInputBytes?: number
+  /** Maximum bytes materialized by whole-file and host command input/output operations (default 8 MiB). */
+  hostInputBytes?: number
+  /** Maximum simultaneously open files per exec (default 1024). */
+  maxOpenFiles?: number
+  /** Maximum normalized path depth (default and hard ceiling 256). */
+  maxPathDepth?: number
+  /** Maximum bytes retained by tail (default 8 MiB). */
+  tailInputBytes?: number
   sortInputBytes?: number
   /** Maximum total bytes accepted by jq across stdin and file operands. */
   jqInputBytes?: number
@@ -170,6 +182,8 @@ export interface LimitsOptions {
   fetchResponseBytes?: number
 }
 
+/** Trusted host callback; buffered input and output are capped by hostInputBytes.
+ * Already-running callbacks may outlive an exec timeout. */
 export type JsCommand = (call: CommandCall) => Promise<CommandOutput> | CommandOutput
 
 export interface CommandCall {
@@ -313,10 +327,12 @@ export declare const prompts: {
 export declare function precompileJs(): Buffer
 
 /**
- * Installs a `precompileJs` artifact as this process's JavaScript runtime, in
+ * Installs a trusted `precompileJs` artifact as this process's JavaScript runtime, in
  * place of the embedded one. Call it before the first `js` command; a second
  * call, or a stale or foreign artifact, throws and leaves the embedded runtime
- * in place.
+ * in place. The caller must guarantee authenticity and matching build/target.
+ * Untrusted artifact bytes can execute arbitrary native code; format checks
+ * are not a security boundary.
  */
 export declare function usePrecompiledJs(artifact: Buffer | Uint8Array): void
 

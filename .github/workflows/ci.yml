@@ -30,8 +30,12 @@ jobs:
           node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"
       - run: cargo fmt --all --check
       - run: cargo test --workspace --all-features --locked
-      - run: cargo build --workspace --no-default-features --locked
-      - run: cargo test --workspace --no-default-features --locked
+      # Select the core package alone: the Node workspace member enables JS
+      # and S3 on its dependency even with workspace --no-default-features.
+      - name: Test core without optional features, including doctests
+        run: cargo test -p tinysandbox --no-default-features --locked
+      - name: Test core with default features, including doctests
+        run: cargo test -p tinysandbox --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
       - run: cargo publish --dry-run --locked -p tinysandbox
@@ -151,6 +155,8 @@ jobs:
         run: npm install -g npm@11.12.1
       - run: npm ci
         working-directory: tinysandbox-node
+      - name: Test local filesystem containment and conformance on macOS
+        run: cargo test -p tinysandbox --no-default-features --locked --test vfs_local --test vfs_conformance
       - run: npm test
         working-directory: tinysandbox-node
       - run: npm run examples

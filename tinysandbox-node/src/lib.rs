@@ -67,10 +67,14 @@ pub fn precompile_js() -> Result<Buffer> {
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
 }
 
-/// Installs a `precompileJs` artifact as this process's JavaScript runtime.
+/// Installs a trusted `precompileJs` artifact as this process's JavaScript runtime.
+/// The caller must guarantee authenticity and matching build/target; accepting
+/// untrusted bytes here permits arbitrary native code execution.
 #[napi]
 pub fn use_precompiled_js(artifact: Buffer) -> Result<()> {
-    tinysandbox::js::use_precompiled(&artifact)
+    // SAFETY: this host-only API explicitly requires an authentic, compatible
+    // artifact from precompileJs; callers must never supply guest/untrusted bytes.
+    unsafe { tinysandbox::js::use_precompiled(&artifact) }
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
 }
 
@@ -220,6 +224,11 @@ impl Sandbox {
                             callback: Arc::new(callback),
                         },
                     );
+                }
+            }
+            if let Some(disabled) = get_optional::<Vec<String>>(&options, "disabledCommands")? {
+                for name in disabled {
+                    builder = builder.without_command(&name);
                 }
             }
         }
@@ -467,6 +476,9 @@ impl SandboxFs {
         let offset = u64_from_js(offset).map_err(|err| napi_vfs_error(err, None))?;
         let len = usize_from_js(len).map_err(|err| napi_vfs_error(err, None))?;
         let fs = self.sandbox.fs();
+        if len > fs.max_io_bytes() {
+            return Err(napi_vfs_error(VfsError::new(Errno::EFBIG), None));
+        }
         fs.read_at(handle, offset, vec![0; len])
             .await
             .map(|(mut data, read)| {
@@ -481,6 +493,9 @@ impl SandboxFs {
         let handle = handle_from_js(handle).map_err(|err| napi_vfs_error(err, None))?;
         let offset = u64_from_js(offset).map_err(|err| napi_vfs_error(err, None))?;
         let fs = self.sandbox.fs();
+        if data.len() > fs.max_io_bytes() {
+            return Err(napi_vfs_error(VfsError::new(Errno::EFBIG), None));
+        }
         fs.write_at(handle, offset, data.to_vec())
             .await
             .map(|written| written as f64)
@@ -517,10 +532,21 @@ impl Command for JsCommand {
         let callback = Arc::clone(&self.callback);
         Box::pin(async move {
             let mut stdin = Vec::new();
-            if ctx.stdin.read_to_end(&mut stdin).await.is_err() {
+            let limit = ctx.limits.host_input_bytes;
+            if ctx
+                .stdin
+                .take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut stdin)
+                .await
+                .is_err()
+            {
                 return CommandResult::failure();
             }
 
+            if stdin.len() > limit {
+                return write_command_error(ctx.stderr, "host command input limit exceeded".into())
+                    .await;
+            }
             let call = CommandCall {
                 args: ctx.args,
                 env: ctx.env.into_iter().collect(),
@@ -536,6 +562,21 @@ impl Command for JsCommand {
                 Err(err) => return write_command_error(ctx.stderr, err.reason).await,
             };
 
+            if output
+                .stdout
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > limit)
+                || output
+                    .stderr
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() > limit)
+            {
+                return write_command_error(
+                    ctx.stderr,
+                    "host command output limit exceeded".into(),
+                )
+                .await;
+            }
             if let Some(stdout) = output.stdout
                 && ctx.stdout.write_all(&stdout).await.is_err()
             {
@@ -1294,7 +1335,8 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
                 "wallTimeMs must be a finite non-negative number".to_owned(),
             ));
         }
-        parsed.wall_time = Duration::from_secs_f64(ms / 1000.0);
+        parsed.wall_time = Duration::try_from_secs_f64(ms / 1000.0)
+            .map_err(|_| Error::new(Status::InvalidArg, "wallTimeMs is out of range"))?;
     }
     if let Some(bytes) = get_optional::<f64>(&limits, "stdoutBytes")? {
         parsed.stdout_bytes = usize_from_number(bytes)?;
@@ -1304,6 +1346,21 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
     }
     if let Some(commands) = get_optional::<f64>(&limits, "maxCommands")? {
         parsed.max_commands = usize_from_number(commands)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "shellInputBytes")? {
+        parsed.shell_input_bytes = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "hostInputBytes")? {
+        parsed.host_input_bytes = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "maxOpenFiles")? {
+        parsed.max_open_files = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "maxPathDepth")? {
+        parsed.max_path_depth = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "tailInputBytes")? {
+        parsed.tail_input_bytes = usize_from_number(value)?;
     }
     if let Some(bytes) = get_optional::<f64>(&limits, "sortInputBytes")? {
         parsed.sort_input_bytes = usize_from_number(bytes)?;

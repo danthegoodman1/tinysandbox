@@ -180,7 +180,11 @@ export interface SandboxStats {
   vfs?: VfsStatsJs
 }
 
-/** Installs a `precompileJs` artifact as this process's JavaScript runtime. */
+/**
+ * Installs a trusted `precompileJs` artifact as this process's JavaScript runtime.
+ * The caller must guarantee authenticity and matching build/target; accepting
+ * untrusted bytes here permits arbitrary native code execution.
+ */
 export declare function usePrecompiledJs(artifact: Buffer): void
 
 export interface VfsCallbackError {

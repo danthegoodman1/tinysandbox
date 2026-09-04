@@ -4,11 +4,6 @@ export type HostGlobal = (argument: JsonValue) => JsonValue;
 
 export type VfsErrno = "EBADF" | "EBUSY" | "EXDEV" | "EACCES" | "EEXIST" | "EFBIG" | "EIO" | "EINVAL" | "EISDIR" | "ENOENT" | "ENOSPC" | "ENOTDIR" | "ENOTEMPTY";
 
-export declare class VfsError extends Error {
-  readonly code: VfsErrno;
-  constructor(code: VfsErrno, message?: string);
-}
-
 export interface VfsMetadata {
   fileType: "file" | "directory";
   len: number;
@@ -41,6 +36,8 @@ export interface Vfs {
   writeAt(handle: number, offset: number, data: Uint8Array): number;
   truncate(handle: number, len: number): void;
   close(handle: number): void;
+  /** Discard staged writes on failure; falls back to close when omitted. */
+  abort?(handle: number): void;
 }
 
 export interface RunCodeOptions {
@@ -51,6 +48,8 @@ export interface RunCodeOptions {
   timeoutMs?: number;
   sourceBytes?: number;
   hostResponseBytes?: number;
+  hostInputBytes?: number;
+  maxOpenFiles?: number;
   stdoutBytes?: number;
   stderrBytes?: number;
   scriptPath?: string;
@@ -76,5 +75,3 @@ export interface JsEngine {
   runFile(path: string, options: RunFileOptions): RunResult;
 }
 
-export declare const QUICKJS_INITIAL_MEMORY_BYTES: number;
-export declare function createEngine(wasm: BufferSource | WebAssembly.Module): Promise<JsEngine>;

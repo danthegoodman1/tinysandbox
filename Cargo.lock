@@ -2722,6 +2722,7 @@ dependencies = [
  "libc",
  "proptest",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

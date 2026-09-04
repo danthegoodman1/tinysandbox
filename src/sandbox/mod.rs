@@ -21,23 +21,27 @@
 
 mod builtins;
 pub mod command;
+mod control;
 pub mod fs;
 #[cfg(feature = "js")]
 pub mod host;
 mod jq;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::{self, Cursor};
 use std::pin::Pin;
+#[cfg(feature = "js")]
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
+use control::{ExecutionControl, ExecutionGuard};
 use fs::{Fs, STREAM_CHUNK_BYTES, errno_message, normalize_absolute};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::{task, time};
 
 use crate::shell::{
@@ -112,6 +116,7 @@ pub struct SandboxStats {
 
 /// In-process shell sandbox backed by a virtual filesystem.
 pub struct Sandbox {
+    host_fs: Fs,
     vfs: Arc<dyn Vfs>,
     commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
     command_names: Arc<BTreeSet<String>>,
@@ -157,11 +162,7 @@ impl Sandbox {
     /// Returns an async filesystem facade rooted at the sandbox's base cwd.
     pub fn fs(&self) -> Fs {
         let session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
-        Fs::new(
-            Arc::clone(&self.vfs),
-            Arc::clone(&self.command_names),
-            session.cwd.clone(),
-        )
+        self.host_fs.with_cwd(session.cwd.clone())
     }
 
     /// Binds a host function at a dotted global path, replacing any global
@@ -274,8 +275,10 @@ impl Sandbox {
     /// The wall-clock timeout is exec-wide. When it fires, partial stdout,
     /// stderr, metrics, and session mutations are discarded and the result
     /// exits 124. Blocking host calls already running on worker threads are not
-    /// cancelled by that timeout, so VFS implementations should keep individual
-    /// operations bounded.
+    /// preempted by that timeout. Their admission slots remain held until they
+    /// finish; new filesystem calls are rejected and remaining handles are
+    /// aborted. Slow cleanup can outlive the result. VFS implementations and
+    /// trusted callbacks must keep individual operations bounded.
     ///
     /// By default, each exec starts from the sandbox's base session: the
     /// builder-configured cwd and environment (defaults: `/workspace`,
@@ -289,29 +292,38 @@ impl Sandbox {
     /// multiple execs overlap, the last completed exec wins for session state.
     pub async fn exec(&self, input: &str) -> ExecResult {
         let started = Instant::now();
-        let future = self.exec_inner(input);
-        match time::timeout(self.limits.wall_time, future).await {
-            Ok(mut result) => {
+        let control = ExecutionControl::new(self.limits);
+        let _guard = ExecutionGuard(Arc::clone(&control));
+        let future = self.exec_inner(input, Arc::clone(&control));
+        match time::timeout(control.remaining(), future).await {
+            Ok(mut result) if !control.is_cancelled() => {
                 result.metrics.wall_time = started.elapsed();
                 result
             }
-            Err(_) => ExecResult {
-                stdout: String::new(),
-                stderr: "tinysandbox: command timed out\n".to_owned(),
-                exit_code: 124,
-                metrics: ExecMetrics {
-                    wall_time: started.elapsed(),
-                    commands: Vec::new(),
-                    pipe_bytes: Vec::new(),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                    peak_wasm_memory_bytes: None,
-                },
-            },
+            _ => {
+                control.cancel();
+                ExecResult {
+                    stdout: String::new(),
+                    stderr: "tinysandbox: command timed out\n".to_owned(),
+                    exit_code: 124,
+                    metrics: ExecMetrics {
+                        wall_time: started.elapsed(),
+                        ..ExecMetrics::empty()
+                    },
+                }
+            }
         }
     }
 
-    async fn exec_inner(&self, input: &str) -> ExecResult {
+    async fn exec_inner(&self, input: &str, control: Arc<ExecutionControl>) -> ExecResult {
+        if input.len() > self.limits.shell_input_bytes {
+            return ExecResult {
+                stdout: String::new(),
+                stderr: "tinysandbox: shell input limit exceeded\n".into(),
+                exit_code: 125,
+                metrics: ExecMetrics::empty(),
+            };
+        }
         let program = match shell::parse(input) {
             Ok(program) => program,
             Err(err) => {
@@ -325,8 +337,12 @@ impl Sandbox {
         };
 
         let mut session = self.session_snapshot();
-        let mut exec = ExecState::new(session.last_status, self.limits);
+        let mut exec = ExecState::new(session.last_status, self.limits, control);
         for list in &program.lists {
+            task::yield_now().await;
+            if exec.control.is_cancelled() {
+                break;
+            }
             exec.last_status = self.exec_and_or_list(list, &mut session, &mut exec).await;
             if exec.limit_hit {
                 break;
@@ -334,7 +350,7 @@ impl Sandbox {
         }
 
         session.last_status = exec.last_status;
-        if self.persist_session {
+        if self.persist_session && !exec.control.is_cancelled() {
             self.store_session(session);
         }
         self.commands_run.fetch_add(
@@ -366,6 +382,7 @@ impl Sandbox {
         exec: &mut ExecState,
     ) -> i32 {
         let mut status = self.exec_pipeline(&list.first, session, exec).await;
+        exec.last_status = status;
         for item in &list.rest {
             let should_run = match item.op {
                 AndOrOp::And => status == 0,
@@ -373,6 +390,7 @@ impl Sandbox {
             };
             if should_run {
                 status = self.exec_pipeline(&item.pipeline, session, exec).await;
+                exec.last_status = status;
             }
             if exec.limit_hit {
                 break;
@@ -387,12 +405,40 @@ impl Sandbox {
         session: &mut Session,
         exec: &mut ExecState,
     ) -> i32 {
+        task::yield_now().await;
+        if exec.control.is_cancelled() {
+            return 124;
+        }
         let remaining = self.limits.max_commands.saturating_sub(exec.command_count);
-        let command_cost = pipeline_command_cost(pipeline, session, exec.last_status);
+        let command_cost = pipeline.commands.len();
         if command_cost > remaining {
             exec.write_stderr(b"tinysandbox: maximum command count exceeded\n");
             exec.limit_hit = true;
             return 125;
+        }
+
+        // Admit the entire pipeline before allocating expanded argv, opening
+        // redirects, or creating pipes. Include field-vector storage as well as
+        // payload bytes so whitespace expansion cannot bypass the budget.
+        let mut expansion_remaining = self
+            .limits
+            .shell_input_bytes
+            .max(self.limits.host_input_bytes);
+        for command in &pipeline.commands {
+            task::yield_now().await;
+            if exec.control.is_cancelled() {
+                return 124;
+            }
+            let AstCommand::Simple(simple) = command;
+            if let Some(cost) =
+                expansion_cost(simple, &session.env, exec.last_status, expansion_remaining)
+            {
+                expansion_remaining -= cost;
+            } else {
+                exec.write_stderr(b"tinysandbox: shell expansion limit exceeded\n");
+                exec.limit_hit = true;
+                return 125;
+            }
         }
 
         if pipeline.commands.len() == 1 {
@@ -402,10 +448,14 @@ impl Sandbox {
 
         let mut stages = Vec::new();
         for command in &pipeline.commands {
+            task::yield_now().await;
+            if exec.control.is_cancelled() {
+                return 124;
+            }
             let AstCommand::Simple(simple) = command;
             stages.push(self.prepare_stage(simple, session, exec).await);
         }
-        exec.command_count += stages.iter().filter(|stage| stage.counts_command).count();
+        exec.command_count += stages.len();
         self.run_pipeline_stages(stages, exec).await
     }
 
@@ -424,20 +474,24 @@ impl Sandbox {
         let assignment_values =
             expand_assignments(&simple.assignments, &session.env, exec.last_status);
         let words = expand_words(&simple.words, &session.env, exec.last_status);
-        if words.is_empty() {
-            for (name, value) in assignment_values {
-                session.env.insert(name, value);
-            }
-            return 0;
-        }
         exec.command_count += 1;
 
-        let command_name = words[0].clone();
-        let args = words[1..].to_vec();
-        let fs = Fs::new(
+        // Shell assignments in a null command persist even if its redirect fails.
+        if words.is_empty() {
+            for (name, value) in &assignment_values {
+                session.env.insert(name.clone(), value.clone());
+            }
+        }
+        let command_name = words
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "tinysandbox".into());
+        let args = words.get(1..).unwrap_or_default().to_vec();
+        let fs = Fs::scoped(
             Arc::clone(&self.vfs),
             Arc::clone(&self.command_names),
             session.cwd.clone(),
+            Some(Arc::clone(&exec.control)),
         );
         let mut redirects = match prepare_redirects(simple, &fs, &session.env, exec.last_status)
             .await
@@ -450,6 +504,20 @@ impl Sandbox {
                 return 1;
             }
         };
+
+        if words.is_empty() {
+            close_stdin_redirect(&fs, redirects.stdin.take()).await;
+            if let Err((path, err)) = finish_redirects(&redirects).await {
+                exec.write_stderr(
+                    format!("tinysandbox: {path}: {}\n", errno_message(err.errno())).as_bytes(),
+                );
+                return 1;
+            }
+            for (name, value) in assignment_values {
+                session.env.insert(name, value);
+            }
+            return 0;
+        }
 
         let mut command_env = session.env.clone();
         for (name, value) in assignment_values {
@@ -467,7 +535,11 @@ impl Sandbox {
             stdout: &mut special_stdout,
             stderr: &mut special_stderr,
         };
-        if let Some(mut status) = run_shell_builtin_stage(&command_name, &args, shell_ctx).await {
+        if let Some(mut status) = if self.commands.contains_key(&command_name) {
+            run_shell_builtin_stage(&command_name, &args, shell_ctx).await
+        } else {
+            None
+        } {
             close_stdin_redirect(&fs, redirects.stdin.take()).await;
             let Some((mut stdout, stdout_sinks, _)) = writer_for_destination_or_report(
                 &command_name,
@@ -617,10 +689,11 @@ impl Sandbox {
                 .map(|assignment| assignment.name.clone())
                 .unwrap_or_else(|| "<empty>".to_owned())
         });
-        let fs = Fs::new(
+        let fs = Fs::scoped(
             Arc::clone(&self.vfs),
             Arc::clone(&self.command_names),
             session.cwd.clone(),
+            Some(Arc::clone(&exec.control)),
         );
         let redirects = match prepare_redirects(simple, &fs, &session.env, exec.last_status).await {
             Ok(redirects) => redirects,
@@ -668,7 +741,7 @@ impl Sandbox {
             cwd: session.cwd.clone(),
             fs,
             command: self.commands.get(&name).cloned(),
-            shell_builtin: is_shell_builtin_name(&name),
+            shell_builtin: self.commands.contains_key(&name) && is_shell_builtin_name(&name),
             redirects,
             limits: self.limits,
             commands: Arc::clone(&self.command_names),
@@ -699,7 +772,12 @@ impl Sandbox {
             pipe_readers.push(Some(Box::pin(reader)));
             pipe_writers.push(Some(PipeDestination {
                 writer: SharedCountingPipeWriter {
-                    inner: Arc::new(Mutex::new(writer)),
+                    inner: Some(Arc::new(Mutex::new(writer))),
+                    wake: Arc::new(PipeWake {
+                        waiters: Mutex::new(BTreeMap::new()),
+                        next_id: AtomicUsize::new(1),
+                    }),
+                    id: 0,
                     bytes: Arc::clone(&count),
                     broken: Arc::clone(&broken),
                 },
@@ -938,6 +1016,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Removes a command, including a default builtin, from lookup and `/bin`.
+    /// For example, use `without_command("jq")` when native evaluator work is
+    /// outside the host's resource policy.
+    pub fn without_command(mut self, name: &str) -> Self {
+        self.commands.remove(name);
+        self
+    }
+
     /// Registers a custom command by name.
     pub fn command<F, Fut>(mut self, name: impl Into<String>, command: F) -> Self
     where
@@ -1029,10 +1115,16 @@ impl SandboxBuilder {
         #[cfg(feature = "js")]
         let js_prelude = Arc::<str>::from(self.js_prelude.unwrap_or_default());
         let command_names = Arc::new(self.commands.keys().cloned().collect());
-        let vfs = Arc::new(
+        let vfs: Arc<dyn Vfs> = Arc::new(
             MountedVfs::new(self.mounts).expect("SandboxBuilder validates mount names eagerly"),
         );
+        let host_fs = Fs::new(
+            Arc::clone(&vfs),
+            Arc::clone(&command_names),
+            self.cwd.clone(),
+        );
         Sandbox {
+            host_fs,
             vfs,
             commands: Arc::new(self.commands),
             command_names,
@@ -1166,6 +1258,7 @@ async fn run_shell_builtin_stage(
 }
 
 struct ExecState {
+    control: Arc<ExecutionControl>,
     stdout: CaptureWriter,
     stderr: CaptureWriter,
     timings: Vec<CommandTiming>,
@@ -1177,8 +1270,9 @@ struct ExecState {
 }
 
 impl ExecState {
-    fn new(last_status: i32, limits: Limits) -> Self {
+    fn new(last_status: i32, limits: Limits, control: Arc<ExecutionControl>) -> Self {
         Self {
+            control,
             stdout: CaptureWriter::new(limits.stdout_bytes),
             stderr: CaptureWriter::new(limits.stderr_bytes),
             timings: Vec::new(),
@@ -1270,7 +1364,7 @@ struct CappedOutput {
     total: usize,
     pre_truncation: Vec<u8>,
     head: Vec<u8>,
-    tail: Vec<u8>,
+    tail: VecDeque<u8>,
     truncated: bool,
 }
 
@@ -1281,7 +1375,7 @@ impl CappedOutput {
             total: 0,
             pre_truncation: Vec::new(),
             head: Vec::new(),
-            tail: Vec::new(),
+            tail: VecDeque::new(),
             truncated: false,
         }
     }
@@ -1332,7 +1426,7 @@ impl CappedOutput {
         }
         if data.len() >= limit {
             self.tail.clear();
-            self.tail.extend_from_slice(&data[data.len() - limit..]);
+            self.tail.extend(&data[data.len() - limit..]);
             return;
         }
         let overflow = self
@@ -1343,7 +1437,7 @@ impl CappedOutput {
         if overflow > 0 {
             self.tail.drain(..overflow);
         }
-        self.tail.extend_from_slice(data);
+        self.tail.extend(data);
     }
 
     fn finish(&self) -> (Vec<u8>, bool) {
@@ -1356,7 +1450,7 @@ impl CappedOutput {
         let mut out = Vec::with_capacity(self.cap);
         out.extend_from_slice(&self.head);
         out.extend_from_slice(TRUNCATION_MARKER);
-        out.extend_from_slice(&self.tail);
+        out.extend(self.tail.iter());
         (out, true)
     }
 }
@@ -1420,11 +1514,51 @@ struct PipeDestination {
     broken: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
 struct SharedCountingPipeWriter {
-    inner: Arc<Mutex<DuplexStream>>,
+    inner: Option<Arc<Mutex<DuplexStream>>>,
+    wake: Arc<PipeWake>,
+    id: usize,
     bytes: Arc<AtomicUsize>,
     broken: Arc<AtomicBool>,
+}
+
+// DuplexStream has one write waker. Duplicated descriptors may be polled by
+// different tasks, so its readiness must wake every waiting descriptor.
+struct PipeWake {
+    waiters: Mutex<BTreeMap<usize, Waker>>,
+    next_id: AtomicUsize,
+}
+impl Wake for PipeWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        let waiters =
+            std::mem::take(&mut *self.waiters.lock().unwrap_or_else(PoisonError::into_inner));
+        for waker in waiters.into_values() {
+            waker.wake();
+        }
+    }
+}
+impl Clone for SharedCountingPipeWriter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            bytes: Arc::clone(&self.bytes),
+            broken: Arc::clone(&self.broken),
+            wake: Arc::clone(&self.wake),
+            id: self.wake.next_id.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+impl Drop for SharedCountingPipeWriter {
+    fn drop(&mut self) {
+        self.wake
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 impl AsyncWrite for SharedCountingPipeWriter {
@@ -1433,8 +1567,26 @@ impl AsyncWrite for SharedCountingPipeWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        match Pin::new(&mut *inner).poll_write(cx, buf) {
+        let Some(pipe) = &self.inner else {
+            return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+        };
+        self.wake
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.id, cx.waker().clone());
+        let waker = Waker::from(Arc::clone(&self.wake));
+        let mut shared_cx = Context::from_waker(&waker);
+        let mut inner = pipe.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = Pin::new(&mut *inner).poll_write(&mut shared_cx, buf);
+        if result.is_ready() {
+            self.wake
+                .waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.id);
+        }
+        match result {
             Poll::Ready(Ok(n)) => {
                 self.bytes.fetch_add(n, Ordering::Relaxed);
                 Poll::Ready(Ok(n))
@@ -1447,34 +1599,119 @@ impl AsyncWrite for SharedCountingPipeWriter {
         }
     }
 
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Duplex writes are accepted directly into the bounded pipe buffer.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.wake
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&this.id);
+        this.inner = None;
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct FileSink(Arc<RedirectFile>);
+
+// Duplication shares one description and offset. Accept at most one owned
+// chunk per destination; pending lock acquisition owns no caller bytes, so a
+// cancelled write can safely be followed by a write of a different buffer.
+type RedirectLock =
+    Pin<Box<dyn Future<Output = tokio::sync::OwnedMutexGuard<RedirectState>> + Send>>;
+struct RedirectWriter {
+    target: Arc<RedirectFile>,
+    pending: Option<RedirectLock>,
+}
+impl RedirectWriter {
+    fn poll_lock(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<tokio::sync::OwnedMutexGuard<RedirectState>> {
+        if self.pending.is_none() {
+            self.pending = Some(Box::pin(Arc::clone(&self.target.state).lock_owned()));
+        }
+        let result = self
+            .pending
+            .as_mut()
+            .expect("lock installed")
+            .as_mut()
+            .poll(cx);
+        if result.is_ready() {
+            self.pending = None;
+        }
+        result
+    }
+}
+impl AsyncWrite for RedirectWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let mut state = match this.poll_lock(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(state) => state,
+        };
+        if let Some(err) = state.error {
+            return Poll::Ready(Err(io::Error::other(err)));
+        }
+        let Some(handle) = state.handle else {
+            return Poll::Ready(Err(io::Error::other(VfsError::new(Errno::EBADF))));
+        };
+        let n = buf.len().min(STREAM_CHUNK_BYTES);
+        if n == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        let data = buf[..n].to_vec();
+        let fs = this.target.fs.clone();
+        // Retain an error if the task panics or is discarded during runtime
+        // shutdown. Completion clears it only after every byte is written.
+        state.error = Some(VfsError::new(Errno::EIO));
+        task::spawn(async move {
+            let mut written = 0;
+            while written < data.len() {
+                match fs
+                    .write_at(handle, state.offset, data[written..].to_vec())
+                    .await
+                {
+                    Ok(0) => {
+                        state.error = Some(VfsError::new(Errno::ENOSPC));
+                        return;
+                    }
+                    Ok(bytes) => {
+                        written += bytes;
+                        state.offset = state.offset.saturating_add(bytes as u64);
+                    }
+                    Err(err) => {
+                        state.error = Some(err);
+                        return;
+                    }
+                }
+                if let Err(err) = fs.checkpoint().await {
+                    state.error = Some(err);
+                    return;
+                }
+            }
+            state.error = None;
+        });
+        Poll::Ready(Ok(n))
+    }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        Pin::new(&mut *inner).poll_flush(cx)
+        match self.get_mut().poll_lock(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(state) => {
+                Poll::Ready(state.error.map_or(Ok(()), |err| Err(io::Error::other(err))))
+            }
+        }
     }
-
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        Pin::new(&mut *inner).poll_shutdown(cx)
-    }
-}
-
-struct FileSink {
-    handle: Option<task::JoinHandle<Result<(), (String, VfsError)>>>,
-}
-
-impl FileSink {
-    fn new(handle: task::JoinHandle<Result<(), (String, VfsError)>>) -> Self {
-        Self {
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for FileSink {
-    fn drop(&mut self) {
-        if let Some(handle) = &self.handle {
-            handle.abort();
-        }
+        self.poll_flush(cx)
     }
 }
 
@@ -1538,66 +1775,20 @@ async fn writer_for_destination_or_report(
 }
 
 async fn file_writer(
-    fs: &Fs,
-    target: &RedirectFile,
+    _fs: &Fs,
+    target: &Arc<RedirectFile>,
 ) -> Result<(BoxAsyncWrite, FileSink), (String, VfsError)> {
-    let mode = if target.append {
-        crate::vfs::OpenMode::write_only().create().append()
-    } else {
-        crate::vfs::OpenMode::write_only()
-    };
-    let handle = fs
-        .open(&target.path, mode)
-        .await
-        .map_err(|err| (target.path.clone(), err))?;
-    let path = target.path.clone();
-    let fs = fs.clone();
-    let (mut reader, writer) = tokio::io::duplex(PIPE_CAPACITY_BYTES);
-    let sink = FileSink::new(task::spawn(async move {
-        let mut offset = 0_u64;
-        let mut buf = vec![0; STREAM_CHUNK_BYTES];
-        let mut result = Ok(());
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            let mut written = 0;
-            while written < n {
-                match fs.write_at(handle, offset, buf[written..n].to_vec()).await {
-                    Ok(0) => {
-                        result = Err(VfsError::new(Errno::ENOSPC));
-                        break;
-                    }
-                    Ok(bytes) => {
-                        written += bytes;
-                        offset = offset.saturating_add(bytes as u64);
-                    }
-                    Err(err) => {
-                        result = Err(err);
-                        break;
-                    }
-                }
-            }
-            if result.is_err() {
-                break;
-            }
-        }
-        let close = fs.close(handle).await;
-        match (result, close) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(err), _) | (_, Err(err)) => Err((path, err)),
-        }
-    }));
-    Ok((Box::pin(writer), sink))
+    Ok((
+        Box::pin(RedirectWriter {
+            target: Arc::clone(target),
+            pending: None,
+        }),
+        FileSink(Arc::clone(target)),
+    ))
 }
 
-async fn await_file_sink(mut sink: FileSink) -> Result<(), (String, VfsError)> {
-    let handle = sink.handle.take().expect("file sink awaited once");
-    handle
-        .await
-        .unwrap_or_else(|_| Err(("redirect".to_owned(), VfsError::new(Errno::EINVAL))))
+async fn await_file_sink(sink: FileSink) -> Result<(), (String, VfsError)> {
+    sink.0.finish().await
 }
 
 async fn drain_file_sinks(sinks: Vec<FileSink>) {
@@ -1609,7 +1800,7 @@ async fn drain_file_sinks(sinks: Vec<FileSink>) {
 async fn run_stage_task(
     index: usize,
     stage: PreparedStage,
-    mut stdin: BoxAsyncRead,
+    stdin: BoxAsyncRead,
     stdout: BoxAsyncWrite,
     stderr: BoxAsyncWrite,
     sinks: Vec<FileSink>,
@@ -1623,7 +1814,9 @@ async fn run_stage_task(
         let _ = stderr.write_all(message.as_bytes()).await;
         CommandResult::failure()
     } else if matches!(&stage.kind, StageKind::AssignmentOnly) {
-        let _ = tokio::io::copy(&mut stdin, &mut tokio::io::sink()).await;
+        drop(stdin);
+        drop(stdout);
+        drop(stderr);
         CommandResult::success()
     } else {
         run_registered_stage(stage, stdin, stdout, stderr).await
@@ -1724,7 +1917,7 @@ async fn run_registered_stage(
     CommandResult::new(127)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct PreparedRedirects {
     stdin: Option<InputRedirect>,
     stdout: OutputDestination,
@@ -1747,10 +1940,10 @@ struct InputRedirect {
     handle: crate::vfs::FileHandle,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum OutputDestination {
     Capture(CaptureFd),
-    File(RedirectFile),
+    File(Arc<RedirectFile>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1759,10 +1952,46 @@ enum CaptureFd {
     Stderr,
 }
 
-#[derive(Debug, Clone)]
 struct RedirectFile {
     path: String,
-    append: bool,
+    fs: Fs,
+    state: Arc<tokio::sync::Mutex<RedirectState>>,
+}
+struct RedirectState {
+    handle: Option<crate::vfs::FileHandle>,
+    offset: u64,
+    error: Option<VfsError>,
+}
+impl RedirectFile {
+    async fn finish(&self) -> Result<(), (String, VfsError)> {
+        let mut state = self.state.lock().await;
+        if let Some(handle) = state.handle.take() {
+            let result = if state.error.is_some() || self.fs.is_cancelled() {
+                self.fs.abort(handle).await
+            } else {
+                self.fs.close(handle).await
+            };
+            if state.error.is_none() {
+                state.error = result.err();
+            }
+        }
+        state
+            .error
+            .map_or(Ok(()), |err| Err((self.path.clone(), err)))
+    }
+}
+
+async fn finish_redirects(redirects: &PreparedRedirects) -> Result<(), (String, VfsError)> {
+    let mut result = Ok(());
+    for destination in [&redirects.stdout, &redirects.stderr] {
+        if let OutputDestination::File(file) = destination {
+            let close = file.finish().await;
+            if result.is_ok() {
+                result = close;
+            }
+        }
+    }
+    result
 }
 
 async fn prepare_redirects(
@@ -1772,95 +2001,84 @@ async fn prepare_redirects(
     last_status: i32,
 ) -> Result<PreparedRedirects, (String, VfsError)> {
     let mut redirects = PreparedRedirects::default();
-
-    for redirect in &simple.redirects {
-        match &redirect.target {
-            RedirectTarget::Fd(fd) => {
-                if let Err(err) = apply_fd_redirect(&mut redirects, redirect, *fd) {
-                    close_stdin_redirect(fs, redirects.stdin.take()).await;
-                    return Err(err);
-                }
-            }
-            RedirectTarget::Word(word) => {
-                let path = match redirect_target(word, env, last_status) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        close_stdin_redirect(fs, redirects.stdin.take()).await;
-                        return Err(err);
-                    }
-                };
-                match (
-                    redirect.fd.unwrap_or(default_redirect_fd(redirect.op)),
-                    redirect.op,
-                ) {
-                    (0, RedirectOp::Read) => {
-                        let handle = match fs.open(&path, crate::vfs::OpenMode::read_only()).await {
-                            Ok(handle) => handle,
-                            Err(err) => {
-                                close_stdin_redirect(fs, redirects.stdin.take()).await;
-                                return Err((path.clone(), err));
+    let mut opened: Vec<Arc<RedirectFile>> = Vec::new();
+    let result = async {
+        for redirect in &simple.redirects {
+            fs.checkpoint()
+                .await
+                .map_err(|err| ("redirect".into(), err))?;
+            match &redirect.target {
+                RedirectTarget::Fd(fd) => apply_fd_redirect(&mut redirects, redirect, *fd)?,
+                RedirectTarget::Word(word) => {
+                    let path = redirect_target(word, env, last_status)?;
+                    match (
+                        redirect.fd.unwrap_or(default_redirect_fd(redirect.op)),
+                        redirect.op,
+                    ) {
+                        (0, RedirectOp::Read) => {
+                            let handle = fs
+                                .open(&path, crate::vfs::OpenMode::read_only())
+                                .await
+                                .map_err(|err| (path.clone(), err))?;
+                            if let Some(previous) = redirects.stdin.replace(InputRedirect {
+                                path: path.clone(),
+                                handle,
+                            }) {
+                                fs.close(previous.handle)
+                                    .await
+                                    .map_err(|err| (previous.path, err))?;
                             }
-                        };
-                        if let Some(previous) = redirects.stdin.replace(InputRedirect {
-                            path: path.clone(),
-                            handle,
-                        }) && let Err(err) = fs.close(previous.handle).await
-                        {
-                            close_stdin_redirect(fs, redirects.stdin.take()).await;
-                            return Err((previous.path, err));
                         }
-                    }
-                    (1, RedirectOp::Write) => {
-                        if let Err(err) = preflight_output(fs, &path, false).await {
-                            close_stdin_redirect(fs, redirects.stdin.take()).await;
-                            return Err(err);
+                        (fd @ (1 | 2), op @ (RedirectOp::Write | RedirectOp::Append)) => {
+                            let mode = if op == RedirectOp::Append {
+                                crate::vfs::OpenMode::write_only().create().append()
+                            } else {
+                                crate::vfs::OpenMode::write_only().create().truncate()
+                            };
+                            let handle = fs
+                                .open(&path, mode)
+                                .await
+                                .map_err(|err| (path.clone(), err))?;
+                            let target = Arc::new(RedirectFile {
+                                path,
+                                fs: fs.clone(),
+                                state: Arc::new(tokio::sync::Mutex::new(RedirectState {
+                                    handle: Some(handle),
+                                    offset: 0,
+                                    error: None,
+                                })),
+                            });
+                            opened.push(Arc::clone(&target));
+                            if fd == 1 {
+                                redirects.stdout = OutputDestination::File(target);
+                            } else {
+                                redirects.stderr = OutputDestination::File(target);
+                            }
                         }
-                        redirects.stdout = OutputDestination::File(RedirectFile {
-                            path,
-                            append: false,
-                        });
-                    }
-                    (1, RedirectOp::Append) => {
-                        if let Err(err) = preflight_output(fs, &path, true).await {
-                            close_stdin_redirect(fs, redirects.stdin.take()).await;
-                            return Err(err);
-                        }
-                        redirects.stdout =
-                            OutputDestination::File(RedirectFile { path, append: true });
-                    }
-                    (2, RedirectOp::Write) => {
-                        if let Err(err) = preflight_output(fs, &path, false).await {
-                            close_stdin_redirect(fs, redirects.stdin.take()).await;
-                            return Err(err);
-                        }
-                        redirects.stderr = OutputDestination::File(RedirectFile {
-                            path,
-                            append: false,
-                        });
-                    }
-                    (2, RedirectOp::Append) => {
-                        if let Err(err) = preflight_output(fs, &path, true).await {
-                            close_stdin_redirect(fs, redirects.stdin.take()).await;
-                            return Err(err);
-                        }
-                        redirects.stderr =
-                            OutputDestination::File(RedirectFile { path, append: true });
-                    }
-                    (_, _) => {
-                        close_stdin_redirect(fs, redirects.stdin.take()).await;
-                        return Err((path, VfsError::new(Errno::EINVAL)));
+                        _ => return Err((path, VfsError::new(Errno::EINVAL))),
                     }
                 }
             }
         }
+        Ok(())
+    }
+    .await;
+    // Earlier successful redirects still create/truncate their files, including
+    // redirects superseded later in the same command or followed by an error.
+    let mut result = result;
+    for file in opened {
+        if result.is_err() || Arc::strong_count(&file) == 1 {
+            let close = file.finish().await;
+            if result.is_ok() {
+                result = close;
+            }
+        }
+    }
+    if let Err(err) = result {
+        close_stdin_redirect(fs, redirects.stdin.take()).await;
+        return Err(err);
     }
     Ok(redirects)
-}
-
-async fn preflight_output(fs: &Fs, path: &str, append: bool) -> Result<(), (String, VfsError)> {
-    fs.write_file(path, &[], append)
-        .await
-        .map_err(|err| (path.to_owned(), err))
 }
 
 fn apply_fd_redirect(
@@ -1872,21 +2090,11 @@ fn apply_fd_redirect(
     if !matches!(fd, 1 | 2) || !matches!(target_fd, 1 | 2) {
         return Err((target_fd.to_string(), VfsError::new(Errno::EINVAL)));
     }
-    let mut target = if target_fd == 1 {
+    let target = if target_fd == 1 {
         redirects.stdout.clone()
     } else {
         redirects.stderr.clone()
     };
-    if let OutputDestination::File(file) = &mut target {
-        file.append = true;
-        if target_fd == 1 {
-            if let OutputDestination::File(stdout) = &mut redirects.stdout {
-                stdout.append = true;
-            }
-        } else if let OutputDestination::File(stderr) = &mut redirects.stderr {
-            stderr.append = true;
-        }
-    }
     if fd == 1 {
         redirects.stdout = target;
     } else {
@@ -1915,19 +2123,74 @@ fn redirect_target(
     }
 }
 
-fn pipeline_command_cost(pipeline: &Pipeline, session: &Session, last_status: i32) -> usize {
-    pipeline
-        .commands
-        .iter()
-        .filter(|command| {
-            let AstCommand::Simple(simple) = command;
-            !expand_words(&simple.words, &session.env, last_status).is_empty()
-        })
-        .count()
-}
-
 fn is_shell_builtin_name(name: &str) -> bool {
     matches!(name, "cd" | "export" | "unset")
+}
+
+fn expansion_cost(
+    simple: &SimpleCommand,
+    env: &BTreeMap<String, String>,
+    last_status: i32,
+    limit: usize,
+) -> Option<usize> {
+    let mut cost = 0usize;
+    let mut charge = |n: usize| {
+        cost = cost.saturating_add(n);
+        cost <= limit
+    };
+    // The current environment is cloned for command execution. Assignments
+    // contribute their new values below, bounding retained session growth too.
+    for (name, value) in env {
+        if !charge(name.len().saturating_add(value.len())) {
+            return None;
+        }
+    }
+    for assignment in &simple.assignments {
+        if !charge(assignment.name.len()) {
+            return None;
+        }
+    }
+    for (word, split) in simple
+        .assignments
+        .iter()
+        .map(|a| (&a.value, false))
+        .chain(simple.words.iter().map(|w| (w, true)))
+        .chain(simple.redirects.iter().filter_map(|r| match &r.target {
+            RedirectTarget::Word(w) => Some((w, true)),
+            _ => None,
+        }))
+    {
+        if !charge(std::mem::size_of::<String>()) {
+            return None;
+        }
+        for segment in &word.segments {
+            let (value, fields) = match segment {
+                Segment::Literal { value, .. } => {
+                    (std::borrow::Cow::Borrowed(value.as_str()), false)
+                }
+                Segment::Expansion { name, quoted } => {
+                    (expansion_value(name, env, last_status), split && !quoted)
+                }
+            };
+            if !charge(value.len()) {
+                return None;
+            }
+            if fields
+                && !charge(
+                    value
+                        .split_whitespace()
+                        .count()
+                        .saturating_add(2)
+                        .saturating_mul(
+                            std::mem::size_of::<String>() + std::mem::size_of::<&str>(),
+                        ),
+                )
+            {
+                return None;
+            }
+        }
+    }
+    Some(cost)
 }
 
 fn expand_assignments(
@@ -2023,11 +2286,15 @@ fn expand_assignment_value(
     out
 }
 
-fn expansion_value(name: &str, env: &BTreeMap<String, String>, last_status: i32) -> String {
+fn expansion_value<'a>(
+    name: &str,
+    env: &'a BTreeMap<String, String>,
+    last_status: i32,
+) -> std::borrow::Cow<'a, str> {
     if name == "?" {
-        last_status.to_string()
+        std::borrow::Cow::Owned(last_status.to_string())
     } else {
-        env.get(name).cloned().unwrap_or_default()
+        std::borrow::Cow::Borrowed(env.get(name).map(String::as_str).unwrap_or_default())
     }
 }
 
