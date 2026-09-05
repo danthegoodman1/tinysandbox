@@ -25,7 +25,8 @@ mod control;
 pub mod fs;
 #[cfg(feature = "js")]
 pub mod host;
-mod jq;
+mod jq_protocol;
+mod jq_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -39,6 +40,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
+pub use control::HostContext;
 use control::{ExecutionControl, ExecutionGuard};
 use fs::{Fs, STREAM_CHUNK_BYTES, errno_message, normalize_absolute};
 use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -90,7 +92,7 @@ pub struct ExecMetrics {
     pub stdout_truncated: bool,
     /// Whether captured stderr exceeded `Limits::stderr_bytes` while streaming.
     pub stderr_truncated: bool,
-    /// Peak WebAssembly memory reported by JS commands that ran in this exec.
+    /// Peak WebAssembly memory reported by JS or jq commands in this exec.
     pub peak_wasm_memory_bytes: Option<usize>,
 }
 
@@ -182,6 +184,24 @@ impl Sandbox {
         Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
     {
         let entries = vec![(name.into(), Arc::new(global) as Arc<dyn JsGlobal>)];
+        self.mutate_js_globals(|current| merge_js_globals(current, entries))
+    }
+
+    /// Binds or replaces a host global with cooperative cancellation context.
+    #[cfg(feature = "js")]
+    pub fn set_js_global_with_context<F, Fut>(
+        &self,
+        name: impl Into<String>,
+        global: F,
+    ) -> Result<(), JsGlobalError>
+    where
+        F: Fn(serde_json::Value, HostContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
+    {
+        let entries = vec![(
+            name.into(),
+            Arc::new(host::ContextualGlobal(global)) as Arc<dyn JsGlobal>,
+        )];
         self.mutate_js_globals(|current| merge_js_globals(current, entries))
     }
 
@@ -1018,8 +1038,7 @@ impl SandboxBuilder {
     }
 
     /// Removes a command, including a default builtin, from lookup and `/bin`.
-    /// For example, use `without_command("jq")` when native evaluator work is
-    /// outside the host's resource policy.
+    /// For example, use `without_command("rm")` to remove that command capability.
     pub fn without_command(mut self, name: &str) -> Self {
         self.commands.remove(name);
         self
@@ -1061,6 +1080,34 @@ impl SandboxBuilder {
         self
     }
 
+    /// Binds a host global that receives its cancellation and deadline context.
+    ///
+    /// Trusted callbacks should pass the remaining time and cancellation signal
+    /// to downstream work. Their future is dropped when the call expires;
+    /// synchronous blocking code and host allocations remain the host's concern.
+    ///
+    /// ```
+    /// use tinysandbox::sandbox::{HostError, Sandbox};
+    /// let sandbox = Sandbox::builder()
+    ///     .js_global_with_context("delayedEcho", |value, context| async move {
+    ///         tokio::select! {
+    ///             _ = context.cancelled() => Err(HostError::new("cancelled")),
+    ///             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => Ok(value),
+    ///         }
+    ///     })
+    ///     .build();
+    /// ```
+    #[cfg(feature = "js")]
+    pub fn js_global_with_context<F, Fut>(mut self, name: impl Into<String>, global: F) -> Self
+    where
+        F: Fn(serde_json::Value, HostContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, HostError>> + Send + 'static,
+    {
+        self.js_globals
+            .push((name.into(), Arc::new(host::ContextualGlobal(global))));
+        self
+    }
+
     /// Registers the host transport backing sandboxed JavaScript `fetch`.
     #[cfg(feature = "js")]
     pub fn fetch<F, Fut>(mut self, fetch: F) -> Self
@@ -1069,6 +1116,17 @@ impl SandboxBuilder {
         Fut: Future<Output = Result<FetchResponse, HostError>> + Send + 'static,
     {
         self.fetch = Some(Arc::new(fetch));
+        self
+    }
+
+    /// Registers a fetch handler with cooperative cancellation and a deadline.
+    #[cfg(feature = "js")]
+    pub fn fetch_with_context<F, Fut>(mut self, fetch: F) -> Self
+    where
+        F: Fn(FetchRequest, HostContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<FetchResponse, HostError>> + Send + 'static,
+    {
+        self.fetch = Some(Arc::new(host::ContextualFetch(fetch)));
         self
     }
 

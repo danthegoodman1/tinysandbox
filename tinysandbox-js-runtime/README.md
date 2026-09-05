@@ -85,7 +85,9 @@ minimum of 1,245,184 bytes is rejected before instantiation. Non-page-aligned
 values are rounded down for the actual WebAssembly maximum.
 
 Global names use dot-separated JavaScript identifier segments. Each value must
-be a synchronous one-argument function. Guest arguments cross the boundary
+be a synchronous function. Its first argument is the guest value; a second
+context argument exposes `signal`, `deadlineMs`, `remainingTimeMs()`, and
+`isCancelled()`. Existing one-argument functions keep working. Guest arguments cross the boundary
 with JavaScript's normal `JSON.stringify` semantics (including its omission and
 coercion rules); host return values must already be strict JSON values and are
 validated without coercion. Promises, invalid returns, invalid names, namespace
@@ -150,6 +152,17 @@ The monotonic `timeoutMs` budget covers source loading in `runFile`, guest
 execution, and synchronous host calls. A host callback already executing cannot
 be interrupted mid-call; further guest filesystem operations are rejected after
 it returns if the deadline has expired.
+
+Host callbacks can poll `context.isCancelled()` or `context.remainingTimeMs()`
+to cooperate with that same monotonic deadline. Polling also refreshes
+`context.signal`; deadline events cannot fire autonomously while synchronous
+JavaScript blocks the event loop. `deadlineMs` is an approximate Unix timestamp
+for display. An optional `options.signal` rejects already-aborted runs and
+propagates aborts raised synchronously during callbacks. Each callback's signal
+also aborts when that callback returns, and its listener is removed. The upstream
+signal listener is removed when the run finishes. A timer on the same event loop cannot interrupt
+`runCode()` or `runFile()`; use a separate worker if the host needs that boundary.
+This package runs JavaScript only and has no jq command or `jqMemoryBytes` option.
 
 The package build type-checks the implementation with strict TypeScript and
 emits JavaScript and declarations together. Run `npm test` for the shared guest

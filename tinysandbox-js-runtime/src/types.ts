@@ -1,6 +1,15 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-export type HostGlobal = (argument: JsonValue) => JsonValue;
+export interface HostContext {
+  /** Aborts on callback completion; cancellation is refreshed at checkpoints and by context polling. */
+  readonly signal: AbortSignal;
+  /** Approximate Unix timestamp; remainingTimeMs uses the monotonic deadline. */
+  readonly deadlineMs: number;
+  remainingTimeMs(): number;
+  isCancelled(): boolean;
+}
+
+export type HostGlobal = (argument: JsonValue, context: HostContext) => JsonValue;
 
 export type VfsErrno = "EBADF" | "EBUSY" | "EXDEV" | "EACCES" | "EEXIST" | "EFBIG" | "EIO" | "EINVAL" | "EISDIR" | "ENOENT" | "ENOSPC" | "ENOTDIR" | "ENOTEMPTY";
 
@@ -46,6 +55,8 @@ export interface RunCodeOptions {
   wasmMemoryBytes?: number;
   quickjsHeapBytes?: number;
   timeoutMs?: number;
+  /** Synchronous execution observes aborts at checkpoints; timers cannot preempt host callbacks. */
+  signal?: AbortSignal;
   sourceBytes?: number;
   hostResponseBytes?: number;
   hostInputBytes?: number;
@@ -74,4 +85,3 @@ export interface JsEngine {
   runCode(code: string, options?: RunCodeOptions): RunResult;
   runFile(path: string, options: RunFileOptions): RunResult;
 }
-

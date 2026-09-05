@@ -22,31 +22,33 @@ export {
   VfsStatsJs
 }
 
-export declare class Sandbox extends NativeSandbox {
+// The facade adapts callback arguments and return values at the native boundary.
+export interface Sandbox extends Omit<NativeSandbox, 'setJsGlobal' | 'extendJsGlobals' | 'replaceJsGlobals'> {}
+export declare class Sandbox {
   constructor(options?: SandboxOptions | null)
-  override get fs(): SandboxFs
-  override stats(): Promise<SandboxStats>
+  get fs(): SandboxFs
+  stats(): Promise<SandboxStats>
   /**
    * Binds one host function, replacing any global under that exact name.
    * Visible to `js` commands that start after the call returns; one already
    * running keeps the set it started with.
    */
-  override setJsGlobal(name: string, global: JsGlobal): void
+  setJsGlobal(name: string, global: JsGlobal): void
   /**
    * Adds host functions to the ones already bound, replacing any that share an
    * exact name and leaving the rest untouched.
    */
-  override extendJsGlobals(globals: Record<string, JsGlobal>): void
+  extendJsGlobals(globals: Record<string, JsGlobal>): void
   /**
    * Replaces every host global with this set, dropping the ones it does not
    * name, including globals bound in the constructor. The set is validated
    * before it lands, so a rejected one leaves the live globals untouched.
    */
-  override replaceJsGlobals(globals: Record<string, JsGlobal>): void
+  replaceJsGlobals(globals: Record<string, JsGlobal>): void
   /** Removes a host global, reporting whether it was bound. */
-  override removeJsGlobal(name: string): boolean
+  removeJsGlobal(name: string): boolean
   /** The names currently bound as host globals, in sorted order. */
-  override jsGlobalNames(): Array<string>
+  jsGlobalNames(): Array<string>
 }
 
 export interface SandboxOptions {
@@ -55,7 +57,7 @@ export interface SandboxOptions {
   cwd?: string
   persistSession?: boolean
   commands?: Record<string, JsCommand>
-  /** Commands removed after registration; e.g. ["jq"] to exclude native filter evaluation. */
+  /** Commands removed after registration; e.g. ["jq"] to disable the jq command. */
   disabledCommands?: Array<string>
   /**
    * Host functions bound into the sandboxed JavaScript global scope. Each key
@@ -178,6 +180,8 @@ export interface LimitsOptions {
   sortInputBytes?: number
   /** Maximum total bytes accepted by jq across stdin and file operands. */
   jqInputBytes?: number
+  /** Maximum jq guest linear memory in bytes (default 64 MiB). */
+  jqMemoryBytes?: number
   wasmMemoryBytes?: number
   fetchResponseBytes?: number
 }
@@ -186,7 +190,17 @@ export interface LimitsOptions {
  * Already-running callbacks may outlive an exec timeout. */
 export type JsCommand = (call: CommandCall) => Promise<CommandOutput> | CommandOutput
 
-export interface CommandCall {
+export interface HostContext {
+  /** Aborts when this callback settles, its deadline expires, or its execution is cancelled. */
+  readonly signal: AbortSignal
+  /** Approximate Unix timestamp for display; use remainingTimeMs for monotonic budgeting. */
+  readonly deadlineMs: number | null
+  remainingTimeMs(): number | null
+  /** Also refreshes the signal synchronously, useful for cooperative CPU loops. */
+  isCancelled(): boolean
+}
+
+export interface CommandCall extends HostContext {
   args: Array<string>
   env: Record<string, string>
   cwd: string
@@ -200,7 +214,7 @@ export interface CommandOutput {
 }
 
 /** Host function bound into the JavaScript global scope, called synchronously as name(args). */
-export type JsGlobal = (args: unknown) => Promise<JsonValue> | JsonValue
+export type JsGlobal = (args: unknown, context: HostContext) => Promise<JsonValue> | JsonValue
 
 export type JsonValue =
   | null
@@ -211,7 +225,7 @@ export type JsonValue =
   | { [key: string]: JsonValue }
 
 /** Host transport used by sandboxed JavaScript fetch(). */
-export type JsFetch = (request: FetchRequest) => Promise<FetchResponse> | FetchResponse
+export type JsFetch = (request: FetchRequest, context: HostContext) => Promise<FetchResponse> | FetchResponse
 
 export interface FetchRequest {
   url: string

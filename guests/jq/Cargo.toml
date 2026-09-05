@@ -1,0 +1,24 @@
+[package]
+name = "tinysandbox-jq-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[dependencies]
+jaq-core = "3.1.0"
+jaq-json = { version = "2.0.1", features = ["serde", "sync"] }
+jaq-std = "3.0.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

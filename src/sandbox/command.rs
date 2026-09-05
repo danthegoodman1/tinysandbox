@@ -71,7 +71,7 @@ pub struct CommandContext {
 pub struct CommandResult {
     /// Process-like exit code.
     pub exit_code: i32,
-    /// Peak WebAssembly memory observed by JS commands.
+    /// Peak WebAssembly memory observed by JS or jq commands.
     pub peak_wasm_memory_bytes: Option<usize>,
 }
 
@@ -126,6 +126,8 @@ pub struct Limits {
     pub sort_input_bytes: usize,
     /// Maximum bytes accepted by `jq` before it fails.
     pub jq_input_bytes: usize,
+    /// Maximum jq guest linear memory, including its stack and intermediate values.
+    pub jq_memory_bytes: usize,
     /// Maximum WebAssembly memory for JS commands.
     pub wasm_memory_bytes: usize,
     /// Maximum bytes accepted from a JavaScript fetch response body.
@@ -146,6 +148,7 @@ impl Default for Limits {
             tail_input_bytes: 8 * 1024 * 1024,
             sort_input_bytes: 8 * 1024 * 1024,
             jq_input_bytes: 8 * 1024 * 1024,
+            jq_memory_bytes: 64 * 1024 * 1024,
             wasm_memory_bytes: 64 * 1024 * 1024,
             fetch_response_bytes: 32 * 1024 * 1024,
         }

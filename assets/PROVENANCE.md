@@ -1,4 +1,16 @@
-# QuickJS Wasm Artifact Provenance
+# Wasm Artifact Provenance
+
+## jq
+
+`assets/jq.wasm` is built from the standalone `guests/jq` crate using
+`scripts/build-jq-wasm.sh`. Its pinned Rust toolchain, locked dependencies,
+artifact hash, memory floor, exact imports/exports, and reproduction commands
+are documented in [guests/jq/README.md](../guests/jq/README.md). CI rebuilds it
+on Linux and requires byte-for-byte equality with the checked-in artifact,
+then runs its ABI and compatibility tests. The guest has no ambient filesystem,
+network, process, or environment capability; time comes from one explicit import.
+
+## QuickJS
 
 `assets/quickjs.wasm` is built from source by `scripts/build-quickjs-wasm.sh`.
 

@@ -386,9 +386,9 @@ fn jq_timeout_cancels_no_output_range_reduction() {
         .expect("build single-blocking-thread runtime");
 
     rt.block_on(async {
-        // This filter does substantial work before producing any output. With a
-        // single blocking thread, the following jq proves the timed-out worker
-        // released its blocking slot instead of continuing in the background.
+        // This filter does substantial work before producing any output. The
+        // public timeout result must preserve subsequent command health. The
+        // jq_runtime unit test separately proves an entered guest worker exits.
         let timed_out_sandbox = Sandbox::builder()
             .limits(Limits {
                 wall_time: Duration::from_millis(25),
@@ -404,7 +404,7 @@ fn jq_timeout_cancels_no_output_range_reduction() {
         let after_sandbox = Sandbox::builder().build();
         let after = tokio::time::timeout(Duration::from_secs(1), after_sandbox.exec("jq -n '1'"))
             .await
-            .expect("subsequent jq should acquire the only blocking thread");
+            .expect("subsequent jq should remain usable");
         assert_eq!(after.exit_code, 0, "{}", after.stderr);
         assert_eq!(after.stdout, "1\n");
     });

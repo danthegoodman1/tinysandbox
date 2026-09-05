@@ -1,6 +1,6 @@
 //! Async filesystem facade exposed to sandbox commands.
 
-use super::{Limits, control::ExecutionControl};
+use super::{HostContext, Limits, control::ExecutionControl};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
@@ -69,6 +69,15 @@ impl Fs {
     /// retain a 64 KiB allowance even when the whole-file input limit is lower.
     pub fn max_io_bytes(&self) -> usize {
         self.limits().host_input_bytes.max(STREAM_CHUNK_BYTES)
+    }
+
+    /// Cooperative cancellation and deadline for trusted work in this execution.
+    /// Host filesystem calls outside an exec return a context with no deadline.
+    pub fn host_context(&self) -> HostContext {
+        self.handles
+            .control
+            .as_ref()
+            .map_or_else(HostContext::unscoped, |control| control.host_context())
     }
 
     /// Whether this execution has ended or exhausted its wall-clock budget.

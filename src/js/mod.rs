@@ -38,6 +38,7 @@ use wasmtime::{
     Caller, Engine, Extern, Linker, Memory, MemoryType, Module, ResourceLimiter, Store, Trap,
 };
 
+use crate::sandbox::HostContext;
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
 use crate::sandbox::fs::{Fs, join_path};
 use crate::sandbox::host::{Fetch, FetchRequest, FetchResponse, HostError, JsGlobal};
@@ -730,22 +731,57 @@ impl Drop for HostState {
     }
 }
 
+struct HostCallTimeout;
+
 fn block_on_host_timeout<F, T>(
     state: &HostState,
-    future: F,
-) -> Result<T, tokio::time::error::Elapsed>
+    call: impl FnOnce(HostContext) -> F,
+) -> Result<T, HostCallTimeout>
 where
     F: Future<Output = T>,
 {
-    // Fire before the outer command deadline so the guest can observe the
-    // host-call error. A measured 50ms is sufficient for QuickJS to
-    // catch/render it, while the quarter-budget ceiling keeps short budgets
-    // useful instead of timing out immediately.
+    // Preserve time for the guest to catch/render host errors before the outer
+    // command expires. This shorter deadline is visible to the callback too.
     let headroom = (EPOCH_TICK * 10).min(state.wall_time / 4);
     let remaining = state.remaining_wall_time().saturating_sub(headroom);
-    state
-        .host_runtime
-        .block_on(async move { tokio::time::timeout(remaining, future).await })
+    let deadline = Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(Instant::now);
+    let context = state.fs.host_context().child(deadline);
+    struct CancelOnDrop(HostContext);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let _guard = CancelOnDrop(context.clone());
+    state.host_runtime.block_on(async {
+        if context.is_cancelled() {
+            return Err(HostCallTimeout);
+        }
+        let future = call(context.clone());
+        let mut future = std::pin::pin!(future);
+        let mut cancelled = std::pin::pin!(context.cancelled());
+        std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            if context.is_cancelled() {
+                return Poll::Ready(Err(HostCallTimeout));
+            }
+            if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                return Poll::Ready(if context.is_cancelled() {
+                    Err(HostCallTimeout)
+                } else {
+                    Ok(value)
+                });
+            }
+            if cancelled.as_mut().poll(cx).is_ready() {
+                Poll::Ready(Err(HostCallTimeout))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    })
 }
 
 #[derive(Clone)]
@@ -1251,10 +1287,11 @@ fn handle_fetch(state: &mut HostState, args: &Value) -> Result<Value, HostError>
         headers: payload.headers,
         body,
     };
-    let response = match block_on_host_timeout(state, fetch.fetch(request)) {
-        Ok(result) => result?,
-        Err(_) => return Err(HostError::new("fetch timed out")),
-    };
+    let response =
+        match block_on_host_timeout(state, |context| fetch.fetch_with_context(request, context)) {
+            Ok(result) => result?,
+            Err(_) => return Err(HostError::new("fetch timed out")),
+        };
     if response.body.len() > state.fetch_response_bytes {
         return Err(HostError::new(format!(
             "fetch response body exceeded limit of {} bytes",
@@ -1290,7 +1327,7 @@ fn handle_js_global(state: &mut HostState, args: &Value) -> Result<Value, HostEr
         .cloned()
         .ok_or_else(|| HostError::new(format!("unknown global '{name}'")))?;
     let payload = args.get("args").cloned().unwrap_or(Value::Null);
-    match block_on_host_timeout(state, global.call(payload)) {
+    match block_on_host_timeout(state, |context| global.call_with_context(payload, context)) {
         Ok(result) => result,
         Err(_) => Err(HostError::new(format!("global '{name}' timed out"))),
     }

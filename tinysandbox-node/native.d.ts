@@ -7,13 +7,23 @@ export declare class ExternalObject<T> {
     [K: symbol]: T
   }
 }
+/** Internal bridge for the JavaScript callback's cooperative cancellation signal. */
+export declare class NativeHostContext {
+  get deadlineMs(): number | null
+  remainingTimeMs(): number | null
+  isCancelled(): boolean
+  /** True when the execution/callback ends; false when the wrapper disposes its subscription. */
+  cancelled(): Promise<boolean>
+  dispose(): void
+}
+
 export declare class NativeSandbox {
   constructor(options?: object | undefined | null)
   /**
    * Binds one host function, replacing any global under that exact name.
    * Visible to `js` commands that start after this returns.
    */
-  setJsGlobal(name: string, global: (arg: [any]) => Promise<JsGlobalCallbackResponse>): void
+  setJsGlobal(name: string, global: (arg: [any, NativeHostContext]) => Promise<JsGlobalCallbackResponse>): void
   /**
    * Adds host functions to the ones already bound, replacing any that share
    * an exact name and leaving the rest untouched.
@@ -85,7 +95,7 @@ export interface ConformanceResult {
   snapshots: string
 }
 
-export declare function createJsVfs(vfs: object): ExternalObject<JsVfsExternal>
+export declare function createJsVfs(vfs: object): ExternalObject<unknown>
 
 export interface DirEntryJs {
   name: string
@@ -173,7 +183,7 @@ export const PROMPT_SHELL: string
 
 export declare function promptGlobals(names: Array<string>): string
 
-export declare function runConformance(factory: (arg: [VfsQuotaJs]) => Promise<JsVfsHandle>): Promise<unknown>
+export declare function runConformance(factory: (arg: [VfsQuotaJs]) => Promise<ExternalObject<unknown>>): Promise<unknown>
 
 export interface SandboxStats {
   commandsRun: number

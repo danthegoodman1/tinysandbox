@@ -71,6 +71,72 @@ test("supports synchronous dotted globals and JSON-safe values", async () => {
   assert.throws(() => engine.runCode("", { globals: { "bad-name": () => null } }), /invalid name/);
 });
 
+test("host globals can poll the shared monotonic deadline and abort signal", async () => {
+  const engine = await createEngine(bytes);
+  let observed = false;
+  const result = engine.runCode("work(null)", {
+    timeoutMs: 50,
+    globals: { work: (argument, context) => {
+      assert.equal(argument, null);
+      assert.ok(context.signal instanceof AbortSignal);
+      assert.ok(context.remainingTimeMs() > 0 && context.remainingTimeMs() <= 50);
+      assert.ok(Math.abs(context.deadlineMs - Date.now() - context.remainingTimeMs()) < 100);
+      context.signal.addEventListener("abort", () => { observed = true; }, { once: true });
+      // A second clock independently bounds this regression if context polling breaks.
+      const watchdog = performance.now() + 500;
+      while (!context.isCancelled() && performance.now() < watchdog) {}
+      assert.equal(context.isCancelled(), true);
+      assert.equal(context.signal.aborted, true);
+      return null;
+    } },
+  });
+  assert.equal(result.exitCode, 124);
+  assert.equal(observed, true);
+  assert.equal(engine.runCode("console.log(legacy(7))", { globals: { legacy: (value) => value } }).stdout, "7\n");
+});
+
+test("external aborts propagate synchronously to host context and stop later operations", async () => {
+  const engine = await createEngine(bytes);
+  const controller = new AbortController();
+  let laterCalls = 0;
+  const options = {
+    signal: controller.signal,
+    globals: {
+      stop: (_argument, context) => {
+        controller.abort(new Error("stop this run"));
+        assert.equal(context.signal.aborted, true);
+        assert.equal(context.isCancelled(), true);
+        return null;
+      },
+      later: () => { laterCalls += 1; return null; },
+    },
+  };
+  assert.equal(engine.runCode("stop(null); later(null)", options).exitCode, 124);
+  assert.equal(laterCalls, 0);
+  assert.equal(engine.runCode("later(null)", options).exitCode, 124, "already-aborted signal rejects entry");
+  assert.equal(laterCalls, 0);
+  assert.equal(engine.runCode("console.log('healthy')").stdout, "healthy\n");
+});
+
+test("successful and failed callbacks release their signals before the next invocation", async () => {
+  const engine = await createEngine(bytes);
+  let previous;
+  let aborts = 0;
+  const result = engine.runCode("inspect(false); try { inspect(true) } catch {} inspect(false)", {
+    globals: { inspect: (fail, context) => {
+      if (previous) assert.equal(previous.signal.aborted, true);
+      assert.equal(context.signal.aborted, false);
+      context.signal.addEventListener("abort", () => { aborts += 1; }, { once: true });
+      previous = context;
+      if (fail) throw new Error("expected");
+      return null;
+    } },
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(previous.signal.aborted, true, "retained signal aborts without polling");
+  assert.equal(aborts, 3);
+});
+
 test("rejects every non-JSON host-global shape deterministically", async () => {
   const engine = await createEngine(bytes);
   const cycle = {};

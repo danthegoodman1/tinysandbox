@@ -17,14 +17,11 @@ exclude = ["PLAN.md", "original-plan.md", ".github/", ".vscode/", "scripts/relea
 [dependencies]
 aws-sdk-s3 = { version = "1.140.0", optional = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "rustls"] }
 base64 = { version = "0.22.1", optional = true }
-jaq-core = "3.1.0"
-jaq-json = { version = "2.0.1", features = ["serde", "sync"] }
-jaq-std = "3.0.1"
 regex = "1.12.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "time", "io-util", "sync"] }
-wasmtime = { version = "46.0.1", default-features = false, features = ["runtime", "cranelift", "std"], optional = true }
+wasmtime = { version = "46.0.1", default-features = false, features = ["runtime", "cranelift", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -34,15 +31,15 @@ rustix = { version = "1.1.4", features = ["fs"] }
 proptest = "1.11.0"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "rt", "time", "io-util"] }
 
-# Used by build.rs to precompile the QuickJS module for the target, so no
+# Used by build.rs to precompile the jq/QuickJS modules for the target, so no
 # process runs Cranelift. Shares the `wasmtime` name with the runtime
 # dependency because Cargo allows a crate under one name per package.
 [build-dependencies]
-wasmtime = { version = "46.0.1", optional = true, default-features = false, features = ["cranelift", "std"] }
+wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "std"] }
 
 [features]
 default = ["js"]
-js = ["dep:base64", "dep:wasmtime"]
+js = ["dep:base64"]
 s3 = ["dep:aws-sdk-s3", "tokio/rt-multi-thread"]
 
 [[example]]

@@ -24,7 +24,7 @@ QuickJS decomposition. Change APIs where the actual contract requires it.
 - Admit source, expanded pipelines, host reads, retained buffers, handles, and
   workers before allocating or dispatching the corresponding work.
 - Prefer a measured local change over a broad rewrite. Do not equate Wasm
-  limits with total-process heap limits or native evaluator preemption.
+  limits with total-process heap limits or preemption of trusted host code.
 
 ## Testing strategy
 
@@ -53,7 +53,7 @@ they motivated an explicit policy, not an invented new escape.
 | F05 | Both JS hosts clamped fd reads by a reused pathname and returned zero instead of six bytes. | Handle-based reads with independent real-Node comparison. |
 | F06 | A 128-byte capture cap changed 4097 pipeline/file bytes to 129, including NULs. | Bounded acknowledged JS transport; capture only at the destination; exact-byte/early-close tests. |
 | F07 | Redirect preflight/reopen produced ACB for ABC and broke S3 replacement/merged output. | Open once, share offset and one finish, preserve replacement mode, own queued bytes across write cancellation. |
-| F08 | Sort read before enforcing its cap; whole reads, expansion, null stages, and worker admission had gaps. | Incremental/cumulative budgets, bounded adapters/serialization, all-stage admission, explicit native-jq exclusion policy. |
+| F08 | Sort read before enforcing its cap; whole reads, expansion, null stages, and worker admission had gaps. | Incremental/cumulative budgets, bounded adapters/serialization, all-stage admission, isolated jq evaluator (Phase 22). |
 | F09 | Null redirects were skipped; `$?` was stale within and/or lists; null stages drained input. | Shared redirect preparation/finish, immediate status propagation and input close, effect-aware Bash tests. |
 | F10 | Recursive copy into itself grew until quota; tree/copy paths were recursive or whole-file. | Normalized topology rejection, streamed copy, iterative traversal, depth 256 snapshot/tree policy. |
 | F11 | An unused slow mount forced memory operations through blocking dispatch; buffers repeatedly moved/scanned prefixes. | Resolved-backend dispatch, direct bounded JS workers, cursor/ring buffers, reproducible release measurements. |
@@ -72,11 +72,14 @@ they motivated an explicit policy, not an invented new escape.
   back. Cleanup can outlive the result. No public "all workers finished" API is
   promised. JS/jq workers each have 16 slots, VFS dispatch 128, fallback cleanup 4;
   open handles have a 16,384 process ceiling and 1,024 default per-exec ceiling.
-- Native jq retains jaq: its heap and work between checkpoints are not hard
-  bounded. `without_command("jq")` / `disabledCommands: ['jq']` excludes it from
-  execution and `/bin`; hard isolation for arbitrary native filters belongs in
-  an OS-isolated worker. Input buffering precedes jq admission to avoid pipeline
-  deadlock and is capped per command, not process-wide.
+- Phase 22 replaces native jaq execution with an embedded jaq Wasm guest: parser,
+  compiler, evaluator, and serializer share one capped linear memory and an
+  engine-interrupted deadline. Wasmtime is now required even without `js`;
+  `without_command("jq")` remains available. Input buffering precedes jq admission
+  to avoid pipeline deadlock and is capped per command, not process-wide.
+- Trusted host callbacks receive cooperative deadline/cancellation context.
+  Arbitrary host allocations and synchronous blocking code require application
+  limits or external process isolation; no new hard host-code guarantee.
 - Local roots are stable capabilities. A host rename does not revoke an opened
   directory. Host-created hard links and mounted outside content are unsupported
   isolation inputs; external mutations can invalidate quota accounting.
@@ -148,7 +151,7 @@ Goal: Reject oversized work during admission or consumption and state the limits
 
 Scope: 17A, 17B, 17C, 17D.
 
-Completion gate: Adversarial generated input, expansion, retention, serialization and admission regressions pass; native jaq remains explicitly outside hard heap/preemption guarantees.
+Completion gate: Adversarial generated input, expansion, retention, serialization and admission regressions pass; Phase 22 extends these admission bounds to the evaluator itself.
 
 Testing plan: Maintain the named regressions below and run the shared configuration matrix.
 
@@ -158,9 +161,9 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | 17A: Parser, expansion, stage and loop budgets (F03/F08) | `execution_boundaries.rs`: all-stage/no-pipe rejection, cumulative pipeline expansion, variable doubling/field amplification, assignment-aware redirect admission and no redirect mutations. |
 | Complete | Work | 17B: Bounded host reads, retention and serialization (F08) | Incremental sort, retained tail byte ring, bounded whole-file helpers, Rust/portable host transfer tests, streamed sed and jq serialization. |
-| Complete | Decision | 17C: Bounded worker and jq policy | Independent 16-slot JS/jq pools retain permits through worker exit; jq admission test covers full-pool timeout and a one-slot pipeline. README states evaluator limits and exclusion API. |
+| Complete | Decision | 17C: Bounded worker and jq policy | Independent 16-slot JS/jq pools retain permits through worker exit; jq admission test covers full-pool timeout and a one-slot pipeline. README states admission limits and exclusion API; Phase 22 replaces native evaluation. |
 | Complete | Work | 17D: Capped Node command adapter | `hostInputBytes` limits input before callback and output before transport; Node tests verify rejection, exact cap, no callback on oversized input, and pre-allocation raw read checks. |
-| Complete | Test / Gate | Phase 17 validation | Adversarial generated input, expansion, retention, serialization and admission regressions pass; native jaq remains explicitly outside hard heap/preemption guarantees. |
+| Complete | Test / Gate | Phase 17 validation | Adversarial generated input, expansion, retention, serialization and admission regressions pass; Phase 22 extends these admission bounds to the evaluator itself. |
 
 ## Phase 18: Unify supported simple-command semantics
 
@@ -235,7 +238,31 @@ Status ledger:
 | Complete | Work | 21A: Genuine feature-isolation gates (F12) | CI selects core-only no-default/default features; hidden feature gates fix seven README doctests; macOS runs local/conformance tests. |
 | Complete | Work | 21B: Composition plus independent reference corpus | Bash effect corpus, portable real-Node fd oracle, S3 composition and gated lifecycle regressions. |
 | Complete | Work | 21C: Checked implementation and public type contract | Removed blanket ts-nocheck/manual portable declarations; strict tsc emits JS/declarations from implementation/interfaces.26 portable tests, Convex and package smoke pass. |
-| Complete | Doc | 21D: Precise guarantees and current plan evidence | README documents cancellation, staging, native jq, local capability assumptions, all new limits and artifact trust; this ledger and benchmark evidence replace prospective claims. |
+| Complete | Doc | 21D: Precise guarantees and current plan evidence | README documents cancellation, staging, isolated jq, local capability assumptions, all new limits and artifact trust; this ledger and benchmark evidence replace prospective claims. |
 | Complete | Work | 21E: Deterministic release-test boundary | Offline fresh-cache placeholder test; live registry smoke separately opt-in and bounded. 31 deterministic release tests pass; live smoke also verified. |
 | Complete | Test / Gate | Phase 21 validation | [CI run 33929163678](https://github.com/danthegoodman1/tinysandbox/actions/runs/33929163678) passed all seven jobs for implementation commit `e4c1bfd`: Rust release gates, Linux x64/arm64, macOS arm64/Intel, portable Chrome/Convex, and live S3. [PR #24](https://github.com/danthegoodman1/tinysandbox/pull/24) tracks subsequent checks. |
 
+
+## Phase 22: Isolate jq and expose cooperative host cancellation
+
+Goal: Enforce jq memory and computation boundaries while giving trusted host
+callbacks the deadline and cancellation context needed to stop their own work.
+
+Scope: 22A guest/runtime, 22B callback APIs, 22C packaging and compatibility.
+
+Completion gate: Hostile intermediate allocations fail within the guest cap;
+engine cancellation terminates an entered no-output evaluation; existing jq
+semantics and legacy callback signatures pass; PR CI is green.
+
+Testing plan: Guest evaluator tests, end-to-end CLI/resource cases, actual worker
+exit after cancellation, callback cancellation/drop races, native/portable tests,
+locked artifact rebuild, optimized before/after measurement, and full CI matrix.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 22A: Capped, preemptible jq guest | `guests/jq`, `jq_protocol.rs`, `jq_runtime.rs`, `build.rs`; 15 guest tests, 5 real-Wasm ABI tests, CLI/e2e/streaming suites, 32MiB allocation/recovery test, entered-worker cancellation and unpolled-output deadline tests pass. |
+| Complete | Work | 22B: Trusted host callback context | `tests/host_context.rs` (6 tests), cancellation race unit tests, native callback tests and 29 portable tests verify deadlines, execution drop, settlement, legacy signatures, and no effects from expired queued callbacks. |
+| Complete | Work | 22C: Reproducible artifact, API and resource documentation | Two clean pinned/locked guest builds match the hash in `guests/jq/README.md`; `benchmarks/JQ_ISOLATION.md` records measured 1.32–1.74× latency and guest memory; README documents required Wasmtime, UTC/empty-env semantics, caps and cooperative host limits. |
+| In Progress | Test / Gate | Phase 22 validation | Workspace all-feature and core no-feature/default tests, strict Clippy/rustdoc, guest/ABI tests, and Cargo publish dry-run pass. Native Node build/declaration checks and 56 tests, 29 portable tests, Chrome/Convex and portable package checks pass. Needs green PR CI, including Linux byte-for-byte guest rebuild. |

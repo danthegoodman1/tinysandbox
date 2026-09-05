@@ -1,4 +1,4 @@
-import type { JsonValue, HostGlobal, VfsErrno, VfsMetadata, VfsOpenMode, Vfs, RunCodeOptions, RunFileOptions, RunResult, JsEngine } from "./types.js";
+import type { JsonValue, HostGlobal, HostContext, VfsErrno, VfsMetadata, VfsOpenMode, Vfs, RunCodeOptions, RunFileOptions, RunResult, JsEngine } from "./types.js";
 export type * from "./types.js";
 
 type ErrorPayload = { message: string; code?: string };
@@ -611,6 +611,11 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       const vfs = options.vfs === undefined ? undefined : validateVfs(options.vfs);
       const started = monotonicNow();
       const deadline = started + timeoutMs;
+      const signal = options.signal;
+      if (signal !== undefined && (typeof signal.aborted !== "boolean" || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")) {
+        throw new TypeError("signal must be an AbortSignal");
+      }
+      const controller = new AbortController();
       const memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: maximumPages });
       const stdout: Uint8Array[] = [];
       const stderr: Uint8Array[] = [];
@@ -618,9 +623,42 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       let stderrLength = 0;
       let response: Uint8Array = new Uint8Array();
       let timedOut = false;
+      let finished = false;
       let limitFailure: RunLimitError | undefined;
+      const isCancelled = () => {
+        if (signal?.aborted || monotonicNow() >= deadline) timedOut = true;
+        if ((finished || timedOut) && !controller.signal.aborted) {
+          controller.abort(signal?.reason ?? new DOMException("Execution ended", "AbortError"));
+        }
+        return finished || timedOut;
+      };
+      const deadlineMs = Date.now() + Math.max(0, deadline - monotonicNow());
+      const callbackContext = () => {
+        const callback = new AbortController();
+        const abort = () => { callback.abort(controller.signal.reason); };
+        const cancelled = () => {
+          if (isCancelled()) abort();
+          return callback.signal.aborted;
+        };
+        controller.signal.addEventListener("abort", abort, { once: true });
+        const context: HostContext = Object.freeze({
+          signal: callback.signal,
+          deadlineMs,
+          remainingTimeMs: () => { cancelled(); return Math.max(0, deadline - monotonicNow()); },
+          isCancelled: cancelled,
+        });
+        return {
+          context,
+          dispose: () => {
+            controller.signal.removeEventListener("abort", abort);
+            callback.abort(new DOMException("Host callback completed", "AbortError"));
+          },
+        };
+      };
+      const onAbort = () => { isCancelled(); };
+      const cancellationMessage = () => signal?.aborted ? "command cancelled" : "command timed out";
       const checkpoint = () => {
-        if (monotonicNow() >= deadline) { timedOut = true; throw new RunLimitError("timeout", "command timed out"); }
+        if (isCancelled()) throw new RunLimitError("timeout", cancellationMessage());
       };
       const vfsDispatcher = vfs === undefined ? undefined : createVfsDispatcher(vfs, resolvePath("/", options.cwd ?? "/"), hostInputBytes, hostResponseBytes, maxOpenFiles, checkpoint);
 
@@ -657,8 +695,7 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       };
       const tinysandbox = {
         should_interrupt() {
-          if (monotonicNow() >= deadline) timedOut = true;
-          return timedOut ? 1 : 0;
+          return isCancelled() ? 1 : 0;
         },
         host_call(opPointer: number, opLength: number, jsonPointer: number, jsonLength: number) {
           checkpoint();
@@ -690,10 +727,11 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
             setResponse({ error: { message: `unknown global '${String(name)}'` } });
             return 0;
           }
+          const host = callbackContext();
           try {
             const payload = argument.args ?? null;
             assertJsonValue(payload);
-            const value = handler(payload);
+            const value = handler(payload, host.context);
             checkpoint();
             if (thenable(value)) {
               throw new TypeError(`global '${name}' returned a Promise; host globals must be synchronous`);
@@ -702,6 +740,8 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
             setResponse({ value });
           } catch (error) {
             setResponse({ error: jsonError(error) });
+          } finally {
+            host.dispose();
           }
           return 0;
         },
@@ -743,6 +783,8 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       let cleanupFailure: unknown;
       let completed = false;
       try {
+        signal?.addEventListener("abort", onAbort, { once: true });
+        checkpoint();
         instance = new WebAssembly.Instance(module, { env: { memory }, tinysandbox, wasi_snapshot_preview1: wasi });
         if (instance.exports.memory !== memory) throw new TypeError("QuickJS wasm did not re-export env.memory");
         if (typeof instance.exports._initialize === "function") instance.exports._initialize();
@@ -760,20 +802,23 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
         if (!pointer) throw new WebAssembly.RuntimeError("QuickJS input allocation failed");
         read(pointer, configBytes.byteLength).set(configBytes);
         exitCode = (instance.exports as GuestExports).tinysandbox_run(pointer, configBytes.byteLength, quickjsHeapBytes);
-        if (monotonicNow() >= deadline) timedOut = true;
+        isCancelled();
         if (timedOut) {
-          return { exitCode: 124, stdout: "", stderr: "js: command timed out\n", initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
+          return { exitCode: 124, stdout: "", stderr: `js: ${cancellationMessage()}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
         }
         (instance.exports as GuestExports).tinysandbox_free(pointer);
         completed = true;
       } catch (error) {
         if (timedOut) {
-          return { exitCode: 124, stdout: "", stderr: "js: command timed out\n", initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
+          return { exitCode: 124, stdout: "", stderr: `js: ${cancellationMessage()}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
         }
         const isMemory = error instanceof WebAssembly.RuntimeError && /memory|allocation|out of bounds/i.test(error.message);
         const message = limitFailure?.message ?? (isMemory ? "wasm memory limit exceeded" : `runtime trap: ${error instanceof Error ? error.message : String(error)}`);
         return { exitCode: 1, stdout: decoder.decode(join(stdout, stdoutLength)), stderr: `js: ${message}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
       } finally {
+        finished = true;
+        signal?.removeEventListener("abort", onAbort);
+        isCancelled();
         cleanupFailure = vfsDispatcher?.closeAll(completed && exitCode === 0 && !timedOut && limitFailure === undefined);
       }
       if (cleanupFailure !== undefined && exitCode === 0) {
@@ -793,7 +838,10 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       if (typeof path !== "string") throw new TypeError("path must be a string");
       if (options === null || typeof options !== "object") throw new TypeError("options must be an object");
       const deadline = monotonicNow() + integerOption("timeoutMs", options.timeoutMs, DEFAULT_TIMEOUT_MS, 1);
-      const checkpoint = () => { if (monotonicNow() >= deadline) throw new RunLimitError("timeout", "command timed out"); };
+      const checkpoint = () => {
+        if (options.signal?.aborted) throw new RunLimitError("timeout", "command cancelled");
+        if (monotonicNow() >= deadline) throw new RunLimitError("timeout", "command timed out");
+      };
       const vfs = validateVfs(options.vfs);
       const cwd = resolvePath("/", options.cwd ?? "/");
       const resolved = resolvePath(cwd, path);
@@ -802,7 +850,7 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       try {
         bytes = remapHostFailure(() => readAll(vfs, resolved, Math.min(sourceBytes, integerOption("hostInputBytes", options.hostInputBytes, DEFAULT_HOST_INPUT_BYTES)), checkpoint), "open", resolved);
       } catch (error) {
-        if (error instanceof RunLimitError && error.kind === "timeout") return { exitCode: 124, stdout: "", stderr: "js: command timed out\n", initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: 0 };
+        if (error instanceof RunLimitError && error.kind === "timeout") return { exitCode: 124, stdout: "", stderr: `js: ${error.message}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: 0 };
         if (error instanceof HostCallFailure) throw exposedHostError(error.payload);
         throw error;
       }
