@@ -5,8 +5,10 @@
 `assets/jq.wasm` is built from the standalone `guests/jq` crate using
 `scripts/build-jq-wasm.sh`. Its pinned Rust toolchain, locked dependencies,
 artifact hash, memory floor, exact imports/exports, and reproduction commands
-are documented in [guests/jq/README.md](../guests/jq/README.md). CI rebuilds it
-on Linux and requires byte-for-byte equality with the checked-in artifact,
+are documented in [guests/jq/README.md](../guests/jq/README.md). The canonical
+builder uses Rust host `x86_64-unknown-linux-gnu`; the pinned Linux/amd64 Docker
+recipe avoids platform-dependent Cargo build-unit metadata. CI rebuilds it
+on Linux x86_64 and requires byte-for-byte equality with the checked-in artifact,
 then runs its ABI and compatibility tests. The guest has no ambient filesystem,
 network, process, or environment capability; time comes from one explicit import.
 

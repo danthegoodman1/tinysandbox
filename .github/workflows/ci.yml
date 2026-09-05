@@ -30,9 +30,17 @@ jobs:
       - run: cargo test --manifest-path guests/jq/Cargo.toml --locked
       - run: cargo clippy --manifest-path guests/jq/Cargo.toml --all-targets --locked -- -D warnings
       - name: Verify the checked-in guest is reproducible
+        id: rebuild
         run: |
           scripts/build-jq-wasm.sh
+          sha256sum assets/jq.wasm
           git diff --exit-code -- assets/jq.wasm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure() && steps.rebuild.outcome == 'failure'
+        with:
+          name: jq-guest-rebuild-mismatch
+          path: assets/jq.wasm
+          retention-days: 7
       - run: node --test guests/jq/abi.test.mjs
 
   rust-release-gates:

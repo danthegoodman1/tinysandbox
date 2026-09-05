@@ -15,11 +15,23 @@ of the host workspace. The evaluator and its existing tests moved from
 
 ## Build and verify
 
+On a Linux x86_64 machine:
+
 ```sh
 rustup toolchain install 1.97.0 --profile minimal --target wasm32-unknown-unknown
 scripts/build-jq-wasm.sh
 cargo +1.97.0 test --manifest-path guests/jq/Cargo.toml --locked
 node --test guests/jq/abi.test.mjs
+```
+
+On other platforms, use the pinned Linux/amd64 builder (run from the repository
+root; this writes the build output and `assets/jq.wasm` in the mounted checkout):
+
+```sh
+docker run --rm --platform linux/amd64 \
+  -v "$(pwd):/work" -w /work \
+  rust:1.97.0-slim-bookworm@sha256:6d220bf85c74e842a79da63997af8d2e74455c0b8847d8bb3a5888572334991d \
+  bash -c 'rustup target add wasm32-unknown-unknown && scripts/build-jq-wasm.sh'
 ```
 
 The build script pins Rust 1.97.0, uses `--locked`, enables release optimization,
@@ -30,13 +42,23 @@ static data. `TINYSANDBOX_JQ_BUILD_DIR` selects a separate output directory for
 an independent rebuild. `TINYSANDBOX_JQ_RUST_TOOLCHAIN` is an explicit toolchain
 override for development; changing it may change the artifact.
 
-The checked-in artifact was built on macOS arm64 with
-`rustc 1.97.0 (2d8144b78 2026-07-07)`:
+The canonical Rust host is `x86_64-unknown-linux-gnu`. Cargo incorporates native
+build-script and procedural-macro build units into target crate metadata, so
+macOS builds can reorder Wasm functions even with the same compiler version,
+locked dependencies, source-path remapping, and target. The script rejects other
+hosts by default; `TINYSANDBOX_JQ_ALLOW_NONCANONICAL=1` permits a development
+build whose bytes differ from the checked-in artifact. CI retains the strict
+byte-for-byte Linux rebuild check.
 
-- Size: 1,856,818 bytes.
-- SHA-256: `a08cbfca784d3ea7e69c2f369485e934706302f160cb72bd5f9284a3174f2720`.
+The checked-in artifact was built with the pinned Docker image above and
+`rustc 1.97.0 (2d8144b78 2026-07-07)`, LLVM 22.1.6:
+
+- Size: 1,856,826 bytes.
+- SHA-256: `32d500d7885df6d23d727ebb06f753cce026ca506854afa2ed48ab3c7cdd5627`.
 - Initial memory: 135 Wasm pages, or 8,847,360 bytes, including the eight-MiB stack.
-- Separate clean build directories produced identical bytes on this host.
+- The Docker build and independent Ubuntu x86_64 CI build produced identical
+  bytes. Clean macOS builds also reproduced each other across different checkout,
+  Cargo-cache and target directories, but differed from the canonical Linux build.
 
 The host's configured memory limit includes that memory floor, the guest heap,
 parser/compiler state, and guest input/output buffers. Wasmtime compiled code,
