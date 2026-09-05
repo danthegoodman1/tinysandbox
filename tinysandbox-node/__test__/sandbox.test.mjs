@@ -47,6 +47,7 @@ test('numeric validation rejects unsafe byte counts and VFS lengths', async () =
   const unsafeInteger = Number.MAX_SAFE_INTEGER + 1
   assert.throws(() => new Sandbox({ limits: { stdoutBytes: unsafeInteger } }), /EINVAL/)
   assert.throws(() => new Sandbox({ limits: { jqInputBytes: unsafeInteger } }), /EINVAL/)
+  assert.throws(() => new Sandbox({ limits: { jqMemoryBytes: unsafeInteger } }), /EINVAL/)
 
   const sandbox = new Sandbox()
   await sandbox.fs.writeFile('/workspace/x', Buffer.from('abc'))
@@ -62,6 +63,130 @@ test('numeric validation rejects unsafe byte counts and VFS lengths', async () =
   } finally {
     await sandbox.fs.close(handle)
   }
+})
+
+test('host globals receive correlated deadlines and preserve one-argument callbacks', async () => {
+  let observed
+  const sandbox = new Sandbox({
+    limits: { wallTimeMs: 1000 },
+    commands: { delay: async () => { await new Promise((resolve) => setTimeout(resolve, 120)); return {} } },
+    globals: {
+      legacy: (args) => args.value,
+      inspect: (args, context) => {
+        assert.deepEqual(args, { value: 'new' })
+        assert.ok(context.signal instanceof AbortSignal)
+        assert.equal(context.isCancelled(), false)
+        assert.ok(context.remainingTimeMs() > 0)
+        assert.ok(context.remainingTimeMs() < 900, 'earlier command consumed the shared budget')
+        assert.ok(Math.abs(context.deadlineMs - Date.now() - context.remainingTimeMs()) < 100)
+        observed = context
+        return args.value
+      }
+    }
+  })
+  const result = await sandbox.exec(`delay; js -e 'console.log(legacy({value:"old"}), inspect({value:"new"}))'`)
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(result.stdout, 'old new\n')
+  assert.ok(observed)
+  assert.equal(observed.signal.aborted, true, 'callback completion aborts retained signals without polling')
+  assert.equal((await sandbox.exec(`js -e 'console.log(legacy({value:"healthy"}))'`)).stdout, 'healthy\n')
+})
+
+test('global, fetch, and custom-command callbacks receive abort on their actual deadline', async () => {
+  for (const kind of ['global', 'fetch', 'command']) {
+    let resolveAborted
+    let seen = false
+    const aborted = new Promise((resolve) => { resolveAborted = resolve })
+    const wait = (context, response) => {
+      seen = true
+      assert.ok(context.remainingTimeMs() > 0)
+      return new Promise((resolve) => {
+        const stop = () => { resolveAborted(); resolve(response) }
+        if (context.signal.aborted) stop()
+        else context.signal.addEventListener('abort', stop, { once: true })
+      })
+    }
+    const options = { limits: { wallTimeMs: 250 } }
+    let script
+    if (kind === 'global') {
+      options.globals = { wait: (_args, context) => wait(context, null) }
+      script = `js -e 'wait(null)'`
+    } else if (kind === 'fetch') {
+      options.fetch = (_request, context) => wait(context, { status: 499 })
+      script = `js -e 'fetch("https://example.test/wait")'`
+    } else {
+      options.commands = { wait: (call) => wait(call, {}) }
+      script = 'wait'
+    }
+    const sandbox = new Sandbox(options)
+    const result = await sandbox.exec(script)
+    // Guest host-call deadlines reserve shell cleanup time and are catchable
+    // exceptions; commands use the outer execution's deadline directly.
+    assert.equal(result.exitCode, kind === 'command' ? 124 : 1, `${kind}: ${result.stderr}`)
+    assert.equal(seen, true, kind)
+    let watchdog
+    try {
+      await Promise.race([aborted, new Promise((_resolve, reject) => {
+        watchdog = setTimeout(() => reject(new Error(`${kind} callback did not receive abort`)), 1500)
+      })])
+    } finally { clearTimeout(watchdog) }
+    assert.equal((await sandbox.exec('echo healthy')).stdout, 'healthy\n')
+  }
+})
+
+test('callback completion aborts retained signals before the next invocation', async () => {
+  let previous
+  let aborts = 0
+  const sandbox = new Sandbox({ globals: {
+    inspect: (fail, context) => {
+      if (previous) assert.equal(previous.signal.aborted, true)
+      assert.equal(context.signal.aborted, false)
+      context.signal.addEventListener('abort', () => { aborts += 1 }, { once: true })
+      previous = context
+      if (fail) throw new Error('expected')
+      return null
+    }
+  } })
+  const result = await sandbox.exec(`js -e 'inspect(false); try { inspect(true) } catch {} inspect(false)'`)
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(previous.signal.aborted, true)
+  assert.equal(aborts, 3)
+})
+
+test('callbacks queued behind a blocked Node event loop never start after expiration', async () => {
+  for (const kind of ['global', 'fetch', 'command']) {
+    let calls = 0
+    const options = { limits: { wallTimeMs: 200 } }
+    let script
+    if (kind === 'global') {
+      options.globals = { effect: () => { calls += 1; return null } }
+      script = `js -e 'effect(null)'`
+    } else if (kind === 'fetch') {
+      options.fetch = () => { calls += 1; return { status: 200 } }
+      script = `js -e 'fetch("https://example.test/effect")'`
+    } else {
+      options.commands = { effect: () => { calls += 1; return {} } }
+      script = 'effect'
+    }
+    const sandbox = new Sandbox(options)
+    const pending = sandbox.exec(script)
+    // Rust runs on its own threads and queues the TSFN while Node cannot
+    // service it. Wait well past the deadline before delivering that queue.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 450)
+    const result = await pending
+    assert.notEqual(result.exitCode, 0, kind)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(calls, 0, `${kind} must not begin host effects after cancellation`)
+    assert.equal((await sandbox.exec('echo healthy')).stdout, 'healthy\n')
+  }
+})
+
+test('jqMemoryBytes constrains jq without poisoning later executions', async () => {
+  const sandbox = new Sandbox({ limits: { jqMemoryBytes: 1 } })
+  const result = await sandbox.exec(`echo '{}' | jq '.'`)
+  assert.notEqual(result.exitCode, 0)
+  assert.match(result.stderr, /memory|heap|limit/i)
+  assert.equal((await sandbox.exec('echo healthy')).stdout, 'healthy\n')
 })
 
 test('jq builtin and jqInputBytes limit are available through Node options', async () => {
@@ -533,3 +658,40 @@ function waitForChild(child, timeoutMs) {
 function singleQuote(value) {
   return `'${value.replaceAll("'", "'\\''")}'`
 }
+
+test('host callbacks have bounded buffered input and output', async () => {
+  let calls = 0
+  const sandbox = new Sandbox({
+    limits: { hostInputBytes: 4 },
+    commands: {
+      inspect: () => { calls++; return { stdout: 'ok' } },
+      large: () => ({ stdout: '12345' })
+    }
+  })
+  const oversized = await sandbox.exec('echo 12345 | inspect')
+  assert.notEqual(oversized.exitCode, 0)
+  assert.match(oversized.stderr, /input limit/)
+  assert.equal(calls, 0)
+  assert.equal((await sandbox.exec('echo 123 | inspect')).stdout, 'ok')
+  assert.equal(calls, 1)
+  assert.match((await sandbox.exec('large')).stderr, /output limit/)
+})
+
+test('disabled commands are absent from execution and bin', async () => {
+  const sandbox = new Sandbox({ disabledCommands: ['jq', 'cd'] })
+  assert.equal((await sandbox.exec("jq -n '1'")).exitCode, 127)
+  assert.equal((await sandbox.exec('cd /')).exitCode, 127)
+  assert.doesNotMatch((await sandbox.exec('ls /bin')).stdout, /\bjq\b|\bcd\b/)
+})
+
+test('host descriptors survive distinct fs facade calls and large reads fail before allocation', async () => {
+  const sandbox = new Sandbox()
+  await sandbox.fs.writeFile('/workspace/f', Buffer.from('abcdef'))
+  const fd = await sandbox.fs.open('/workspace/f', { read: true })
+  await sandbox.fs.rename('/workspace/f', '/workspace/g')
+  await sandbox.fs.writeFile('/workspace/f', Buffer.alloc(0))
+  assert.equal((await sandbox.fs.readAt(fd, 0, 6)).toString(), 'abcdef')
+  await assert.rejects(() => sandbox.fs.readAt(fd, 0, 1024 ** 3), { code: 'EFBIG' })
+  await sandbox.fs.close(fd)
+  assert.throws(() => new Sandbox({ limits: { wallTimeMs: Number.MAX_VALUE } }), /wallTimeMs/)
+})

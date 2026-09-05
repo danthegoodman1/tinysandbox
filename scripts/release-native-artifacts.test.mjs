@@ -95,7 +95,7 @@ test("branch runs restore the cargo cache without evicting main's", () => {
   // branch's entries. Saving from every branch run pushed main's cache out, so
   // main rebuilt from scratch: 20 minutes for a job that takes 2 warm.
   const ciCaches = [...ciWorkflow.matchAll(/uses: Swatinem\/rust-cache@[0-9a-f]{40} #[^\n]*\n\s+with:\n(?<config>(?:\s{10}\S[^\n]*\n)+)/g)]
-  assert.equal(ciCaches.length, 4, "every CI job that builds Rust must cache it")
+  assert.equal(ciCaches.length, 5, "every CI job that builds Rust, including the jq guest, must cache it")
   for (const cache of ciCaches) {
     assert.match(
       cache.groups.config,

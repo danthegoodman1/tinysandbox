@@ -504,7 +504,7 @@ async fn redirect_setup_failures_close_opened_handles() {
     assert_eq!(input_vfs.live_handles(), 0);
 
     let output_vfs = Arc::new(TrackingVfs::default());
-    output_vfs.fail_second_open_for("/stderr");
+    output_vfs.fail_open_for("/stderr");
     let output_sandbox = Sandbox::builder()
         .mount_arc("workspace", output_vfs.clone())
         .command("both", |mut ctx| async move {
@@ -756,7 +756,7 @@ struct TrackingVfs {
     inner: InMemoryVfs,
     live_handles: Mutex<BTreeSet<FileHandle>>,
     opens_by_path: Mutex<BTreeMap<String, usize>>,
-    fail_second_open_path: Mutex<Option<String>>,
+    fail_open_path: Mutex<Option<String>>,
 }
 
 impl TrackingVfs {
@@ -771,9 +771,9 @@ impl TrackingVfs {
         self.inner.close(handle).expect("close seed file");
     }
 
-    fn fail_second_open_for(&self, path: &str) {
+    fn fail_open_for(&self, path: &str) {
         *self
-            .fail_second_open_path
+            .fail_open_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(path.to_owned());
     }
@@ -812,21 +812,20 @@ impl Vfs for TrackingVfs {
     }
 
     fn open(&self, path: &str, mode: OpenMode) -> VfsResult<FileHandle> {
-        let open_count = {
+        {
             let mut opens = self
                 .opens_by_path
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let count = opens.entry(path.to_owned()).or_default();
             *count += 1;
-            *count
         };
         let fail_path = self
-            .fail_second_open_path
+            .fail_open_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if fail_path.as_deref() == Some(path) && open_count == 2 {
+        if fail_path.as_deref() == Some(path) {
             return Err(tinysandbox::vfs::VfsError::new(
                 tinysandbox::vfs::Errno::EACCES,
             ));

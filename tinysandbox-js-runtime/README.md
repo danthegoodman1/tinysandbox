@@ -85,7 +85,9 @@ minimum of 1,245,184 bytes is rejected before instantiation. Non-page-aligned
 values are rounded down for the actual WebAssembly maximum.
 
 Global names use dot-separated JavaScript identifier segments. Each value must
-be a synchronous one-argument function. Guest arguments cross the boundary
+be a synchronous function. Its first argument is the guest value; a second
+context argument exposes `signal`, `deadlineMs`, `remainingTimeMs()`, and
+`isCancelled()`. Existing one-argument functions keep working. Guest arguments cross the boundary
 with JavaScript's normal `JSON.stringify` semantics (including its omission and
 coercion rules); host return values must already be strict JSON values and are
 validated without coercion. Promises, invalid returns, invalid names, namespace
@@ -115,7 +117,11 @@ paths resolve from `cwd`.
 
 The exported `Vfs` interface is deliberately small and synchronous: `stat`,
 `readdir`, `mkdir`, `rename`, `unlink`, `rmdir`, `open`, `readAt`, `writeAt`,
-`truncate`, and `close`. Paths delivered to it are normalized absolute paths;
+`truncate`, and `close`, plus optional `abort` for discarding staged writes.
+Successful runs close any remaining descriptors; failed or timed-out runs call
+`abort` when supplied, otherwise `close`. Handles must continue to refer to the
+same file after its original path is renamed, unlinked, or reused.
+Paths delivered to it are normalized absolute paths;
 handles and offsets are non-negative safe integers, and positional operations
 do not change the guest fd cursor. Implementations report one of the exported
 `VfsErrno` strings by throwing `new VfsError(code)`. Quotas and storage
@@ -130,3 +136,34 @@ package also does not provide network access, timers, guest ESM, TypeScript
 transpilation, Asyncify/JSPI, or persistent isolates. The compatibility glue's
 `fetch` never reaches ambient V8 networking and fails with unavailable-host
 capability behavior.
+
+
+## Host resource budgets
+
+`hostInputBytes` bounds whole-file reads and decoded guest writes (default
+8 MiB). `hostResponseBytes` bounds serialized host responses (default 1 MiB),
+including JSON framing and base64 expansion. Oversized reads fail before their
+entire contents are copied into the host or encoded. `maxOpenFiles` bounds guest
+descriptors (default 1,024). Positional reads can return fewer bytes than
+requested to stay within the response budget. Paths and recursive traversal
+are limited to 256 components.
+
+The monotonic `timeoutMs` budget covers source loading in `runFile`, guest
+execution, and synchronous host calls. A host callback already executing cannot
+be interrupted mid-call; further guest filesystem operations are rejected after
+it returns if the deadline has expired.
+
+Host callbacks can poll `context.isCancelled()` or `context.remainingTimeMs()`
+to cooperate with that same monotonic deadline. Polling also refreshes
+`context.signal`; deadline events cannot fire autonomously while synchronous
+JavaScript blocks the event loop. `deadlineMs` is an approximate Unix timestamp
+for display. An optional `options.signal` rejects already-aborted runs and
+propagates aborts raised synchronously during callbacks. Each callback's signal
+also aborts when that callback returns, and its listener is removed. The upstream
+signal listener is removed when the run finishes. A timer on the same event loop cannot interrupt
+`runCode()` or `runFile()`; use a separate worker if the host needs that boundary.
+This package runs JavaScript only and has no jq command or `jqMemoryBytes` option.
+
+The package build type-checks the implementation with strict TypeScript and
+emits JavaScript and declarations together. Run `npm test` for the shared guest
+corpus, independent Node filesystem comparisons, and resource-limit regressions.

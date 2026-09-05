@@ -71,7 +71,7 @@ pub struct CommandContext {
 pub struct CommandResult {
     /// Process-like exit code.
     pub exit_code: i32,
-    /// Peak WebAssembly memory observed by JS commands.
+    /// Peak WebAssembly memory observed by JS or jq commands.
     pub peak_wasm_memory_bytes: Option<usize>,
 }
 
@@ -112,10 +112,22 @@ pub struct Limits {
     pub stderr_bytes: usize,
     /// Maximum simple commands that one parsed program may execute.
     pub max_commands: usize,
+    /// Maximum shell source bytes admitted before parsing.
+    pub shell_input_bytes: usize,
+    /// Maximum bytes materialized by a whole-file or host-input operation.
+    pub host_input_bytes: usize,
+    /// Maximum simultaneously open files in one execution.
+    pub max_open_files: usize,
+    /// Maximum normalized path depth (also bounded by the VFS hard limit of 256).
+    pub max_path_depth: usize,
+    /// Maximum bytes retained by the `tail` window.
+    pub tail_input_bytes: usize,
     /// Maximum bytes accepted by `sort` before it fails.
     pub sort_input_bytes: usize,
     /// Maximum bytes accepted by `jq` before it fails.
     pub jq_input_bytes: usize,
+    /// Maximum jq guest linear memory, including its stack and intermediate values.
+    pub jq_memory_bytes: usize,
     /// Maximum WebAssembly memory for JS commands.
     pub wasm_memory_bytes: usize,
     /// Maximum bytes accepted from a JavaScript fetch response body.
@@ -129,8 +141,14 @@ impl Default for Limits {
             stdout_bytes: 1024 * 1024,
             stderr_bytes: 1024 * 1024,
             max_commands: 1024,
+            shell_input_bytes: 1024 * 1024,
+            host_input_bytes: 8 * 1024 * 1024,
+            max_open_files: 1024,
+            max_path_depth: 256,
+            tail_input_bytes: 8 * 1024 * 1024,
             sort_input_bytes: 8 * 1024 * 1024,
             jq_input_bytes: 8 * 1024 * 1024,
+            jq_memory_bytes: 64 * 1024 * 1024,
             wasm_memory_bytes: 64 * 1024 * 1024,
             fetch_response_bytes: 32 * 1024 * 1024,
         }

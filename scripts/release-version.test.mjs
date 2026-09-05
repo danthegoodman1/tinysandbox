@@ -137,24 +137,51 @@ test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) =
   }
 })
 
-test("placeholder optional entries only survive npm ci while the version is unpublished", (t) => {
+test("placeholder optional entries survive npm ci when an offline cache has no package metadata", (t) => {
   const repoRoot = createFixtureRepo(t)
   const nodeRoot = join(repoRoot, "tinysandbox-node")
 
-  // 1.4.0 does not exist on npm, so the placeholder entries `applyVersion`
-  // writes are accepted: npm cannot resolve the optional packages at all.
+  // An empty offline cache makes the package deterministically unavailable,
+  // independent of what versions have since been published to the registry.
   applyVersion("1.4.0", repoRoot)
   execFileSync(
     process.platform === "win32" ? "npm.cmd" : "npm",
-    ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", join(repoRoot, ".npm-cache")],
-    { cwd: nodeRoot, stdio: "pipe" }
+    ["ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund", "--cache", join(repoRoot, ".npm-cache")],
+    { cwd: nodeRoot, stdio: "pipe", timeout: 30_000 }
   )
 
-  // This is the whole reason the release workflow refreshes the lockfile after
-  // publishing. Once the version resolves, the same placeholders fail the
-  // clean install, which is what broke CI after 0.4.7 and 0.4.8 shipped.
   const lockfilePath = join(nodeRoot, "package-lock.json")
   const lockfile = JSON.parse(readFileSync(lockfilePath, "utf8"))
+  for (const name of nativePackageNames) {
+    assert.deepEqual(lockfile.packages[`node_modules/${name}`], { optional: true })
+  }
+})
+
+// Opt in separately when checking actual registry/CLI interoperability:
+// TINYSANDBOX_TEST_LIVE_NPM=1 node --test --test-name-pattern='live registry:' scripts/release-version.test.mjs
+test("live registry: unavailable optional package versions allow placeholder entries", {
+  skip: process.env.TINYSANDBOX_TEST_LIVE_NPM !== "1"
+}, (t) => {
+  const repoRoot = createFixtureRepo(t)
+  const nodeRoot = join(repoRoot, "tinysandbox-node")
+  // Avoid depending on a fixed future release (such as 1.4.0) staying absent.
+  const version = `0.0.${Date.now()}`
+  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
+  const registryArgs = ["--fetch-retries=0", "--fetch-timeout=10000", "--cache", join(repoRoot, ".npm-cache")]
+  // npm ci can skip optional dependencies after transport errors too. Require
+  // a real registry 404 so an unreachable registry cannot make this pass.
+  assert.throws(() => execFileSync(
+    npm,
+    ["view", `${nativePackageNames[0]}@${version}`, "version", "--json", ...registryArgs],
+    { cwd: nodeRoot, stdio: "pipe", timeout: 15_000 }
+  ), (err) => /E404/u.test(String(err.stderr)))
+  applyVersion(version, repoRoot)
+  execFileSync(
+    npm,
+    ["ci", "--ignore-scripts", "--no-audit", "--no-fund", ...registryArgs],
+    { cwd: nodeRoot, stdio: "pipe", timeout: 60_000 }
+  )
+  const lockfile = JSON.parse(readFileSync(join(nodeRoot, "package-lock.json"), "utf8"))
   for (const name of nativePackageNames) {
     assert.deepEqual(lockfile.packages[`node_modules/${name}`], { optional: true })
   }

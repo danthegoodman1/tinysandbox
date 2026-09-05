@@ -55,15 +55,19 @@ function wrapCommands(commands) {
   return Object.fromEntries(
     Object.entries(commands).map(([name, command]) => [
       name,
-      async (call) => {
+      async (call, nativeContext) => {
+        const host = callbackContext(call, nativeContext)
         try {
+          host.context.signal.throwIfAborted()
           const payload = firstArgument(call)
-          return normalizeCommandOutput(await command(payload))
+          return normalizeCommandOutput(await command({ ...payload, ...host.context }))
         } catch (err) {
           return {
             exitCode: 1,
             stderr: Buffer.from(`${err?.message ?? err}\n`)
           }
+        } finally {
+          host.dispose()
         }
       }
     ])
@@ -77,11 +81,15 @@ function wrapGlobals(globals) {
       if (typeof global !== 'function') throw new TypeError(`global '${name}' must be a function`)
       return [
         name,
-        async (args) => {
+        async (args, nativeContext) => {
+          const host = callbackContext(args, nativeContext)
           try {
-            return { value: normalizeJsonValue(await global(firstArgument(args))) }
+            host.context.signal.throwIfAborted()
+            return { value: normalizeJsonValue(await global(firstArgument(args), host.context)) }
           } catch (err) {
             return { error: callbackErrorPayload(err) }
+          } finally {
+            host.dispose()
           }
         }
       ]
@@ -91,11 +99,46 @@ function wrapGlobals(globals) {
 
 function wrapFetch(fetch) {
   if (typeof fetch !== 'function') throw new TypeError('fetch must be a function')
-  return async (request) => {
+  return async (request, nativeContext) => {
+    const host = callbackContext(request, nativeContext)
     try {
-      return { response: normalizeFetchResponse(await fetch(normalizeFetchRequest(firstArgument(request)))) }
+      host.context.signal.throwIfAborted()
+      return { response: normalizeFetchResponse(await fetch(normalizeFetchRequest(firstArgument(request)), host.context)) }
     } catch (err) {
       return { error: callbackErrorPayload(err) }
+    } finally {
+      host.dispose()
+    }
+  }
+}
+
+function callbackContext(value, nativeContext) {
+  const native = value && typeof value === 'object' && Object.hasOwn(value, '0') ? value[1] : nativeContext
+  const controller = new AbortController()
+  let active = true
+  const abort = () => controller.abort(new DOMException('Host callback cancelled', 'AbortError'))
+  const isCancelled = () => {
+    if (native.isCancelled()) abort()
+    return controller.signal.aborted
+  }
+  isCancelled()
+  // Subscribe to the Rust invocation's actual cancellation state. Disposing
+  // resolves this subscription after settlement; no independent timer survives.
+  native.cancelled().then((cancelled) => { if (active && cancelled) abort() })
+  return {
+    context: Object.freeze({
+      signal: controller.signal,
+      deadlineMs: native.deadlineMs ?? null,
+      remainingTimeMs: () => {
+        isCancelled()
+        return native.remainingTimeMs() ?? null
+      },
+      isCancelled
+    }),
+    dispose: () => {
+      active = false
+      native.dispose()
+      controller.abort(new DOMException('Host callback completed', 'AbortError'))
     }
   }
 }

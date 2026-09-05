@@ -13,8 +13,8 @@ use napi_derive::napi;
 use serde_json::Value;
 use tinysandbox::sandbox::{
     Command, CommandContext, CommandFuture, CommandResult, ExecResult as CoreExecResult,
-    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostError, JsGlobalError,
-    JsGlobalFuture, JsGlobals, Limits, Sandbox as CoreSandbox,
+    FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostContext, HostError,
+    JsGlobalError, JsGlobalFuture, JsGlobals, Limits, Sandbox as CoreSandbox,
 };
 use tinysandbox::vfs::{
     DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
@@ -23,16 +23,30 @@ use tinysandbox::vfs::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type JsCommandCallback = Arc<
-    ThreadsafeFunction<CommandCall, Promise<CommandOutput>, (CommandCall,), Status, false, true>,
+    ThreadsafeFunction<
+        (CommandCall, HostContext),
+        Promise<CommandOutput>,
+        (CommandCall, NativeHostContext),
+        Status,
+        false,
+        true,
+    >,
 >;
 type JsGlobalCallback = Arc<
-    ThreadsafeFunction<Value, Promise<JsGlobalCallbackResponse>, (Value,), Status, false, true>,
+    ThreadsafeFunction<
+        (Value, HostContext),
+        Promise<JsGlobalCallbackResponse>,
+        (Value, NativeHostContext),
+        Status,
+        false,
+        true,
+    >,
 >;
 type JsFetchCallback = Arc<
     ThreadsafeFunction<
-        FetchRequest,
+        (FetchRequest, HostContext),
         Promise<FetchCallbackResponse>,
-        (FetchRequest,),
+        (FetchRequest, NativeHostContext),
         Status,
         false,
         true,
@@ -43,6 +57,70 @@ type JsVfsCallback =
 type JsVfsFactoryCallback =
     Arc<ThreadsafeFunction<VfsQuotaJs, Promise<JsVfsHandle>, (VfsQuotaJs,), Status, false, true>>;
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Internal bridge for the JavaScript callback's cooperative cancellation signal.
+#[napi]
+pub struct NativeHostContext {
+    context: HostContext,
+    disposed: tokio::sync::watch::Sender<bool>,
+    deadline_ms: Option<f64>,
+}
+
+impl NativeHostContext {
+    fn new(context: HostContext) -> Self {
+        let deadline_ms = context.remaining().map(|remaining| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+                + remaining.as_secs_f64() * 1000.0
+        });
+        Self {
+            context,
+            disposed: tokio::sync::watch::channel(false).0,
+            deadline_ms,
+        }
+    }
+}
+
+#[napi]
+impl NativeHostContext {
+    #[napi(getter)]
+    pub fn deadline_ms(&self) -> Option<f64> {
+        self.deadline_ms
+    }
+
+    #[napi]
+    pub fn remaining_time_ms(&self) -> Option<f64> {
+        self.context
+            .remaining()
+            .map(|remaining| remaining.as_secs_f64() * 1000.0)
+    }
+
+    #[napi]
+    pub fn is_cancelled(&self) -> bool {
+        self.context.is_cancelled()
+    }
+
+    /// True when the execution/callback ends; false when the wrapper disposes its subscription.
+    #[napi]
+    pub async fn cancelled(&self) -> bool {
+        let mut disposed = self.disposed.subscribe();
+        if *disposed.borrow() {
+            return false;
+        }
+        tokio::select! {
+            _ = self.context.cancelled() => true,
+            _ = disposed.changed() => false,
+        }
+    }
+
+    #[napi]
+    pub fn dispose(&self) {
+        self.disposed.send_replace(true);
+    }
+}
 
 #[napi]
 pub const PROMPT_OVERVIEW: &str = tinysandbox::prompts::OVERVIEW;
@@ -67,10 +145,14 @@ pub fn precompile_js() -> Result<Buffer> {
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
 }
 
-/// Installs a `precompileJs` artifact as this process's JavaScript runtime.
+/// Installs a trusted `precompileJs` artifact as this process's JavaScript runtime.
+/// The caller must guarantee authenticity and matching build/target; accepting
+/// untrusted bytes here permits arbitrary native code execution.
 #[napi]
 pub fn use_precompiled_js(artifact: Buffer) -> Result<()> {
-    tinysandbox::js::use_precompiled(&artifact)
+    // SAFETY: this host-only API explicitly requires an authentic, compatible
+    // artifact from precompileJs; callers must never supply guest/untrusted bytes.
+    unsafe { tinysandbox::js::use_precompiled(&artifact) }
         .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
 }
 
@@ -145,18 +227,23 @@ impl Sandbox {
                 builder = builder.js_prelude(js_prelude);
             }
             if options.has_named_property("fetch")? {
-                let fetch: Function<'_, (FetchRequest,), Promise<FetchCallbackResponse>> =
-                    options.get_named_property("fetch")?;
+                let fetch: Function<
+                    '_,
+                    (FetchRequest, NativeHostContext),
+                    Promise<FetchCallbackResponse>,
+                > = options.get_named_property("fetch")?;
                 let callback = Arc::new(
                     fetch
-                        .build_threadsafe_function::<FetchRequest>()
+                        .build_threadsafe_function::<(FetchRequest, HostContext)>()
                         .callee_handled::<false>()
                         .weak::<true>()
-                        .build_callback(|ctx| Ok((ctx.value,)))?,
+                        .build_callback(|ctx| {
+                            Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)))
+                        })?,
                 );
-                builder = builder.fetch(move |request| {
+                builder = builder.fetch_with_context(move |request, context| {
                     let callback = Arc::clone(&callback);
-                    async move { call_js_fetch(callback, request).await }
+                    async move { call_js_fetch(callback, request, context).await }
                 });
             }
             if let Some(mounts) = get_optional_object(&options, "mounts")? {
@@ -207,19 +294,29 @@ impl Sandbox {
             }
             if let Some(commands) = get_optional_object(&options, "commands")? {
                 for name in Object::keys(&commands)? {
-                    let callback: Function<'_, (CommandCall,), Promise<CommandOutput>> =
-                        commands.get_named_property(&name)?;
+                    let callback: Function<
+                        '_,
+                        (CommandCall, NativeHostContext),
+                        Promise<CommandOutput>,
+                    > = commands.get_named_property(&name)?;
                     let callback = callback
-                        .build_threadsafe_function::<CommandCall>()
+                        .build_threadsafe_function::<(CommandCall, HostContext)>()
                         .callee_handled::<false>()
                         .weak::<true>()
-                        .build_callback(|ctx| Ok((ctx.value,)))?;
+                        .build_callback(|ctx| {
+                            Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)))
+                        })?;
                     builder = builder.command_obj(
                         name,
                         JsCommand {
                             callback: Arc::new(callback),
                         },
                     );
+                }
+            }
+            if let Some(disabled) = get_optional::<Vec<String>>(&options, "disabledCommands")? {
+                for name in disabled {
+                    builder = builder.without_command(&name);
                 }
             }
         }
@@ -242,9 +339,9 @@ impl Sandbox {
     pub fn set_js_global(
         &self,
         name: String,
-        global: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>>,
+        global: Function<'_, (Value, NativeHostContext), Promise<JsGlobalCallbackResponse>>,
     ) -> Result<()> {
-        let globals = JsGlobals::new().with(name, js_global_handler(global)?);
+        let globals = JsGlobals::new().with_context(name, js_global_handler(global)?);
         self.inner
             .extend_js_globals(globals)
             .map_err(|err| js_global_error("setJsGlobal", &err))
@@ -467,6 +564,9 @@ impl SandboxFs {
         let offset = u64_from_js(offset).map_err(|err| napi_vfs_error(err, None))?;
         let len = usize_from_js(len).map_err(|err| napi_vfs_error(err, None))?;
         let fs = self.sandbox.fs();
+        if len > fs.max_io_bytes() {
+            return Err(napi_vfs_error(VfsError::new(Errno::EFBIG), None));
+        }
         fs.read_at(handle, offset, vec![0; len])
             .await
             .map(|(mut data, read)| {
@@ -481,6 +581,9 @@ impl SandboxFs {
         let handle = handle_from_js(handle).map_err(|err| napi_vfs_error(err, None))?;
         let offset = u64_from_js(offset).map_err(|err| napi_vfs_error(err, None))?;
         let fs = self.sandbox.fs();
+        if data.len() > fs.max_io_bytes() {
+            return Err(napi_vfs_error(VfsError::new(Errno::EFBIG), None));
+        }
         fs.write_at(handle, offset, data.to_vec())
             .await
             .map(|written| written as f64)
@@ -517,10 +620,21 @@ impl Command for JsCommand {
         let callback = Arc::clone(&self.callback);
         Box::pin(async move {
             let mut stdin = Vec::new();
-            if ctx.stdin.read_to_end(&mut stdin).await.is_err() {
+            let limit = ctx.limits.host_input_bytes;
+            if ctx
+                .stdin
+                .take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut stdin)
+                .await
+                .is_err()
+            {
                 return CommandResult::failure();
             }
 
+            if stdin.len() > limit {
+                return write_command_error(ctx.stderr, "host command input limit exceeded".into())
+                    .await;
+            }
             let call = CommandCall {
                 args: ctx.args,
                 env: ctx.env.into_iter().collect(),
@@ -528,7 +642,10 @@ impl Command for JsCommand {
                 stdin: Buffer::from(stdin),
             };
 
-            let output = match callback.call_async_catch(call).await {
+            let output = match callback
+                .call_async_catch((call, ctx.fs.host_context()))
+                .await
+            {
                 Ok(promise) => match promise.await {
                     Ok(output) => output,
                     Err(err) => return write_command_error(ctx.stderr, err.reason).await,
@@ -536,6 +653,21 @@ impl Command for JsCommand {
                 Err(err) => return write_command_error(ctx.stderr, err.reason).await,
             };
 
+            if output
+                .stdout
+                .as_ref()
+                .is_some_and(|bytes| bytes.len() > limit)
+                || output
+                    .stderr
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.len() > limit)
+            {
+                return write_command_error(
+                    ctx.stderr,
+                    "host command output limit exceeded".into(),
+                )
+                .await;
+            }
             if let Some(stdout) = output.stdout
                 && ctx.stdout.write_all(&stdout).await.is_err()
             {
@@ -564,26 +696,26 @@ async fn write_command_error(
 fn js_globals_from_object(globals: &Object<'_>) -> Result<JsGlobals> {
     let mut set = JsGlobals::new();
     for name in Object::keys(globals)? {
-        let callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>> =
+        let callback: Function<'_, (Value, NativeHostContext), Promise<JsGlobalCallbackResponse>> =
             globals.get_named_property(&name)?;
-        set = set.with(name, js_global_handler(callback)?);
+        set = set.with_context(name, js_global_handler(callback)?);
     }
     Ok(set)
 }
 
 fn js_global_handler(
-    callback: Function<'_, (Value,), Promise<JsGlobalCallbackResponse>>,
-) -> Result<impl Fn(Value) -> JsGlobalFuture + Send + Sync + use<>> {
+    callback: Function<'_, (Value, NativeHostContext), Promise<JsGlobalCallbackResponse>>,
+) -> Result<impl Fn(Value, HostContext) -> JsGlobalFuture + Send + Sync + use<>> {
     let callback = Arc::new(
         callback
-            .build_threadsafe_function::<Value>()
+            .build_threadsafe_function::<(Value, HostContext)>()
             .callee_handled::<false>()
             .weak::<true>()
-            .build_callback(|ctx| Ok((ctx.value,)))?,
+            .build_callback(|ctx| Ok((ctx.value.0, NativeHostContext::new(ctx.value.1))))?,
     );
-    Ok(move |args: Value| {
+    Ok(move |args: Value, context: HostContext| {
         let callback = Arc::clone(&callback);
-        Box::pin(async move { call_js_global(callback, args).await }) as JsGlobalFuture
+        Box::pin(async move { call_js_global(callback, args, context).await }) as JsGlobalFuture
     })
 }
 
@@ -594,9 +726,10 @@ fn js_global_error(context: &str, err: &JsGlobalError) -> Error {
 async fn call_js_global(
     callback: JsGlobalCallback,
     args: Value,
+    context: HostContext,
 ) -> std::result::Result<Value, HostError> {
     let promise = callback
-        .call_async_catch(args)
+        .call_async_catch((args, context))
         .await
         .map_err(|err| HostError::new(err.reason))?;
     let response = promise.await.map_err(|err| HostError::new(err.reason))?;
@@ -609,9 +742,10 @@ async fn call_js_global(
 async fn call_js_fetch(
     callback: JsFetchCallback,
     request: CoreFetchRequest,
+    context: HostContext,
 ) -> std::result::Result<CoreFetchResponse, HostError> {
     let promise = callback
-        .call_async_catch(FetchRequest::from(request))
+        .call_async_catch((FetchRequest::from(request), context))
         .await
         .map_err(|err| HostError::new(err.reason))?;
     let response = promise.await.map_err(|err| HostError::new(err.reason))?;
@@ -905,7 +1039,7 @@ impl Vfs for JsVfsHandle {
     }
 }
 
-#[napi]
+#[napi(ts_return_type = "ExternalObject<unknown>")]
 pub fn create_js_vfs(vfs: Object<'_>) -> Result<External<JsVfsExternal>> {
     Ok(External::new(JsVfsExternal {
         inner: Arc::new(JsVfs::new(vfs)?),
@@ -981,7 +1115,7 @@ impl Task for ConformanceTask {
     }
 }
 
-#[napi]
+#[napi(ts_args_type = "factory: (arg: [VfsQuotaJs]) => Promise<ExternalObject<unknown>>")]
 pub fn run_conformance(
     factory: Function<'_, (VfsQuotaJs,), Promise<JsVfsHandle>>,
 ) -> Result<AsyncTask<ConformanceTask>> {
@@ -1294,7 +1428,8 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
                 "wallTimeMs must be a finite non-negative number".to_owned(),
             ));
         }
-        parsed.wall_time = Duration::from_secs_f64(ms / 1000.0);
+        parsed.wall_time = Duration::try_from_secs_f64(ms / 1000.0)
+            .map_err(|_| Error::new(Status::InvalidArg, "wallTimeMs is out of range"))?;
     }
     if let Some(bytes) = get_optional::<f64>(&limits, "stdoutBytes")? {
         parsed.stdout_bytes = usize_from_number(bytes)?;
@@ -1305,11 +1440,29 @@ fn parse_limits(limits: Object<'_>) -> Result<Limits> {
     if let Some(commands) = get_optional::<f64>(&limits, "maxCommands")? {
         parsed.max_commands = usize_from_number(commands)?;
     }
+    if let Some(value) = get_optional::<f64>(&limits, "shellInputBytes")? {
+        parsed.shell_input_bytes = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "hostInputBytes")? {
+        parsed.host_input_bytes = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "maxOpenFiles")? {
+        parsed.max_open_files = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "maxPathDepth")? {
+        parsed.max_path_depth = usize_from_number(value)?;
+    }
+    if let Some(value) = get_optional::<f64>(&limits, "tailInputBytes")? {
+        parsed.tail_input_bytes = usize_from_number(value)?;
+    }
     if let Some(bytes) = get_optional::<f64>(&limits, "sortInputBytes")? {
         parsed.sort_input_bytes = usize_from_number(bytes)?;
     }
     if let Some(bytes) = get_optional::<f64>(&limits, "jqInputBytes")? {
         parsed.jq_input_bytes = usize_from_number(bytes)?;
+    }
+    if let Some(bytes) = get_optional::<f64>(&limits, "jqMemoryBytes")? {
+        parsed.jq_memory_bytes = usize_from_number(bytes)?;
     }
     if let Some(bytes) = get_optional::<f64>(&limits, "wasmMemoryBytes")? {
         parsed.wasm_memory_bytes = usize_from_number(bytes)?;

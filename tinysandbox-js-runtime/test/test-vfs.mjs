@@ -66,15 +66,12 @@ export class TestVfs {
 
   rename(from, to) {
     this.record("rename", from, to);
-    const source = this.node(from);
+    this.node(from);
     if (this.nodes.has(to)) throw new VfsError("EEXIST");
     if (this.node(parent(to)).fileType !== "directory") throw new VfsError("ENOTDIR");
     const moved = [...this.nodes.entries()].filter(([path]) => path === from || path.startsWith(`${from}/`));
     for (const [path] of moved) this.nodes.delete(path);
     for (const [path, node] of moved) this.nodes.set(`${to}${path.slice(from.length)}`, node);
-    if (source.fileType === "file") {
-      for (const handle of this.handles.values()) if (handle.path === from) handle.path = to;
-    }
   }
 
   unlink(path) {
@@ -104,7 +101,7 @@ export class TestVfs {
     }
     if (mode.truncate) node.data = new Uint8Array();
     const handle = this.nextHandle++;
-    this.handles.set(handle, { path, mode });
+    this.handles.set(handle, { path, mode, node });
     return handle;
   }
 
@@ -118,7 +115,7 @@ export class TestVfs {
   readAt(handle, offset, buffer) {
     this.record("readAt", handle, offset, buffer.byteLength);
     const opened = this.opened(handle, "read");
-    const data = this.node(opened.path).data;
+    const data = opened.node.data;
     const count = Math.min(buffer.byteLength, Math.max(0, data.byteLength - offset));
     buffer.set(data.subarray(offset, offset + count));
     return count;
@@ -127,7 +124,7 @@ export class TestVfs {
   writeAt(handle, offset, data) {
     this.record("writeAt", handle, offset, data.byteLength);
     const opened = this.opened(handle, "write");
-    const node = this.node(opened.path);
+    const node = opened.node;
     const writeOffset = opened.mode.append ? node.data.byteLength : offset;
     const output = new Uint8Array(Math.max(node.data.byteLength, writeOffset + data.byteLength));
     output.set(node.data);
@@ -139,7 +136,7 @@ export class TestVfs {
   truncate(handle, len) {
     this.record("truncate", handle, len);
     const opened = this.opened(handle, "write");
-    const node = this.node(opened.path);
+    const node = opened.node;
     const output = new Uint8Array(len);
     output.set(node.data.subarray(0, len));
     node.data = output;

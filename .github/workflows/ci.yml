@@ -9,6 +9,40 @@ permissions:
   contents: read
 
 jobs:
+  jq-guest:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.0
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: guests/jq
+          key: jq-guest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - run: cargo fmt --manifest-path guests/jq/Cargo.toml --check
+      - run: cargo test --manifest-path guests/jq/Cargo.toml --locked
+      - run: cargo clippy --manifest-path guests/jq/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Verify the checked-in guest is reproducible
+        id: rebuild
+        run: |
+          scripts/build-jq-wasm.sh
+          sha256sum assets/jq.wasm
+          git diff --exit-code -- assets/jq.wasm
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure() && steps.rebuild.outcome == 'failure'
+        with:
+          name: jq-guest-rebuild-mismatch
+          path: assets/jq.wasm
+          retention-days: 7
+      - run: node --test guests/jq/abi.test.mjs
+
   rust-release-gates:
     runs-on: ubuntu-26.04
 
@@ -30,8 +64,12 @@ jobs:
           node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"
       - run: cargo fmt --all --check
       - run: cargo test --workspace --all-features --locked
-      - run: cargo build --workspace --no-default-features --locked
-      - run: cargo test --workspace --no-default-features --locked
+      # Select the core package alone: the Node workspace member enables JS
+      # and S3 on its dependency even with workspace --no-default-features.
+      - name: Test core without optional features, including doctests
+        run: cargo test -p tinysandbox --no-default-features --locked
+      - name: Test core with default features, including doctests
+        run: cargo test -p tinysandbox --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
       - run: cargo publish --dry-run --locked -p tinysandbox
@@ -151,6 +189,8 @@ jobs:
         run: npm install -g npm@11.12.1
       - run: npm ci
         working-directory: tinysandbox-node
+      - name: Test local filesystem containment and conformance on macOS
+        run: cargo test -p tinysandbox --no-default-features --locked --test vfs_local --test vfs_conformance
       - run: npm test
         working-directory: tinysandbox-node
       - run: npm run examples
