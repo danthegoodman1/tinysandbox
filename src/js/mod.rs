@@ -16,16 +16,14 @@
 //! still reflect QuickJS details: wrapper prefixes leave a line-1 column offset, method frames are named like `at boom`,
 //! and visible `<tinysandbox>` glue frames can appear below user frames.
 //!
-//! `quickjs.wasm` is machine code by the time a script runs. The build script
-//! compiles it for this crate's target and the module embeds the result, so the
-//! first `js` command loads it rather than running Cranelift. [`precompile`]
-//! and [`use_precompiled`] produce and install an artifact by hand, for a
-//! different machine or a differently built process, and
-//! [`runtime_source`] reports which path a process ended up on.
+//! The build script precompiles `quickjs.wasm` for this crate's target. The
+//! runtime loads that embedded artifact, falling back to compiling the fixed
+//! Wasm module when necessary. Applications configure the sandbox, not the
+//! engine or native artifacts.
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,13 +42,12 @@ use crate::sandbox::fs::{Fs, join_path};
 use crate::sandbox::host::{Fetch, FetchRequest, FetchResponse, HostError, JsGlobal};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
-include!("engine_config.rs");
+use crate::wasm::EPOCH_TICK;
 
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
 /// Machine code for [`QUICKJS_WASM`], produced by `build.rs` for this target.
 #[cfg(quickjs_precompiled)]
 const QUICKJS_CWASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quickjs.cwasm"));
-const EPOCH_TICK: Duration = Duration::from_millis(5);
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 const QUICKJS_INITIAL_MEMORY_PAGES: u32 = 19;
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
@@ -59,7 +56,7 @@ const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_CONCURRENT_JS: usize = 16;
 
 /// Registers the `js` command in a sandbox command registry.
-pub fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
+pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     commands.insert("js".to_owned(), Arc::new(js_command));
 }
 
@@ -442,187 +439,30 @@ fn epoch_ticks(wall_time: Duration) -> u64 {
 struct CompiledRuntime {
     engine: Engine,
     module: Module,
-    source: RuntimeSource,
 }
 
 static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
-static RUNTIME_INIT: Mutex<()> = Mutex::new(());
 
 fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
-    if let Some(runtime) = RUNTIME.get() {
-        return runtime
-            .as_ref()
-            .map_err(|err| wasmtime::Error::msg(err.to_string()));
-    }
-    let _init = RUNTIME_INIT
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
     RUNTIME
         .get_or_init(|| {
-            let engine = Engine::new(&quickjs_engine_config(None)?)?;
-            let (module, source) = load_module(&engine)?;
-            link_runtime(engine, module, source)
+            let engine = crate::wasm::engine()?.clone();
+            let module = load_module(&engine)?;
+            Ok(CompiledRuntime { engine, module })
         })
         .as_ref()
         .map_err(|err| wasmtime::Error::msg(err.to_string()))
 }
 
-/// Where the machine code backing the JavaScript runtime came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeSource {
-    /// Loaded from the artifact the build script precompiled, or from one
-    /// installed with [`use_precompiled`].
-    Precompiled,
-    /// Compiled in this process, the slow path the build normally avoids.
-    Compiled,
-}
-
-/// Reports where this process's JavaScript runtime came from, initializing it
-/// if no `js` command has run yet.
-///
-/// [`RuntimeSource::Compiled`] means the process paid for compilation: the
-/// build script produced no artifact, or the one it produced was rejected by
-/// this engine.
-pub fn runtime_source() -> Result<RuntimeSource, PrecompileError> {
-    compiled_runtime()
-        .map(|runtime| runtime.source)
-        .map_err(|err| PrecompileError::new(err.to_string()))
-}
-
-fn engine() -> Result<Engine, PrecompileError> {
-    quickjs_engine_config(None)
-        .and_then(|config| Engine::new(&config))
-        .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))
-}
-
-/// Loads the module, preferring the build script's artifact.
-///
-/// A rejected artifact is not an error: an engine or CPU the build did not
-/// target falls back to compiling, which is slower but correct.
-fn load_module(engine: &Engine) -> wasmtime::Result<(Module, RuntimeSource)> {
+/// Loads the module, preferring the build script's trusted artifact.
+fn load_module(engine: &Engine) -> wasmtime::Result<Module> {
     #[cfg(quickjs_precompiled)]
     // SAFETY: build.rs generated these embedded bytes from our fixed guest.
     #[allow(unsafe_code)]
-    if let Ok(module) = unsafe { deserialize_module(engine, QUICKJS_CWASM) } {
-        return Ok((module, RuntimeSource::Precompiled));
+    if let Ok(module) = unsafe { Module::deserialize(engine, QUICKJS_CWASM) } {
+        return Ok(module);
     }
-    Module::new(engine, QUICKJS_WASM).map(|module| (module, RuntimeSource::Compiled))
-}
-
-#[allow(unsafe_code)]
-unsafe fn deserialize_module(engine: &Engine, artifact: &[u8]) -> wasmtime::Result<Module> {
-    // SAFETY: the caller guarantees authentic, unmodified Wasmtime output.
-    // Header and CPU checks alone cannot establish that safety requirement.
-    unsafe { Module::deserialize(engine, artifact) }
-}
-
-fn link_runtime(
-    engine: Engine,
-    module: Module,
-    source: RuntimeSource,
-) -> wasmtime::Result<CompiledRuntime> {
-    start_epoch_thread(engine.clone())?;
-    Ok(CompiledRuntime {
-        engine,
-        module,
-        source,
-    })
-}
-
-/// Error from the precompiled-runtime APIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrecompileError {
-    message: String,
-}
-
-impl PrecompileError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for PrecompileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for PrecompileError {}
-
-/// Compiles the embedded QuickJS module and returns the machine-code artifact.
-///
-/// The build script already does this for the crate's own target, so a normal
-/// build never runs Cranelift at runtime. Use this to produce an artifact
-/// yourself: to target a different machine, or to share one across processes
-/// that build separately.
-///
-/// The engine here matches the one the runtime uses, so the artifact loads
-/// through [`use_precompiled`] on any machine of the same architecture.
-///
-/// The artifact is tied to this Wasmtime version and to the CPU features of the
-/// machine it targets; Wasmtime rejects a mismatched artifact rather than
-/// running it, so treat it as a build output, never as a portable asset.
-pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
-    engine()?
-        .precompile_module(QUICKJS_WASM)
-        .map_err(|err| PrecompileError::new(format!("precompile quickjs module: {err}")))
-}
-
-/// Installs an artifact from [`precompile`] as this process's JavaScript
-/// runtime, in place of the one the build script embedded.
-///
-/// Call it before the first `js` command: the runtime is initialized once per
-/// process, so a later call fails and leaves the existing runtime in place. A
-/// stale or foreign artifact fails here too, which is the signal to fall back to
-/// the normal path and let the next `js` command compile the module.
-///
-/// # Safety
-///
-/// `artifact` must be the unmodified output of [`precompile`] from a trusted
-/// build. Wasmtime executes these bytes as native machine code: compatibility
-/// checks do not validate their safety. Never accept artifacts from untrusted
-/// input or storage that an attacker can modify.
-///
-/// ```compile_fail
-/// // A raw artifact cannot be installed through safe Rust.
-/// tinysandbox::js::use_precompiled(&[]).unwrap();
-/// ```
-#[allow(unsafe_code)]
-pub unsafe fn use_precompiled(artifact: &[u8]) -> Result<(), PrecompileError> {
-    let _init = RUNTIME_INIT
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if RUNTIME.get().is_some() {
-        return Err(PrecompileError::new(
-            "the JavaScript runtime is already initialized in this process",
-        ));
-    }
-    let engine = engine()?;
-    // SAFETY: this public unsafe function forwards the caller's trust contract.
-    let module = unsafe { deserialize_module(&engine, artifact) }
-        .map_err(|err| PrecompileError::new(format!("deserialize quickjs module: {err}")))?;
-    let runtime = link_runtime(engine, module, RuntimeSource::Precompiled)
-        .map_err(|err| PrecompileError::new(format!("link quickjs runtime: {err}")))?;
-    RUNTIME.set(Ok(runtime)).map_err(|_| {
-        PrecompileError::new("the JavaScript runtime is already initialized in this process")
-    })
-}
-
-fn start_epoch_thread(engine: Engine) -> wasmtime::Result<()> {
-    // Called only while holding RUNTIME_INIT, after a module is ready to become
-    // the process runtime. A losing installation can never capture the ticker.
-    thread::Builder::new()
-        .name("tinysandbox-js-epoch".to_owned())
-        .spawn(move || {
-            loop {
-                thread::sleep(EPOCH_TICK);
-                engine.increment_epoch();
-            }
-        })
-        .map_err(wasmtime::Error::new)?;
-    Ok(())
+    Module::new(engine, QUICKJS_WASM)
 }
 
 struct HostState {
@@ -1787,30 +1627,34 @@ fn usize_len(len: i32) -> wasmtime::Result<usize> {
 mod tests {
     use super::*;
 
+    #[cfg(quickjs_precompiled)]
     #[test]
-    fn concurrent_runtime_initialization_keeps_the_winning_engine_ticking() {
-        let artifact = Arc::new(precompile().expect("trusted artifact"));
+    fn embedded_artifact_matches_the_runtime_engine() {
+        // Check compatibility directly so a silent runtime compile fallback
+        // cannot hide a build/runtime configuration mismatch.
+        #[allow(unsafe_code)]
+        // SAFETY: the artifact is the fixed build output embedded in this crate.
+        unsafe { Module::deserialize(crate::wasm::engine().unwrap(), QUICKJS_CWASM) }
+            .expect("embedded QuickJS artifact is compatible");
+    }
+
+    #[test]
+    fn concurrent_runtime_initialization_keeps_the_engine_ticking() {
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let threads = (0..8)
-            .map(|index| {
-                let artifact = artifact.clone();
+            .map(|_| {
                 let barrier = barrier.clone();
                 thread::spawn(move || {
                     barrier.wait();
-                    if index % 2 == 0 {
-                        // SAFETY: the shared immutable bytes came from precompile.
-                        #[allow(unsafe_code)]
-                        let _ = unsafe { use_precompiled(&artifact) };
-                    } else {
-                        compiled_runtime().expect("initialize runtime");
-                    }
+                    compiled_runtime().expect("initialize runtime")
                 })
             })
             .collect::<Vec<_>>();
+        let runtime = compiled_runtime().expect("shared runtime");
         for thread in threads {
-            thread.join().expect("initialization did not panic");
+            let initialized = thread.join().expect("initialization did not panic");
+            assert!(std::ptr::eq(initialized, runtime));
         }
-        let runtime = compiled_runtime().expect("winning runtime");
         // A tiny module with one empty exported function checks epoch handling
         // at function entry. It cannot hang if the ticker is broken, and does
         // not rely on QuickJS's separate should_interrupt host callback.
@@ -1838,7 +1682,7 @@ mod tests {
             }
             assert!(
                 started.elapsed() < Duration::from_secs(1),
-                "winning engine has no ticker"
+                "shared engine has no ticker"
             );
         }
     }

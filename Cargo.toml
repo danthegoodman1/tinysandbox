@@ -31,8 +31,8 @@ rustix = { version = "1.1.4", features = ["fs"] }
 proptest = "1.11.0"
 tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt-multi-thread", "rt", "time", "io-util"] }
 
-# Used by build.rs to precompile the jq/QuickJS modules for the target, so no
-# process runs Cranelift. Shares the `wasmtime` name with the runtime
+# Used by build.rs to precompile the jq/QuickJS modules for the target, so
+# normal startup avoids compilation. Shares the `wasmtime` name with the runtime
 # dependency because Cargo allows a crate under one name per package.
 [build-dependencies]
 wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "std"] }
@@ -48,10 +48,6 @@ required-features = ["js"]
 
 [[example]]
 name = "js_globals"
-required-features = ["js"]
-
-[[example]]
-name = "js_precompiled"
 required-features = ["js"]
 
 [[example]]

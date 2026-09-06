@@ -66,6 +66,42 @@ async fn custom_commands_use_same_registry_and_pipelines_as_builtins() {
 }
 
 #[tokio::test]
+async fn removing_commands_disables_lookup_and_bin_without_session_effects() {
+    for (name, invocation) in [
+        ("cd", "cd /"),
+        ("export", "export FOO=changed"),
+        ("unset", "unset FOO"),
+        ("cat", "cat"),
+    ] {
+        let sandbox = Sandbox::builder()
+            .env("FOO", "original")
+            .persist_session(true)
+            .without_command(name)
+            .build();
+        assert!(
+            sandbox
+                .fs()
+                .readdir("/bin")
+                .await
+                .expect("list commands")
+                .iter()
+                .all(|entry| entry.name != name)
+        );
+
+        for input in [invocation.to_owned(), format!("echo input | {invocation}")] {
+            let result = sandbox.exec(&input).await;
+            assert_eq!(result.exit_code, 127, "{input}");
+            assert_eq!(result.stderr, format!("{name}: command not found\n"));
+        }
+        assert_eq!(
+            sandbox.exec("pwd; echo $FOO").await.stdout,
+            "/workspace\noriginal\n",
+            "disabled {name} must not affect the stored session"
+        );
+    }
+}
+
+#[tokio::test]
 async fn builtin_text_tools_match_supported_gnu_shapes() {
     // Covers representative supported flags for text builtins without relying
     // on host BSD/GNU tool availability.

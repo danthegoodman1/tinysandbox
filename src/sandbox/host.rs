@@ -14,9 +14,10 @@ use super::HostContext;
 use serde_json::Value;
 
 /// Future returned by host globals.
-pub type JsGlobalFuture = Pin<Box<dyn Future<Output = Result<Value, HostError>> + Send>>;
+pub(crate) type JsGlobalFuture = Pin<Box<dyn Future<Output = Result<Value, HostError>> + Send>>;
 /// Future returned by sandbox fetch handlers.
-pub type FetchFuture = Pin<Box<dyn Future<Output = Result<FetchResponse, HostError>> + Send>>;
+pub(crate) type FetchFuture =
+    Pin<Box<dyn Future<Output = Result<FetchResponse, HostError>> + Send>>;
 
 /// Request passed to an embedder-provided JavaScript `fetch` handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,15 +44,9 @@ pub struct FetchResponse {
 }
 
 /// Host function bound into the sandboxed JavaScript global scope.
-pub trait JsGlobal: Send + Sync {
-    /// Runs the global with the guest-provided JSON argument.
-    fn call(&self, args: Value) -> JsGlobalFuture;
-
+pub(crate) trait JsGlobal: Send + Sync {
     /// Runs with cooperative cancellation and the remaining host-call deadline.
-    /// Existing implementations continue to receive calls through [`Self::call`].
-    fn call_with_context(&self, args: Value, _context: HostContext) -> JsGlobalFuture {
-        self.call(args)
-    }
+    fn call_with_context(&self, args: Value, context: HostContext) -> JsGlobalFuture;
 }
 
 impl<F, Fut> JsGlobal for F
@@ -59,21 +54,15 @@ where
     F: Fn(Value) -> Fut + Send + Sync,
     Fut: Future<Output = Result<Value, HostError>> + Send + 'static,
 {
-    fn call(&self, args: Value) -> JsGlobalFuture {
+    fn call_with_context(&self, args: Value, _context: HostContext) -> JsGlobalFuture {
         Box::pin(self(args))
     }
 }
 
 /// Host transport implementation backing sandboxed JavaScript `fetch`.
-pub trait Fetch: Send + Sync {
-    /// Runs the fetch handler with the guest-provided request.
-    fn fetch(&self, request: FetchRequest) -> FetchFuture;
-
+pub(crate) trait Fetch: Send + Sync {
     /// Runs with cooperative cancellation and the remaining host-call deadline.
-    /// Existing implementations continue through [`Self::fetch`].
-    fn fetch_with_context(&self, request: FetchRequest, _context: HostContext) -> FetchFuture {
-        self.fetch(request)
-    }
+    fn fetch_with_context(&self, request: FetchRequest, context: HostContext) -> FetchFuture;
 }
 
 impl<F, Fut> Fetch for F
@@ -81,7 +70,7 @@ where
     F: Fn(FetchRequest) -> Fut + Send + Sync,
     Fut: Future<Output = Result<FetchResponse, HostError>> + Send + 'static,
 {
-    fn fetch(&self, request: FetchRequest) -> FetchFuture {
+    fn fetch_with_context(&self, request: FetchRequest, _context: HostContext) -> FetchFuture {
         Box::pin(self(request))
     }
 }
@@ -92,9 +81,6 @@ where
     F: Fn(Value, HostContext) -> Fut + Send + Sync,
     Fut: Future<Output = Result<Value, HostError>> + Send + 'static,
 {
-    fn call(&self, args: Value) -> JsGlobalFuture {
-        self.call_with_context(args, HostContext::unscoped())
-    }
     fn call_with_context(&self, args: Value, context: HostContext) -> JsGlobalFuture {
         Box::pin((self.0)(args, context))
     }
@@ -106,9 +92,6 @@ where
     F: Fn(FetchRequest, HostContext) -> Fut + Send + Sync,
     Fut: Future<Output = Result<FetchResponse, HostError>> + Send + 'static,
 {
-    fn fetch(&self, request: FetchRequest) -> FetchFuture {
-        self.fetch_with_context(request, HostContext::unscoped())
-    }
     fn fetch_with_context(&self, request: FetchRequest, context: HostContext) -> FetchFuture {
         Box::pin((self.0)(request, context))
     }

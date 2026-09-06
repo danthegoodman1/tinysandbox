@@ -47,7 +47,7 @@ they motivated an explicit policy, not an invented new escape.
 | ID | Finding | Outcome |
 | --- | --- | --- |
 | F01 | Replacing the local root could expose a sibling sentinel. | Descriptor-relative traversal, no symlinks/special files, race regressions, precise host-mutation contract. |
-| F02 | Safe Rust accepted bytes passed to unsafe native deserialization; initializer could publish the wrong ticker. | Unsafe artifact API, documented Node trust boundary, serialized initialization and epoch regression. |
+| F02 | Safe Rust accepted bytes passed to unsafe native deserialization; initializer could publish the wrong ticker. | External native-artifact APIs removed; automatic embedded artifacts and one shared engine/ticker retained. |
 | F03 | A JS command could start a new write after exec timed out; synchronous preparation could outlive its budget and report success. | Shared cancellation/deadline, worker admission, source/expansion gates, cancellation checkpoints and late-write tests. |
 | F04 | Unclosed JS descriptors pinned unlinked data; canceled opens/sinks lost ownership. | Scoped registries, RAII handoff, success close/failure abort, retained-capability and dropped-future tests. |
 | F05 | Both JS hosts clamped fd reads by a reused pathname and returned zero instead of six bytes. | Handle-based reads with independent real-Node comparison. |
@@ -61,8 +61,9 @@ they motivated an explicit policy, not an invented new escape.
 
 ## Decisions and compatibility
 
-- Rust `js::use_precompiled` is now unsafe. Node's host-only loader explicitly
-  requires authentic, compatible machine-code artifacts. Examples were migrated.
+- Manual native-artifact creation/loading and runtime-source diagnostics are
+  removed from Rust and Node. The build embeds trusted artifacts automatically;
+  JS and jq share one engine/ticker with independent guest state and limits.
 - New `Limits` fields and Node options bound shell source, host inputs, open
   files, path depth, and retained tail bytes. A pipeline's cumulative expansion
   budget is the larger of shell-source and host-input caps. Whole-file host
@@ -102,8 +103,8 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 14A: Descriptor-anchored local backend (F01) | `src/vfs/local.rs`, safe Unix rustix dependency; `tests/vfs_local.rs` covers root/ancestor replacement, sockets/FIFOs, depth and quota. |
-| Complete | Work | 14B: Explicit artifact trust API (F02) | `src/js/mod.rs`, `tinysandbox-node/src/lib.rs`, migrated Rust/README examples; compile-fail doctest rejects safe calls. |
-| Complete | Work | 14C: Atomic runtime/ticker initialization | Serialized initialization; controlled epoch-interruption unit test plus precompiled integration test. |
+| Complete | Work | 14B: Close external artifact loading (F02) | `src/js/mod.rs` loads only the build artifact or fixed Wasm; Node exposes no artifact API. Phase 23 verifies the simplified surface. |
+| Complete | Work | 14C: Atomic runtime/ticker initialization | One `src/wasm.rs` engine/ticker; embedded-artifact compatibility and concurrent initialization/epoch tests replace the manual-install test. |
 | Complete | Test / Gate | Phase 14 validation | Local/conformance, initialization and doctest suites pass; Linux containment also runs in CI. |
 
 ## Phase 15: Own executions and open resources through teardown
@@ -266,3 +267,26 @@ Status ledger:
 | Complete | Work | 22B: Trusted host callback context | `tests/host_context.rs` (6 tests), cancellation race unit tests, native callback tests and 29 portable tests verify deadlines, execution drop, settlement, legacy signatures, and no effects from expired queued callbacks. |
 | Complete | Work | 22C: Reproducible artifact, API and resource documentation | The canonical Linux x86_64 build and pinned Docker reproduction are documented in `guests/jq/README.md`; `benchmarks/JQ_ISOLATION.md` records measured 1.25–1.65× latency and guest memory; README documents required Wasmtime, UTC/empty-env semantics, caps and cooperative host limits. |
 | Complete | Test / Gate | Phase 22 validation | [CI run 33935000244](https://github.com/danthegoodman1/tinysandbox/actions/runs/33935000244) passed all eight jobs on implementation commit `3c3feed`: Rust feature matrix/Clippy/rustdoc/package, native Linux x64/arm64 and macOS arm64/Intel, live S3, portable Chrome/Convex, and the canonical byte-for-byte jq rebuild. Local checks include 56 native and 29 portable tests, 6 Rust context tests, guest memory/worker/backpressure regressions and both package smoke checks. [PR #24](https://github.com/danthegoodman1/tinysandbox/pull/24) tracks checks on subsequent documentation revisions. |
+
+
+## Phase 23: Remove obsolete APIs and duplicate runtime machinery
+
+Goal: Preserve normal sandbox execution and embedding while removing artifact
+management, accidental bridge exposure, and redundant dispatch mechanisms.
+
+Scope: 23A artifact/runtime cleanup, 23B public/bridge cleanup, 23C shell dispatch.
+
+Completion gate: Supported Rust configurations and native Node behavior pass;
+embedded artifacts remain compatible and guest memory/deadlines stay independent.
+
+Testing plan: Full Rust configuration matrix, Clippy/rustdoc, native callback and
+VFS suites, strict public types, examples, package checks, and final PR CI.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | 23A: Automatic artifacts and one engine | `embedded_artifact_matches_the_runtime_engine`, concurrent initialization and `shared_engine_keeps_store_memory_and_interruption_independent` pass; manual APIs/examples/diagnostics removed. |
+| Complete | Work | 23B: Keep implementation interfaces internal | Internal Rust callback traits/command wiring; Node facade and filesystem instance type retained. Strict public types, callback/context/VFS tests and numeric-key payload regression pass with direct N-API arguments. |
+| Complete | Work | 23C: Explicit shell command registration | Typed handler/shell registration replaces no-op closures/dispatch flags. Disabled-command, independent Bash semantics and pipeline-session regressions pass. |
+| Complete | Test / Gate | Phase 23 local validation | Workspace all-feature and isolated no-feature/default Rust tests, Clippy/rustdoc/fmt, Cargo package verification, 56 native and 29 portable tests, 31 release tests, examples and npm package checks pass. [PR #24](https://github.com/danthegoodman1/tinysandbox/pull/24) reports CI for the current head. |

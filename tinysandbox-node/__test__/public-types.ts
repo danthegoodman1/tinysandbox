@@ -1,4 +1,4 @@
-import { Sandbox, type HostContext, type JsFetch, type JsGlobal } from '../index.js'
+import { Sandbox, type HostContext, type JsFetch, type JsGlobal, type SandboxFs } from '../index.js'
 
 const legacyGlobal: JsGlobal = (value) => ({ value: String(value) })
 const legacyFetch: JsFetch = (request) => ({ status: 200, body: request.url })
@@ -24,6 +24,7 @@ sandbox.setJsGlobal('legacyGlobal', legacyGlobal)
 sandbox.extendJsGlobals({ contextualGlobal })
 sandbox.replaceJsGlobals({ legacyGlobal, contextualGlobal })
 const execution: Promise<number> = sandbox.exec('echo hello').then((result) => result.exitCode)
-const read: Promise<Buffer> = sandbox.fs.readFile('/workspace/hello')
+const fs: SandboxFs = sandbox.fs
+const read: Promise<Buffer> = fs.readFile('/workspace/hello')
 void execution
 void read

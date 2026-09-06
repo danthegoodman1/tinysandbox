@@ -57,13 +57,13 @@ pub struct CommandContext {
     pub commands: Arc<BTreeSet<String>>,
     /// Host functions bound into the JavaScript global scope.
     #[cfg(feature = "js")]
-    pub js_globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
+    pub(crate) js_globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     /// JavaScript fetch handler registered on the sandbox.
     #[cfg(feature = "js")]
-    pub js_fetch: Option<Arc<dyn Fetch>>,
+    pub(crate) js_fetch: Option<Arc<dyn Fetch>>,
     /// JavaScript prelude evaluated before each user script.
     #[cfg(feature = "js")]
-    pub js_prelude: Arc<str>,
+    pub(crate) js_prelude: Arc<str>,
 }
 
 /// Exit status and optional resource metrics returned by a command.

@@ -223,6 +223,14 @@ async fn pipeline_shell_builtins_do_not_mutate_session_but_still_write_stdout() 
     let export = sandbox.exec("export FOO=bar; export | cat").await;
     assert_eq!(export.exit_code, 0);
     assert!(export.stdout.contains("declare -x FOO=\"bar\"\n"));
+
+    for mutation in ["export FOO=changed", "unset FOO"] {
+        let result = sandbox
+            .exec(&format!("export FOO=bar; {mutation} | cat; echo $FOO"))
+            .await;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "bar\n", "{mutation}");
+    }
 }
 
 #[tokio::test]

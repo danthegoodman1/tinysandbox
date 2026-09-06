@@ -7,31 +7,25 @@
 
 fn main() {
     println!("cargo::rerun-if-changed=assets/quickjs.wasm");
-    println!("cargo::rerun-if-changed=src/js/engine_config.rs");
+    println!("cargo::rerun-if-changed=src/wasm_config.rs");
     println!("cargo::rustc-check-cfg=cfg(quickjs_precompiled)");
     println!("cargo::rerun-if-changed=assets/jq.wasm");
-    println!("cargo::rerun-if-changed=src/sandbox/jq_engine_config.rs");
     println!("cargo::rustc-check-cfg=cfg(jq_precompiled)");
-    precompile("jq", jq_engine::jq_engine_config);
+    precompile("jq");
     #[cfg(feature = "js")]
-    precompile("quickjs", engine::quickjs_engine_config);
+    precompile("quickjs");
 }
 
-#[cfg(feature = "js")]
 mod engine {
-    include!("src/js/engine_config.rs");
+    include!("src/wasm_config.rs");
 }
 
-mod jq_engine {
-    include!("src/sandbox/jq_engine_config.rs");
-}
-
-fn precompile(name: &str, config: fn(Option<&str>) -> wasmtime::Result<wasmtime::Config>) {
+fn precompile(name: &str) {
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     let target = std::env::var("TARGET").expect("TARGET");
     let wasm = std::fs::read(format!("assets/{name}.wasm")).expect("read embedded guest");
 
-    let artifact = config(Some(&target))
+    let artifact = engine::engine_config(Some(&target))
         .and_then(|config| wasmtime::Engine::new(&config))
         .and_then(|engine| engine.precompile_module(&wasm));
     match artifact {

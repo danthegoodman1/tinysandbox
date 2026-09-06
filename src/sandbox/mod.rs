@@ -57,10 +57,9 @@ pub use command::{
     BoxAsyncRead, BoxAsyncWrite, Command, CommandContext, CommandFuture, CommandResult, Limits,
 };
 #[cfg(feature = "js")]
-pub use host::{
-    Fetch, FetchFuture, FetchRequest, FetchResponse, HostError, JsGlobal, JsGlobalError,
-    JsGlobalFuture, JsGlobals,
-};
+use host::{Fetch, JsGlobal};
+#[cfg(feature = "js")]
+pub use host::{FetchRequest, FetchResponse, HostError, JsGlobalError, JsGlobals};
 
 const PIPE_CAPACITY_BYTES: usize = STREAM_CHUNK_BYTES;
 const TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
@@ -116,11 +115,36 @@ pub struct SandboxStats {
     pub commands_run: u64,
 }
 
+#[derive(Clone)]
+enum RegisteredCommand {
+    Handler(Arc<dyn Command>),
+    Shell(ShellBuiltin),
+}
+
+#[derive(Clone, Copy)]
+enum ShellBuiltin {
+    Cd,
+    Export,
+    Unset,
+}
+
+impl ShellBuiltin {
+    const ALL: [Self; 3] = [Self::Cd, Self::Export, Self::Unset];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Cd => "cd",
+            Self::Export => "export",
+            Self::Unset => "unset",
+        }
+    }
+}
+
 /// In-process shell sandbox backed by a virtual filesystem.
 pub struct Sandbox {
     host_fs: Fs,
     vfs: Arc<dyn Vfs>,
-    commands: Arc<BTreeMap<String, Arc<dyn Command>>>,
+    commands: Arc<BTreeMap<String, RegisteredCommand>>,
     command_names: Arc<BTreeSet<String>>,
     #[cfg(feature = "js")]
     js_globals: RwLock<Arc<BTreeMap<String, Arc<dyn JsGlobal>>>>,
@@ -137,7 +161,7 @@ pub struct Sandbox {
 /// Builder for [`Sandbox`].
 pub struct SandboxBuilder {
     mounts: BTreeMap<String, Arc<dyn Vfs>>,
-    commands: BTreeMap<String, Arc<dyn Command>>,
+    commands: BTreeMap<String, RegisteredCommand>,
     #[cfg(feature = "js")]
     js_globals: Vec<(String, Arc<dyn JsGlobal>)>,
     #[cfg(feature = "js")]
@@ -555,11 +579,8 @@ impl Sandbox {
             stdout: &mut special_stdout,
             stderr: &mut special_stderr,
         };
-        if let Some(mut status) = if self.commands.contains_key(&command_name) {
-            run_shell_builtin_stage(&command_name, &args, shell_ctx).await
-        } else {
-            None
-        } {
+        if let Some(RegisteredCommand::Shell(builtin)) = self.commands.get(&command_name) {
+            let mut status = run_shell_builtin_stage(*builtin, &args, shell_ctx).await;
             close_stdin_redirect(&fs, redirects.stdin.take()).await;
             let Some((mut stdout, stdout_sinks, _)) = writer_for_destination_or_report(
                 &command_name,
@@ -652,7 +673,6 @@ impl Sandbox {
                 cwd: session.cwd.clone(),
                 fs: fs.clone(),
                 command: self.commands.get(&command_name).cloned(),
-                shell_builtin: false,
                 redirects,
                 limits: self.limits,
                 commands: Arc::clone(&self.command_names),
@@ -731,7 +751,6 @@ impl Sandbox {
                     cwd: session.cwd.clone(),
                     fs,
                     command: None,
-                    shell_builtin: false,
                     redirects: PreparedRedirects::default(),
                     limits: self.limits,
                     commands: Arc::clone(&self.command_names),
@@ -762,7 +781,6 @@ impl Sandbox {
             cwd: session.cwd.clone(),
             fs,
             command: self.commands.get(&name).cloned(),
-            shell_builtin: self.commands.contains_key(&name) && is_shell_builtin_name(&name),
             redirects,
             limits: self.limits,
             commands: Arc::clone(&self.command_names),
@@ -965,24 +983,13 @@ impl SandboxBuilder {
         builtins::register(&mut commands);
         #[cfg(feature = "js")]
         crate::js::register(&mut commands);
-        commands.insert(
-            "cd".to_owned(),
-            Arc::new(|_ctx: CommandContext| {
-                Box::pin(async { CommandResult::success() }) as CommandFuture
-            }),
-        );
-        commands.insert(
-            "export".to_owned(),
-            Arc::new(|_ctx: CommandContext| {
-                Box::pin(async { CommandResult::success() }) as CommandFuture
-            }),
-        );
-        commands.insert(
-            "unset".to_owned(),
-            Arc::new(|_ctx: CommandContext| {
-                Box::pin(async { CommandResult::success() }) as CommandFuture
-            }),
-        );
+        let mut commands: BTreeMap<_, _> = commands
+            .into_iter()
+            .map(|(name, command)| (name, RegisteredCommand::Handler(command)))
+            .collect();
+        for builtin in ShellBuiltin::ALL {
+            commands.insert(builtin.name().to_owned(), RegisteredCommand::Shell(builtin));
+        }
 
         let mut env = BTreeMap::new();
         env.insert("PWD".to_owned(), "/workspace".to_owned());
@@ -1052,7 +1059,8 @@ impl SandboxBuilder {
     {
         let name = name.into();
         assert_not_reserved(&name);
-        self.commands.insert(name, Arc::new(command));
+        self.commands
+            .insert(name, RegisteredCommand::Handler(Arc::new(command)));
         self
     }
 
@@ -1060,7 +1068,8 @@ impl SandboxBuilder {
     pub fn command_obj(mut self, name: impl Into<String>, command: impl Command + 'static) -> Self {
         let name = name.into();
         assert_not_reserved(&name);
-        self.commands.insert(name, Arc::new(command));
+        self.commands
+            .insert(name, RegisteredCommand::Handler(Arc::new(command)));
         self
     }
 
@@ -1221,15 +1230,15 @@ struct ShellBuiltinContext<'a> {
 }
 
 async fn run_shell_builtin_stage(
-    name: &str,
+    builtin: ShellBuiltin,
     args: &[String],
     ctx: ShellBuiltinContext<'_>,
-) -> Option<i32> {
-    match name {
-        "cd" => {
+) -> i32 {
+    match builtin {
+        ShellBuiltin::Cd => {
             if args.len() > 1 {
                 ctx.stderr.extend_from_slice(b"cd: too many arguments\n");
-                return Some(1);
+                return 1;
             }
             let target = if let Some(target) = args.first() {
                 target.clone()
@@ -1237,7 +1246,7 @@ async fn run_shell_builtin_stage(
                 home.clone()
             } else {
                 ctx.stderr.extend_from_slice(b"cd: HOME not set\n");
-                return Some(1);
+                return 1;
             };
             let path = ctx.fs.resolve(&target);
             match ctx.fs.stat(&path).await {
@@ -1253,28 +1262,28 @@ async fn run_shell_builtin_stage(
                         .insert("PWD".to_owned(), ctx.session.cwd.clone());
                     ctx.env.insert("OLDPWD".to_owned(), old_pwd);
                     ctx.env.insert("PWD".to_owned(), ctx.session.cwd.clone());
-                    Some(0)
+                    0
                 }
                 Ok(_) => {
                     ctx.stderr
                         .extend_from_slice(format!("cd: {target}: Not a directory\n").as_bytes());
-                    Some(1)
+                    1
                 }
                 Err(err) => {
                     ctx.stderr.extend_from_slice(
                         format!("cd: {target}: {}\n", errno_message(err.errno())).as_bytes(),
                     );
-                    Some(1)
+                    1
                 }
             }
         }
-        "export" => {
+        ShellBuiltin::Export => {
             if args.is_empty() {
                 for (key, value) in &ctx.session.env {
                     ctx.stdout
                         .extend_from_slice(format!("declare -x {key}=\"{value}\"\n").as_bytes());
                 }
-                return Some(0);
+                return 0;
             }
             for arg in args {
                 if let Some((name, value)) = arg.split_once('=') {
@@ -1285,7 +1294,7 @@ async fn run_shell_builtin_stage(
                         ctx.stderr.extend_from_slice(
                             format!("export: `{arg}': not a valid identifier\n").as_bytes(),
                         );
-                        return Some(1);
+                        return 1;
                     }
                 } else if is_assignment_name(arg) {
                     ctx.session.env.entry(arg.clone()).or_default();
@@ -1293,12 +1302,12 @@ async fn run_shell_builtin_stage(
                     ctx.stderr.extend_from_slice(
                         format!("export: `{arg}': not a valid identifier\n").as_bytes(),
                     );
-                    return Some(1);
+                    return 1;
                 }
             }
-            Some(0)
+            0
         }
-        "unset" => {
+        ShellBuiltin::Unset => {
             for arg in args {
                 if is_assignment_name(arg) {
                     ctx.session.env.remove(arg);
@@ -1307,12 +1316,11 @@ async fn run_shell_builtin_stage(
                     ctx.stderr.extend_from_slice(
                         format!("unset: `{arg}': not a valid identifier\n").as_bytes(),
                     );
-                    return Some(1);
+                    return 1;
                 }
             }
-            Some(0)
+            0
         }
-        _ => None,
     }
 }
 
@@ -1520,8 +1528,7 @@ struct PreparedStage {
     env: BTreeMap<String, String>,
     cwd: String,
     fs: Fs,
-    command: Option<Arc<dyn Command>>,
-    shell_builtin: bool,
+    command: Option<RegisteredCommand>,
     redirects: PreparedRedirects,
     limits: Limits,
     commands: Arc<BTreeSet<String>>,
@@ -1916,7 +1923,7 @@ async fn run_registered_stage(
     mut stdout: BoxAsyncWrite,
     mut stderr: BoxAsyncWrite,
 ) -> CommandResult {
-    if stage.shell_builtin {
+    if let Some(RegisteredCommand::Shell(builtin)) = &stage.command {
         let mut session = Session {
             cwd: stage.cwd.clone(),
             env: stage.env.clone(),
@@ -1936,9 +1943,7 @@ async fn run_registered_stage(
             stdout: &mut special_stdout,
             stderr: &mut special_stderr,
         };
-        let status = run_shell_builtin_stage(&stage.name, &stage.args, ctx)
-            .await
-            .unwrap_or(127);
+        let status = run_shell_builtin_stage(*builtin, &stage.args, ctx).await;
         if stdout.write_all(&special_stdout).await.is_err() {
             return CommandResult::failure();
         }
@@ -1948,7 +1953,7 @@ async fn run_registered_stage(
         return CommandResult::new(status);
     }
 
-    if let Some(command) = stage.command {
+    if let Some(RegisteredCommand::Handler(command)) = stage.command {
         let ctx = CommandContext {
             args: stage.args,
             env: stage.env,
@@ -2182,10 +2187,6 @@ fn redirect_target(
     }
 }
 
-fn is_shell_builtin_name(name: &str) -> bool {
-    matches!(name, "cd" | "export" | "unset")
-}
-
 fn expansion_cost(
     simple: &SimpleCommand,
     env: &BTreeMap<String, String>,
@@ -2407,7 +2408,10 @@ fn expansion_value<'a>(
 }
 
 fn assert_not_reserved(name: &str) {
-    if matches!(name, "cd" | "export" | "unset") {
+    if ShellBuiltin::ALL
+        .iter()
+        .any(|builtin| builtin.name() == name)
+    {
         panic!(
             "SandboxBuilder::command cannot register reserved shell builtin '{name}'; cd, export, and unset are interpreted by the shell"
         );

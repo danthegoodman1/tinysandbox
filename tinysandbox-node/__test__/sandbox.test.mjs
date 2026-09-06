@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Sandbox, jsRuntimeSource, prompts, runConformance } from '../index.js'
+import { Sandbox, prompts, runConformance } from '../index.js'
 import { createMemoryVfs } from './helpers.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -348,6 +348,25 @@ test('JS globals round-trip JSON values through Node handlers', async () => {
   assert.equal(result.stdout, '{"doubled":14,"nested":[true,null,"ok"]}\n')
 })
 
+test('host callback arguments preserve arrays and objects with numeric keys', async () => {
+  const values = [null, 7, ['zero', 'one'], { 0: 'zero', 1: 'one', nested: { value: 2 } }]
+  const received = []
+  const sandbox = new Sandbox({
+    globals: {
+      roundTrip: (value, context) => {
+        assert.equal(context.signal instanceof AbortSignal, true)
+        assert.equal(context.isCancelled(), false)
+        received.push(value)
+        return value
+      }
+    }
+  })
+  const result = await sandbox.exec(`js -e 'console.log(JSON.stringify(${JSON.stringify(values)}.map(value => roundTrip(value))))'`)
+  assert.equal(result.exitCode, 0, result.stderr)
+  assert.equal(result.stdout, `${JSON.stringify(values)}\n`)
+  assert.deepEqual(received, values)
+})
+
 test('JS global handler errors preserve string code fields', async () => {
   // Thrown Node errors become guest Error objects with message and optional code.
   const sandbox = new Sandbox({
@@ -589,15 +608,6 @@ test('JS VFS adapters do not keep child processes alive', async () => {
   })
   const result = await waitForChild(child, 2000)
   assert.equal(result.code, 0, result.stderr)
-})
-
-test('the js runtime runs on machine code built ahead of time', async () => {
-  // The native package embeds a precompiled artifact, so no process compiles
-  // the QuickJS module on its first `js` command.
-  const sandbox = new Sandbox()
-  const result = await sandbox.exec("js -e 'console.log(1)'")
-  assert.equal(result.exitCode, 0, result.stderr)
-  assert.equal(jsRuntimeSource(), 'precompiled')
 })
 
 test('prompt chunks map to the matching native constants', async () => {

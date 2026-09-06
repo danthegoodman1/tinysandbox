@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use napi::bindgen_prelude::{
-    AsyncTask, Buffer, External, FromNapiValue, Function, JsObjectValue, Object, Promise, Unknown,
-    ValueType,
+    AsyncTask, Buffer, External, FnArgs, FromNapiValue, Function, JsObjectValue, Object, Promise,
+    Unknown, ValueType,
 };
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi::{Error, JsExternal, Result, Status, Task};
@@ -14,7 +16,7 @@ use serde_json::Value;
 use tinysandbox::sandbox::{
     Command, CommandContext, CommandFuture, CommandResult, ExecResult as CoreExecResult,
     FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostContext, HostError,
-    JsGlobalError, JsGlobalFuture, JsGlobals, Limits, Sandbox as CoreSandbox,
+    JsGlobalError, JsGlobals, Limits, Sandbox as CoreSandbox,
 };
 use tinysandbox::vfs::{
     DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
@@ -26,17 +28,18 @@ type JsCommandCallback = Arc<
     ThreadsafeFunction<
         (CommandCall, HostContext),
         Promise<CommandOutput>,
-        (CommandCall, NativeHostContext),
+        FnArgs<(CommandCall, NativeHostContext)>,
         Status,
         false,
         true,
     >,
 >;
+type JsGlobalFuture = Pin<Box<dyn Future<Output = std::result::Result<Value, HostError>> + Send>>;
 type JsGlobalCallback = Arc<
     ThreadsafeFunction<
         (Value, HostContext),
         Promise<JsGlobalCallbackResponse>,
-        (Value, NativeHostContext),
+        FnArgs<(Value, NativeHostContext)>,
         Status,
         false,
         true,
@@ -46,16 +49,16 @@ type JsFetchCallback = Arc<
     ThreadsafeFunction<
         (FetchRequest, HostContext),
         Promise<FetchCallbackResponse>,
-        (FetchRequest, NativeHostContext),
+        FnArgs<(FetchRequest, NativeHostContext)>,
         Status,
         false,
         true,
     >,
 >;
 type JsVfsCallback =
-    Arc<ThreadsafeFunction<VfsRequest, Promise<VfsResponse>, (VfsRequest,), Status, false, true>>;
+    Arc<ThreadsafeFunction<VfsRequest, Promise<VfsResponse>, VfsRequest, Status, false, true>>;
 type JsVfsFactoryCallback =
-    Arc<ThreadsafeFunction<VfsQuotaJs, Promise<JsVfsHandle>, (VfsQuotaJs,), Status, false, true>>;
+    Arc<ThreadsafeFunction<VfsQuotaJs, Promise<JsVfsHandle>, VfsQuotaJs, Status, false, true>>;
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 /// Internal bridge for the JavaScript callback's cooperative cancellation signal.
@@ -137,35 +140,6 @@ pub fn prompt_globals(names: Vec<String>) -> String {
     tinysandbox::prompts::globals(names)
 }
 
-/// Compiles the embedded QuickJS module and returns the machine-code artifact.
-#[napi]
-pub fn precompile_js() -> Result<Buffer> {
-    tinysandbox::js::precompile()
-        .map(Buffer::from)
-        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
-}
-
-/// Installs a trusted `precompileJs` artifact as this process's JavaScript runtime.
-/// The caller must guarantee authenticity and matching build/target; accepting
-/// untrusted bytes here permits arbitrary native code execution.
-#[napi]
-pub fn use_precompiled_js(artifact: Buffer) -> Result<()> {
-    // SAFETY: this host-only API explicitly requires an authentic, compatible
-    // artifact from precompileJs; callers must never supply guest/untrusted bytes.
-    unsafe { tinysandbox::js::use_precompiled(&artifact) }
-        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
-}
-
-/// Reports where this process's JavaScript machine code came from.
-#[napi]
-pub fn js_runtime_source() -> Result<String> {
-    tinysandbox::js::runtime_source()
-        .map(|source| match source {
-            tinysandbox::js::RuntimeSource::Precompiled => "precompiled".to_owned(),
-            tinysandbox::js::RuntimeSource::Compiled => "compiled".to_owned(),
-        })
-        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))
-}
 #[napi]
 pub const PROMPT_FETCH: &str = tinysandbox::prompts::FETCH;
 #[napi]
@@ -229,7 +203,7 @@ impl Sandbox {
             if options.has_named_property("fetch")? {
                 let fetch: Function<
                     '_,
-                    (FetchRequest, NativeHostContext),
+                    FnArgs<(FetchRequest, NativeHostContext)>,
                     Promise<FetchCallbackResponse>,
                 > = options.get_named_property("fetch")?;
                 let callback = Arc::new(
@@ -238,7 +212,7 @@ impl Sandbox {
                         .callee_handled::<false>()
                         .weak::<true>()
                         .build_callback(|ctx| {
-                            Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)))
+                            Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)).into())
                         })?,
                 );
                 builder = builder.fetch_with_context(move |request, context| {
@@ -296,7 +270,7 @@ impl Sandbox {
                 for name in Object::keys(&commands)? {
                     let callback: Function<
                         '_,
-                        (CommandCall, NativeHostContext),
+                        FnArgs<(CommandCall, NativeHostContext)>,
                         Promise<CommandOutput>,
                     > = commands.get_named_property(&name)?;
                     let callback = callback
@@ -304,7 +278,7 @@ impl Sandbox {
                         .callee_handled::<false>()
                         .weak::<true>()
                         .build_callback(|ctx| {
-                            Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)))
+                            Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)).into())
                         })?;
                     builder = builder.command_obj(
                         name,
@@ -339,7 +313,7 @@ impl Sandbox {
     pub fn set_js_global(
         &self,
         name: String,
-        global: Function<'_, (Value, NativeHostContext), Promise<JsGlobalCallbackResponse>>,
+        global: Function<'_, FnArgs<(Value, NativeHostContext)>, Promise<JsGlobalCallbackResponse>>,
     ) -> Result<()> {
         let globals = JsGlobals::new().with_context(name, js_global_handler(global)?);
         self.inner
@@ -696,22 +670,25 @@ async fn write_command_error(
 fn js_globals_from_object(globals: &Object<'_>) -> Result<JsGlobals> {
     let mut set = JsGlobals::new();
     for name in Object::keys(globals)? {
-        let callback: Function<'_, (Value, NativeHostContext), Promise<JsGlobalCallbackResponse>> =
-            globals.get_named_property(&name)?;
+        let callback: Function<
+            '_,
+            FnArgs<(Value, NativeHostContext)>,
+            Promise<JsGlobalCallbackResponse>,
+        > = globals.get_named_property(&name)?;
         set = set.with_context(name, js_global_handler(callback)?);
     }
     Ok(set)
 }
 
 fn js_global_handler(
-    callback: Function<'_, (Value, NativeHostContext), Promise<JsGlobalCallbackResponse>>,
+    callback: Function<'_, FnArgs<(Value, NativeHostContext)>, Promise<JsGlobalCallbackResponse>>,
 ) -> Result<impl Fn(Value, HostContext) -> JsGlobalFuture + Send + Sync + use<>> {
     let callback = Arc::new(
         callback
             .build_threadsafe_function::<(Value, HostContext)>()
             .callee_handled::<false>()
             .weak::<true>()
-            .build_callback(|ctx| Ok((ctx.value.0, NativeHostContext::new(ctx.value.1))))?,
+            .build_callback(|ctx| Ok((ctx.value.0, NativeHostContext::new(ctx.value.1)).into()))?,
     );
     Ok(move |args: Value, context: HostContext| {
         let callback = Arc::clone(&callback);
@@ -1052,12 +1029,12 @@ struct JsVfsFactory {
 }
 
 impl JsVfsFactory {
-    fn new(factory: Function<'_, (VfsQuotaJs,), Promise<JsVfsHandle>>) -> Result<Self> {
+    fn new(factory: Function<'_, VfsQuotaJs, Promise<JsVfsHandle>>) -> Result<Self> {
         let callback = factory
             .build_threadsafe_function::<VfsQuotaJs>()
             .callee_handled::<false>()
             .weak::<true>()
-            .build_callback(|ctx| Ok((ctx.value,)))?;
+            .build_callback(|ctx| Ok(ctx.value))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -1115,9 +1092,9 @@ impl Task for ConformanceTask {
     }
 }
 
-#[napi(ts_args_type = "factory: (arg: [VfsQuotaJs]) => Promise<ExternalObject<unknown>>")]
+#[napi(ts_args_type = "factory: (quota: VfsQuotaJs) => Promise<ExternalObject<unknown>>")]
 pub fn run_conformance(
-    factory: Function<'_, (VfsQuotaJs,), Promise<JsVfsHandle>>,
+    factory: Function<'_, VfsQuotaJs, Promise<JsVfsHandle>>,
 ) -> Result<AsyncTask<ConformanceTask>> {
     Ok(AsyncTask::new(ConformanceTask {
         factory: JsVfsFactory::new(factory)?,
@@ -1709,14 +1686,13 @@ fn has_non_nullish_named_property(object: &Object<'_>, name: &str) -> Result<boo
 }
 
 fn vfs_callback(vfs: &Object<'_>, name: &'static str) -> Result<JsVfsCallback> {
-    let callback: Function<'_, (VfsRequest,), Promise<VfsResponse>> =
-        vfs.get_named_property(name)?;
+    let callback: Function<'_, VfsRequest, Promise<VfsResponse>> = vfs.get_named_property(name)?;
     Ok(Arc::new(
         callback
             .build_threadsafe_function::<VfsRequest>()
             .callee_handled::<false>()
             .weak::<true>()
-            .build_callback(|ctx| Ok((ctx.value,)))?,
+            .build_callback(|ctx| Ok(ctx.value))?,
     ))
 }
 

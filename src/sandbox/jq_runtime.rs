@@ -4,7 +4,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use wasmtime::{
@@ -14,12 +14,7 @@ use wasmtime::{
 use super::command::{CommandResult, Limits};
 use super::fs::STREAM_CHUNK_BYTES;
 use super::jq_protocol::{JqInputSource, JqOptions, JqRequest};
-
-mod engine_config {
-    include!("jq_engine_config.rs");
-}
-
-const EPOCH_TICK: Duration = Duration::from_millis(5);
+use crate::wasm::EPOCH_TICK;
 pub(crate) const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) enum JqStreamMessage {
@@ -38,17 +33,8 @@ static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
 fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
     RUNTIME
         .get_or_init(|| {
-            let engine = Engine::new(&engine_config::jq_engine_config(None)?)?;
+            let engine = crate::wasm::engine()?.clone();
             let module = load_module(&engine)?;
-            let ticker = engine.clone();
-            std::thread::Builder::new()
-                .name("tinysandbox-jq-epochs".into())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(EPOCH_TICK);
-                        ticker.increment_epoch();
-                    }
-                })?;
             Ok(CompiledRuntime { engine, module })
         })
         .as_ref()
@@ -405,6 +391,7 @@ fn define_imports(linker: &mut Linker<State>) -> wasmtime::Result<()> {
 mod tests {
     use super::super::jq_protocol::parse_jq_args;
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn cancellation_interrupts_an_entered_guest_and_releases_its_worker() {

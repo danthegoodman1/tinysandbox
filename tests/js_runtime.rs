@@ -2167,18 +2167,6 @@ async fn js_globals_extend_adds_without_dropping_the_rest() {
 }
 
 #[tokio::test]
-async fn js_runs_on_machine_code_built_ahead_of_time() {
-    // The build script precompiles the module for this target, so no process
-    // pays Cranelift's compile on its first `js` command.
-    let sandbox = Sandbox::builder().build();
-    assert_eq!(sandbox.exec("js -e 'console.log(1)'").await.stdout, "1\n");
-    assert_eq!(
-        tinysandbox::js::runtime_source().expect("runtime source"),
-        tinysandbox::js::RuntimeSource::Precompiled
-    );
-}
-
-#[tokio::test]
 async fn js_output_preserves_bytes_through_pipes_and_redirects() {
     let vfs = Arc::new(InMemoryVfs::default());
     let sandbox = Sandbox::builder()
@@ -2206,7 +2194,7 @@ async fn js_output_preserves_bytes_through_pipes_and_redirects() {
 
 #[tokio::test]
 async fn js_output_stops_when_the_downstream_reader_exits() {
-    tinysandbox::js::runtime_source().expect("warm runtime");
+    warm_js_runtime().await;
     let sandbox = Sandbox::builder()
         .limits(Limits {
             wall_time: Duration::from_secs(3),
@@ -2256,7 +2244,7 @@ fs.closeSync(fd);
 
 #[tokio::test]
 async fn js_releases_unclosed_files_on_success_errors_and_timeout() {
-    tinysandbox::js::runtime_source().expect("warm runtime");
+    warm_js_runtime().await;
     for (ending, expected) in [
         ("", 0),
         ("throw new Error('stop')", 1),
@@ -2327,7 +2315,7 @@ async fn js_host_file_reads_and_open_files_have_explicit_budgets() {
 async fn js_does_not_start_a_filesystem_mutation_after_the_exec_deadline() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tinysandbox::sandbox::CommandResult;
-    tinysandbox::js::runtime_source().expect("warm runtime");
+    warm_js_runtime().await;
     let entered = Arc::new(AtomicBool::new(false));
     let vfs = Arc::new(InMemoryVfs::default());
     let sandbox = Sandbox::builder()
@@ -2365,4 +2353,9 @@ async fn js_does_not_start_a_filesystem_mutation_after_the_exec_deadline() {
         vfs.stat("/late").is_err(),
         "timed-out JS wrote after exec returned"
     );
+}
+
+async fn warm_js_runtime() {
+    let result = Sandbox::builder().build().exec("js -e ''").await;
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
 }

@@ -1278,10 +1278,9 @@ reports VFS usage and total commands run.
 - JS and jq linear memory are capped by Wasmtime, with CPU interruption, bounded
   host transfers, and an execution-wide deadline. These are not a total-process
   heap cap or a preemption guarantee for trusted host callbacks.
-- Precompiled JS artifacts contain native machine code. Rust's
-  `unsafe use_precompiled` and Node's host-only `usePrecompiledJs` require
-  authentic artifacts from the same build and target. A format/version check
-  does not make untrusted bytes safe.
+- Native artifacts are generated from the fixed JS and jq guests during the
+  build and embedded in the binary. Applications cannot install external native
+  artifacts through the sandbox API.
 - `..` traversal is contained at the virtual root. `/bin` and mount points are
   read-only. With
   the local directory VFS, each component is opened relative to an already-open
@@ -1364,9 +1363,9 @@ RSS includes runtime and allocator overhead for that process.
 
 ### JavaScript runtime startup
 
-Nothing compiles wasm at run time. The build script turns `quickjs.wasm` into
-machine code for the crate's target and the binary embeds the result, so the
-first `js` command loads an artifact that is already executable.
+The build script turns `quickjs.wasm` into machine code for the crate's target
+and the binary embeds the result, so the first `js` command normally loads an
+artifact that is already executable.
 
 Runtime behavior with `wasmtime` 46:
 
@@ -1388,55 +1387,12 @@ CPU features, so it runs on any CPU of that architecture rather than only one as
 new as the build machine. It is also tied to this Wasmtime version. When either
 check fails — a target the build could not generate code for, an artifact from a
 different Wasmtime — the runtime compiles the module itself and keeps working at
-the cost of that first command; `js::runtime_source()` reports which happened.
+the cost of that first command. JS and jq share one Wasmtime engine and
+interruption timer, while each command keeps its own guest state and limits.
 
 Two costs come with this. Wasmtime's compiler is a build dependency as well as a
 runtime one, so a cold `cargo build` compiles it twice; and the binary carries
 the 2.7 MB artifact alongside the 0.6 MB wasm.
-
-To produce an artifact yourself — for another machine, or to share one across
-processes that build separately — `js::precompile` returns the machine code and
-`js::use_precompiled` installs it before the first `js` command, replacing the
-embedded one:
-
-**Rust**
-
-```rust no_run
-# #[cfg(feature = "js")]
-# fn example() {
-// Build step, for example in a packaging job.
-let artifact = tinysandbox::js::precompile().expect("precompile quickjs");
-std::fs::write("target/quickjs.cwasm", &artifact).expect("write artifact");
-
-// Later process, before the first `js` command runs.
-if let Ok(artifact) = std::fs::read("target/quickjs.cwasm") {
-    // SAFETY: These bytes come from our trusted build above, and the artifact
-    // file must remain protected from modification by untrusted writers.
-    let _ = unsafe { tinysandbox::js::use_precompiled(&artifact) };
-}
-# }
-# fn main() {}
-```
-
-**TypeScript**
-
-The native package already embeds an artifact for its platform. To install your
-own:
-
-```ts
-import { readFileSync, writeFileSync } from 'node:fs'
-import { jsRuntimeSource, precompileJs, usePrecompiledJs } from '@tinysandbox/tinysandbox'
-
-writeFileSync('quickjs.cwasm', precompileJs())
-
-try {
-  usePrecompiledJs(readFileSync('quickjs.cwasm'))
-} catch {
-  // Stale or foreign artifact: the embedded runtime still serves.
-}
-
-console.log(jsRuntimeSource()) // 'precompiled'
-```
 
 ## Feature flags
 
@@ -1456,7 +1412,6 @@ Runnable with `cargo run --example <name>`:
 - [`js_scripts`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_scripts.rs) — multi-file JS with `require`,
   the `fs` API, and a look at limits and metrics
 - [`js_dynamic_globals`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_dynamic_globals.rs) — changing the host global surface between commands
-- [`js_precompiled`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_precompiled.rs) — precompiling the QuickJS module and loading it in a later process
 - [`js_globals`](https://github.com/danthegoodman1/tinysandbox/blob/main/examples/js_globals.rs) — host globals,
   prelude wrappers, and embedder-backed fetch
 
@@ -1468,7 +1423,6 @@ dependencies are installed:
 - `js_scripts.ts` — multi-file sandboxed JS with limits and metrics
 - `js_globals.ts` — TypeScript host globals, prelude wrappers, and fetch transport
 - `js_dynamic_globals.ts` — changing the host global surface between commands
-- `js_precompiled.ts` — precompiling the QuickJS module and loading the artifact
 - `js_vfs.ts` — TypeScript-backed VFS callbacks plus `runConformance`
 
 ## License

@@ -112,7 +112,7 @@ async fn contextual_global_registration_and_fetch_preserve_legacy_callbacks() {
 #[tokio::test]
 async fn host_callback_timeout_is_visible_through_its_context() {
     use serde_json::Value;
-    tinysandbox::js::runtime_source().unwrap();
+    warm_js_runtime().await;
     let saved = Arc::new(Mutex::new(None));
     let observed = Arc::clone(&saved);
     let sandbox = Sandbox::builder()
@@ -141,7 +141,7 @@ async fn host_callback_timeout_is_visible_through_its_context() {
 #[tokio::test]
 async fn dropping_exec_wakes_a_running_global_context_before_its_deadline() {
     use serde_json::Value;
-    tinysandbox::js::runtime_source().unwrap();
+    warm_js_runtime().await;
     let (sent, received) = tokio::sync::oneshot::channel();
     let sender = Arc::new(Mutex::new(Some(sent)));
     let sandbox = Sandbox::builder()
@@ -217,4 +217,10 @@ async fn settled_callback_contexts_cancel_without_ending_the_execution() {
         .await;
     assert_eq!(result.exit_code, 0, "{}", result.stderr);
     assert_eq!(result.stdout, "1\n2\n");
+}
+
+#[cfg(feature = "js")]
+async fn warm_js_runtime() {
+    let result = Sandbox::builder().build().exec("js -e ''").await;
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
 }

@@ -37,18 +37,15 @@ sides of the short-line comparison. Host load and allocator behavior affect
 these numbers; there are no portable timing assertions.
 
 The stat benchmark uses `Sandbox::fs()` with default host limits and one fixed
-file; it has no command parsing, JS workers, native jq workers, network requests,
+file; it has no command parsing, JS workers, jq workers, network requests,
 or S3 requests. The buffer workloads have the sizes listed above. This run did
 not measure allocation counts. `/usr/bin/time -l` completed the benchmark but
 could not read `sysctl kern.clockrate` in the execution sandbox, so no peak RSS
 measurement is reported.
 
-Native jq admission is separately capped at 16 blocking workers. A worker owns
-its admission permit until it exits, including after an execution times out.
-Each command's input buffering is bounded by `jq_input_bytes`; it precedes
-worker admission so a queued downstream jq can drain its upstream pipe.
-Serialized output is delivered in at most
-64 KiB chunks through a bounded channel. These bounds do not impose a hard heap
-limit or fully preemptive cancellation inside jaq's evaluator. Embedders needing
-those guarantees can exclude native jq with `without_command("jq")`; changing
-its interpreter or isolation boundary remains a deliberate policy decision.
+jq now runs in an isolated Wasm guest with capped memory and engine
+interruption. Its admission remains separate from JS, and each worker retains
+its permit until it exits. Input buffering precedes worker admission so queued
+pipeline stages can drain their upstream pipes. See
+[JQ_ISOLATION.md](JQ_ISOLATION.md) for the current jq guarantees and before/after
+measurements.

@@ -23,7 +23,7 @@ export declare class NativeSandbox {
    * Binds one host function, replacing any global under that exact name.
    * Visible to `js` commands that start after this returns.
    */
-  setJsGlobal(name: string, global: (arg: [any, NativeHostContext]) => Promise<JsGlobalCallbackResponse>): void
+  setJsGlobal(name: string, global: (arg0: any, arg1: NativeHostContext) => Promise<JsGlobalCallbackResponse>): void
   /**
    * Adds host functions to the ones already bound, replacing any that share
    * an exact name and leaving the rest untouched.
@@ -150,9 +150,6 @@ export interface JsGlobalCallbackResponse {
   error?: HostCallbackError
 }
 
-/** Reports where this process's JavaScript machine code came from. */
-export declare function jsRuntimeSource(): string
-
 export interface OpenModeJs {
   read?: boolean
   write?: boolean
@@ -161,9 +158,6 @@ export interface OpenModeJs {
   truncate?: boolean
   append?: boolean
 }
-
-/** Compiles the embedded QuickJS module and returns the machine-code artifact. */
-export declare function precompileJs(): Buffer
 
 export const PROMPT_BUILTINS: string
 
@@ -183,19 +177,12 @@ export const PROMPT_SHELL: string
 
 export declare function promptGlobals(names: Array<string>): string
 
-export declare function runConformance(factory: (arg: [VfsQuotaJs]) => Promise<ExternalObject<unknown>>): Promise<unknown>
+export declare function runConformance(factory: (quota: VfsQuotaJs) => Promise<ExternalObject<unknown>>): Promise<unknown>
 
 export interface SandboxStats {
   commandsRun: number
   vfs?: VfsStatsJs
 }
-
-/**
- * Installs a trusted `precompileJs` artifact as this process's JavaScript runtime.
- * The caller must guarantee authenticity and matching build/target; accepting
- * untrusted bytes here permits arbitrary native code execution.
- */
-export declare function usePrecompiledJs(artifact: Buffer): void
 
 export interface VfsCallbackError {
   code?: string
