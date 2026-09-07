@@ -3,8 +3,10 @@
 #![doc = include_str!("../README.md")]
 
 #[cfg(feature = "js")]
-pub mod js;
+mod js;
 pub mod prompts;
 pub mod sandbox;
 pub mod shell;
 pub mod vfs;
+
+mod wasm;

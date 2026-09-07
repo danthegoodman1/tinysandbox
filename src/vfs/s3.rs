@@ -1039,6 +1039,27 @@ impl Vfs for S3Vfs {
         }
     }
 
+    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
+        let shared = self
+            .state()
+            .handles
+            .remove(&handle)
+            .ok_or(vfs_error(Errno::EBADF))?;
+        let state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Staging::Stream(stream) = &state.staging
+            && let Some(upload) = &stream.upload
+        {
+            self.ops
+                .abort_upload(AbortUploadRequest {
+                    bucket: self.bucket.clone(),
+                    key: state.key.clone(),
+                    upload_id: upload.id.clone(),
+                })
+                .map_err(RemoteError::into_vfs)?;
+        }
+        Ok(())
+    }
+
     fn close(&self, handle: FileHandle) -> VfsResult<()> {
         let shared = self
             .state()
@@ -3586,5 +3607,173 @@ mod tests {
             bucket.body("root-secret.txt").as_deref(),
             Some(&b"must remain invisible"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn shell_merged_redirects_share_one_s3_description_and_write_order() {
+        use crate::sandbox::{CommandResult, Sandbox};
+        use tokio::io::AsyncWriteExt;
+
+        let bucket = FakeBucket::new();
+        let sandbox = Sandbox::builder()
+            .clear_mounts()
+            .mount("objects", bucket_vfs(&bucket, None))
+            .cwd("/objects")
+            .command("abc", |mut ctx| async move {
+                ctx.stdout.write_all(b"A").await.expect("stdout A");
+                ctx.stderr.write_all(b"B").await.expect("stderr B");
+                ctx.stdout.write_all(b"C").await.expect("stdout C");
+                CommandResult::success()
+            })
+            .build();
+
+        for command in ["abc > merged 2>&1", "echo input | abc > merged 2>&1"] {
+            let result = sandbox.exec(command).await;
+            assert_eq!(result.exit_code, 0, "{}", result.stderr);
+            assert_eq!(bucket.body("merged").as_deref(), Some(&b"ABC"[..]));
+        }
+        assert_eq!(bucket.open_uploads(), 0);
+    }
+
+    #[tokio::test]
+    async fn shell_replacement_redirect_streams_past_the_s3_edit_limit() {
+        use crate::sandbox::{CommandResult, Sandbox};
+        use tokio::io::AsyncWriteExt;
+
+        let bucket = FakeBucket::new();
+        bucket.seed("out", &[b'o'; 64]);
+        let mut vfs = configured_bucket_vfs(
+            &bucket,
+            None,
+            S3VfsConfig {
+                max_edit_bytes: 16,
+                ..S3VfsConfig::default()
+            },
+        );
+        vfs.part_size = 8;
+        let sandbox = Sandbox::builder()
+            .clear_mounts()
+            .mount("objects", vfs)
+            .cwd("/objects")
+            .command("payload", |mut ctx| async move {
+                ctx.stdout
+                    .write_all(&[b'x'; 31])
+                    .await
+                    .expect("stream replacement");
+                CommandResult::success()
+            })
+            .build();
+
+        let result = sandbox.exec("payload > out").await;
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(bucket.body("out"), Some(vec![b'x'; 31]));
+        let result = sandbox
+            .exec("echo value > superseded > final; > empty")
+            .await;
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(bucket.body("superseded"), Some(Vec::new()));
+        assert_eq!(bucket.body("empty"), Some(Vec::new()));
+        assert_eq!(bucket.body("final").as_deref(), Some(&b"value\n"[..]));
+        assert_eq!(bucket.open_uploads(), 0);
+    }
+
+    #[test]
+    fn explicit_abort_discards_buffered_edits_and_pending_multipart_uploads() {
+        let bucket = FakeBucket::new();
+        bucket.seed("existing", b"original");
+        let mut vfs = bucket_vfs(&bucket, None);
+        vfs.part_size = 8;
+
+        let edit = vfs
+            .open("/existing", OpenMode::read_write())
+            .expect("open edit");
+        vfs.write_at(edit, 0, b"changed!")
+            .expect("stage edited body");
+        vfs.abort(edit).expect("discard edit");
+        assert_eq!(bucket.body("existing").as_deref(), Some(&b"original"[..]));
+        assert_errno(vfs.close(edit), Errno::EBADF);
+
+        let buffered = vfs
+            .open("/new-buffer", OpenMode::write_only().create().truncate())
+            .expect("open buffered stream");
+        vfs.write_at(buffered, 0, b"new")
+            .expect("stage unflushed bytes");
+        vfs.abort(buffered).expect("discard unflushed bytes");
+        assert!(bucket.body("new-buffer").is_none());
+
+        let multipart = vfs
+            .open("/existing", OpenMode::write_only().truncate())
+            .expect("open replacement stream");
+        vfs.write_at(multipart, 0, &[b'x'; 24])
+            .expect("upload parts");
+        assert_eq!(bucket.open_uploads(), 1);
+        vfs.abort(multipart).expect("abort uploaded parts");
+        assert_eq!(bucket.body("existing").as_deref(), Some(&b"original"[..]));
+        assert_eq!(bucket.open_uploads(), 0);
+        assert_eq!(bucket.aborted().len(), 1);
+        assert!(vfs.state().handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_redirects_abort_s3_staging_and_preserve_existing_objects() {
+        use crate::sandbox::{CommandResult, Limits, Sandbox};
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        for drop_future in [false, true] {
+            let bucket = FakeBucket::new();
+            bucket.seed("existing", b"original");
+            let mut vfs = bucket_vfs(&bucket, None);
+            vfs.part_size = 8;
+            let vfs = Arc::new(vfs);
+            let staged = Arc::new(tokio::sync::Notify::new());
+            let notify = Arc::clone(&staged);
+            let sandbox = Sandbox::builder()
+                .clear_mounts()
+                .mount_arc("objects", Arc::clone(&vfs) as Arc<dyn Vfs>)
+                .cwd("/objects")
+                .limits(Limits {
+                    wall_time: Duration::from_millis(500),
+                    ..Limits::default()
+                })
+                .command("stage", move |mut ctx| {
+                    let notify = Arc::clone(&notify);
+                    async move {
+                        ctx.stdout
+                            .write_all(&[b'x'; 24])
+                            .await
+                            .expect("stage multipart output");
+                        ctx.stdout
+                            .flush()
+                            .await
+                            .expect("flush staged multipart output");
+                        notify.notify_one();
+                        std::future::pending::<CommandResult>().await
+                    }
+                })
+                .build();
+            let mut exec = Box::pin(sandbox.exec("stage > existing"));
+            tokio::select! {
+                result = &mut exec => panic!("exec ended before output was staged: {result:?}"),
+                _ = staged.notified() => {}
+            }
+            assert_eq!(bucket.open_uploads(), 1);
+            if drop_future {
+                drop(exec);
+            } else {
+                assert_eq!(exec.await.exit_code, 124);
+            }
+            // Cleanup may finish after the caller regains control. Bound this
+            // assertion independently of the execution timeout being tested.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !vfs.state().handles.is_empty() || bucket.open_uploads() != 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("all abandoned S3 handles cleaned up");
+            assert_eq!(bucket.body("existing").as_deref(), Some(&b"original"[..]));
+            assert_eq!(bucket.aborted().len(), 1);
+        }
     }
 }

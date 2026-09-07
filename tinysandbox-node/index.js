@@ -25,7 +25,7 @@ class Sandbox extends native.NativeSandbox {
 }
 
 async function runConformance(vfsFactory) {
-  return native.runConformance(async (quota) => native.createJsVfs(wrapVfs(await vfsFactory(firstArgument(quota)))))
+  return native.runConformance(async (quota) => native.createJsVfs(wrapVfs(await vfsFactory(quota))))
 }
 
 function normalizeOptions(options) {
@@ -55,15 +55,18 @@ function wrapCommands(commands) {
   return Object.fromEntries(
     Object.entries(commands).map(([name, command]) => [
       name,
-      async (call) => {
+      async (call, nativeContext) => {
+        const host = callbackContext(nativeContext)
         try {
-          const payload = firstArgument(call)
-          return normalizeCommandOutput(await command(payload))
+          host.context.signal.throwIfAborted()
+          return normalizeCommandOutput(await command({ ...call, ...host.context }))
         } catch (err) {
           return {
             exitCode: 1,
             stderr: Buffer.from(`${err?.message ?? err}\n`)
           }
+        } finally {
+          host.dispose()
         }
       }
     ])
@@ -77,11 +80,15 @@ function wrapGlobals(globals) {
       if (typeof global !== 'function') throw new TypeError(`global '${name}' must be a function`)
       return [
         name,
-        async (args) => {
+        async (args, nativeContext) => {
+          const host = callbackContext(nativeContext)
           try {
-            return { value: normalizeJsonValue(await global(firstArgument(args))) }
+            host.context.signal.throwIfAborted()
+            return { value: normalizeJsonValue(await global(args, host.context)) }
           } catch (err) {
             return { error: callbackErrorPayload(err) }
+          } finally {
+            host.dispose()
           }
         }
       ]
@@ -91,11 +98,45 @@ function wrapGlobals(globals) {
 
 function wrapFetch(fetch) {
   if (typeof fetch !== 'function') throw new TypeError('fetch must be a function')
-  return async (request) => {
+  return async (request, nativeContext) => {
+    const host = callbackContext(nativeContext)
     try {
-      return { response: normalizeFetchResponse(await fetch(normalizeFetchRequest(firstArgument(request)))) }
+      host.context.signal.throwIfAborted()
+      return { response: normalizeFetchResponse(await fetch(normalizeFetchRequest(request), host.context)) }
     } catch (err) {
       return { error: callbackErrorPayload(err) }
+    } finally {
+      host.dispose()
+    }
+  }
+}
+
+function callbackContext(native) {
+  const controller = new AbortController()
+  let active = true
+  const abort = () => controller.abort(new DOMException('Host callback cancelled', 'AbortError'))
+  const isCancelled = () => {
+    if (native.isCancelled()) abort()
+    return controller.signal.aborted
+  }
+  isCancelled()
+  // Subscribe to the Rust invocation's actual cancellation state. Disposing
+  // resolves this subscription after settlement; no independent timer survives.
+  native.cancelled().then((cancelled) => { if (active && cancelled) abort() })
+  return {
+    context: Object.freeze({
+      signal: controller.signal,
+      deadlineMs: native.deadlineMs ?? null,
+      remainingTimeMs: () => {
+        isCancelled()
+        return native.remainingTimeMs() ?? null
+      },
+      isCancelled
+    }),
+    dispose: () => {
+      active = false
+      native.dispose()
+      controller.abort(new DOMException('Host callback completed', 'AbortError'))
     }
   }
 }
@@ -106,7 +147,7 @@ function wrapVfs(vfs) {
       name,
       async (request) => {
         try {
-          return normalizeVfsResponse(name, await vfs[name](normalizeVfsRequest(request)))
+          return normalizeVfsResponse(name, await vfs[name](request))
         } catch (err) {
           return { error: errorPayload(err) }
         }
@@ -117,7 +158,7 @@ function wrapVfs(vfs) {
             'stats',
             async (request) => {
               try {
-                return normalizeVfsResponse('stats', await vfs.stats(normalizeVfsRequest(request)))
+                return normalizeVfsResponse('stats', await vfs.stats(request))
               } catch (err) {
                 return { error: errorPayload(err) }
               }
@@ -126,16 +167,6 @@ function wrapVfs(vfs) {
         : []
     )
   )
-}
-
-function normalizeVfsRequest(request) {
-  return firstArgument(request)
-}
-
-function firstArgument(value) {
-  // napi-rs TSFN callbacks marshal tuple arguments as an object with numeric
-  // keys, while direct wrapper calls already pass the request object.
-  return value && typeof value === 'object' && Object.hasOwn(value, '0') ? value[0] : value
 }
 
 function normalizeJsonValue(value) {
@@ -369,11 +400,6 @@ const prompts = Object.freeze({
   sessionPersistent: native.PROMPT_SESSION_PERSISTENT
 })
 
-exports.precompileJs = () => native.precompileJs()
-exports.usePrecompiledJs = (artifact) => native.usePrecompiledJs(artifact)
-exports.jsRuntimeSource = () => native.jsRuntimeSource()
-exports.NativeSandbox = native.NativeSandbox
-exports.SandboxFs = SandboxFs
 exports.Sandbox = Sandbox
 exports.runConformance = runConformance
 exports.prompts = prompts

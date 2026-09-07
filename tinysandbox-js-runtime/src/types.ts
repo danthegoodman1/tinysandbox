@@ -1,13 +1,17 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-export type HostGlobal = (argument: JsonValue) => JsonValue;
+export interface HostContext {
+  /** Aborts on callback completion; cancellation is refreshed at checkpoints and by context polling. */
+  readonly signal: AbortSignal;
+  /** Approximate Unix timestamp; remainingTimeMs uses the monotonic deadline. */
+  readonly deadlineMs: number;
+  remainingTimeMs(): number;
+  isCancelled(): boolean;
+}
+
+export type HostGlobal = (argument: JsonValue, context: HostContext) => JsonValue;
 
 export type VfsErrno = "EBADF" | "EBUSY" | "EXDEV" | "EACCES" | "EEXIST" | "EFBIG" | "EIO" | "EINVAL" | "EISDIR" | "ENOENT" | "ENOSPC" | "ENOTDIR" | "ENOTEMPTY";
-
-export declare class VfsError extends Error {
-  readonly code: VfsErrno;
-  constructor(code: VfsErrno, message?: string);
-}
 
 export interface VfsMetadata {
   fileType: "file" | "directory";
@@ -41,6 +45,8 @@ export interface Vfs {
   writeAt(handle: number, offset: number, data: Uint8Array): number;
   truncate(handle: number, len: number): void;
   close(handle: number): void;
+  /** Discard staged writes on failure; falls back to close when omitted. */
+  abort?(handle: number): void;
 }
 
 export interface RunCodeOptions {
@@ -49,8 +55,12 @@ export interface RunCodeOptions {
   wasmMemoryBytes?: number;
   quickjsHeapBytes?: number;
   timeoutMs?: number;
+  /** Synchronous execution observes aborts at checkpoints; timers cannot preempt host callbacks. */
+  signal?: AbortSignal;
   sourceBytes?: number;
   hostResponseBytes?: number;
+  hostInputBytes?: number;
+  maxOpenFiles?: number;
   stdoutBytes?: number;
   stderrBytes?: number;
   scriptPath?: string;
@@ -75,6 +85,3 @@ export interface JsEngine {
   runCode(code: string, options?: RunCodeOptions): RunResult;
   runFile(path: string, options: RunFileOptions): RunResult;
 }
-
-export declare const QUICKJS_INITIAL_MEMORY_BYTES: number;
-export declare function createEngine(wasm: BufferSource | WebAssembly.Module): Promise<JsEngine>;

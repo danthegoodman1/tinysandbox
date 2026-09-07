@@ -1,5 +1,7 @@
 use super::{Errno, VfsError, VfsResult};
 
+pub(crate) const MAX_PATH_DEPTH: usize = 256;
+
 pub(crate) fn normalize_path(path: &str) -> VfsResult<Vec<String>> {
     if path.is_empty() || !path.starts_with('/') || path.contains('\0') {
         return Err(VfsError::new(Errno::EINVAL));
@@ -13,7 +15,12 @@ pub(crate) fn normalize_path(path: &str) -> VfsResult<Vec<String>> {
             ".." => {
                 components.pop();
             }
-            name => components.push(name.to_owned()),
+            name => {
+                if components.len() >= MAX_PATH_DEPTH {
+                    return Err(VfsError::new(Errno::EINVAL));
+                }
+                components.push(name.to_owned());
+            }
         }
     }
 

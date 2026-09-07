@@ -1,13 +1,16 @@
 //! Local-directory VFS that persists sandbox files under a host directory.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::fd::AsFd;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use super::path::normalize_path;
+use rustix::fs::{AtFlags, Dir, Mode, OFlags, mkdirat, openat, renameat, statat, unlinkat};
+
+use super::path::{MAX_PATH_DEPTH, normalize_path};
 use super::{
     DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsQuota, VfsResult,
     VfsStats,
@@ -28,11 +31,15 @@ use super::{
 ///
 /// The root directory must be dedicated to the sandbox. Quota accounting and
 /// handle semantics assume no other process mutates the tree while the VFS is
-/// live; external writers can skew usage numbers but cannot break path
-/// containment.
+/// live. External writers can skew usage numbers, but replacing the root or
+/// an ancestor with a symlink cannot redirect filesystem operations. Opened
+/// directories retain their identity if the host renames them. The host must
+/// not plant hard links to outside files: a hard link grants access to the
+/// same inode, regardless of where its other names are located.
 #[derive(Debug)]
 pub struct LocalVfs {
     root: PathBuf,
+    root_dir: File,
     quota: VfsQuota,
     state: Mutex<State>,
 }
@@ -46,19 +53,15 @@ impl LocalVfs {
     /// Opens a local VFS rooted at an existing directory, enforcing `quota`.
     pub fn with_quota(root: impl AsRef<Path>, quota: VfsQuota) -> io::Result<Self> {
         let root = fs::canonicalize(root)?;
-        if !fs::symlink_metadata(&root)?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                "LocalVfs root must be a directory",
-            ));
-        }
+        let root_dir = File::from(rustix::fs::open(&root, directory_flags(), Mode::empty())?);
 
         let mut used_bytes = 0;
         let mut file_count = 0;
-        scan_tree(&root, &mut used_bytes, &mut file_count)?;
+        scan_tree(&root_dir, &mut used_bytes, &mut file_count)?;
 
         Ok(Self {
             root,
+            root_dir,
             quota,
             state: Mutex::new(State {
                 handles: BTreeMap::new(),
@@ -70,7 +73,8 @@ impl LocalVfs {
         })
     }
 
-    /// Returns the canonicalized host directory backing this VFS.
+    /// Returns the root's canonicalized path at construction. Operations use
+    /// the opened directory, which remains valid if this path is replaced.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -95,7 +99,8 @@ impl LocalVfs {
         let mut state = self.state();
         let mut used_bytes = 0;
         let mut file_count = 0;
-        scan_tree(&self.root, &mut used_bytes, &mut file_count).map_err(|err| io_error(&err))?;
+        scan_tree(&self.root_dir, &mut used_bytes, &mut file_count)
+            .map_err(|err| io_error(&err))?;
 
         let mut counted = BTreeSet::new();
         for handle in state.handles.values() {
@@ -134,25 +139,21 @@ impl LocalVfs {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Maps a VFS path onto the host directory, verifying that every
-    /// intermediate component is a real directory (never a symlink).
-    fn resolve(&self, path: &str) -> VfsResult<PathBuf> {
+    /// Opens each ancestor relative to its already-open parent. Each syscall
+    /// receives one normalized component and refuses symlinks; namespace
+    /// replacement cannot redirect a later operation through a checked path.
+    fn resolve(&self, path: &str) -> VfsResult<Resolved> {
         let components = normalize_path(path)?;
-        let mut resolved = self.root.clone();
-
-        for (index, component) in components.iter().enumerate() {
-            resolved.push(component);
-            if index + 1 == components.len() {
-                break;
-            }
-            match lookup(&resolved)?.as_ref().map(entry_kind) {
-                Some(EntryKind::Directory) => {}
-                Some(EntryKind::File) => return Err(VfsError::new(Errno::ENOTDIR)),
-                Some(EntryKind::Other) | None => return Err(VfsError::new(Errno::ENOENT)),
-            }
+        let mut parent = self.root_dir.try_clone().map_err(|err| io_error(&err))?;
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent = open_directory(&parent, component)?;
         }
-
-        Ok(resolved)
+        let name = components.last().cloned().unwrap_or_else(|| ".".into());
+        Ok(Resolved {
+            parent,
+            name,
+            components,
+        })
     }
 
     fn ensure_entry_slot(&self, state: &State) -> VfsResult<()> {
@@ -193,33 +194,32 @@ impl Vfs for LocalVfs {
     fn stat(&self, path: &str) -> VfsResult<Metadata> {
         let resolved = self.resolve(path)?;
         let _guard = self.state();
-        let meta = lookup(&resolved)?.ok_or(VfsError::new(Errno::ENOENT))?;
+        let meta = resolved.lookup()?.ok_or(VfsError::new(Errno::ENOENT))?;
         metadata_from(&meta).ok_or(VfsError::new(Errno::ENOENT))
     }
 
     fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
         let resolved = self.resolve(path)?;
         let _guard = self.state();
-        match lookup(&resolved)?.as_ref().map(entry_kind) {
-            Some(EntryKind::Directory) => {}
-            Some(EntryKind::File) => return Err(VfsError::new(Errno::ENOTDIR)),
-            Some(EntryKind::Other) | None => return Err(VfsError::new(Errno::ENOENT)),
-        }
-
+        let dir = open_directory(&resolved.parent, &resolved.name)?;
         let mut entries = Vec::new();
-        for entry in fs::read_dir(&resolved).map_err(|err| io_error(&err))? {
-            let entry = entry.map_err(|err| io_error(&err))?;
+        for entry in Dir::read_from(&dir).map_err(os_error)? {
+            let entry = entry.map_err(os_error)?;
             // Names the String-based VFS API cannot express are invisible.
-            let Ok(name) = entry.file_name().into_string() else {
+            let Ok(name) = entry.file_name().to_str() else {
                 continue;
             };
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(io_error(&err)),
+            if matches!(name, "." | "..") {
+                continue;
+            }
+            let Some(meta) = lookup(&dir, name)? else {
+                continue;
             };
             if let Some(metadata) = metadata_from(&meta) {
-                entries.push(DirEntry { name, metadata });
+                entries.push(DirEntry {
+                    name: name.into(),
+                    metadata,
+                });
             }
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -228,17 +228,17 @@ impl Vfs for LocalVfs {
 
     fn mkdir(&self, path: &str) -> VfsResult<()> {
         let resolved = self.resolve(path)?;
-        if resolved == self.root {
+        if resolved.is_root() {
             return Err(VfsError::new(Errno::EEXIST));
         }
 
         let mut state = self.state();
-        if lookup(&resolved)?.is_some() {
+        if resolved.lookup()?.is_some() {
             return Err(VfsError::new(Errno::EEXIST));
         }
         self.ensure_entry_slot(&state)?;
 
-        fs::create_dir(&resolved).map_err(|err| io_error(&err))?;
+        mkdirat(&resolved.parent, &resolved.name, Mode::from_raw_mode(0o777)).map_err(os_error)?;
         state.file_count += 1;
         Ok(())
     }
@@ -246,28 +246,38 @@ impl Vfs for LocalVfs {
     fn rename(&self, from: &str, to: &str) -> VfsResult<()> {
         let from_resolved = self.resolve(from)?;
         let to_resolved = self.resolve(to)?;
-        if from_resolved == self.root || to_resolved == self.root {
+        if from_resolved.is_root() || to_resolved.is_root() {
             return Err(VfsError::new(Errno::EINVAL));
         }
 
         let mut guard = self.state();
         let state = &mut *guard;
-        let source_kind = match lookup(&from_resolved)?.as_ref().map(entry_kind) {
+        let source_kind = match from_resolved.lookup()?.as_ref().map(entry_kind) {
             Some(EntryKind::Other) | None => return Err(VfsError::new(Errno::ENOENT)),
             Some(kind) => kind,
         };
-        if from_resolved == to_resolved {
+        if from_resolved.components == to_resolved.components {
             return Ok(());
         }
 
-        if source_kind == EntryKind::Directory && to_resolved.starts_with(&from_resolved) {
+        if source_kind == EntryKind::Directory
+            && to_resolved
+                .components
+                .starts_with(&from_resolved.components)
+        {
             return Err(VfsError::new(Errno::EINVAL));
         }
 
-        let target = lookup(&to_resolved)?;
-        fs::rename(&from_resolved, &to_resolved).map_err(|err| {
+        let target = to_resolved.lookup()?;
+        renameat(
+            &from_resolved.parent,
+            &from_resolved.name,
+            &to_resolved.parent,
+            &to_resolved.name,
+        )
+        .map_err(|err| {
             // POSIX allows either code when the target directory is non-empty.
-            let err = io_error(&err);
+            let err = os_error(err);
             if err.errno() == Errno::EEXIST {
                 VfsError::new(Errno::ENOTEMPTY)
             } else {
@@ -275,49 +285,51 @@ impl Vfs for LocalVfs {
             }
         })?;
 
-        if let Some(meta) = target
-            && entry_kind(&meta) == EntryKind::File
-        {
-            release_entry(state, file_key(&meta), meta.len());
+        if let Some(meta) = target {
+            match meta.kind {
+                EntryKind::File => release_entry(state, meta.key, meta.len),
+                EntryKind::Directory => state.file_count = state.file_count.saturating_sub(1),
+                EntryKind::Other => {}
+            }
         }
         Ok(())
     }
 
     fn unlink(&self, path: &str) -> VfsResult<()> {
         let resolved = self.resolve(path)?;
-        if resolved == self.root {
+        if resolved.is_root() {
             return Err(VfsError::new(Errno::EISDIR));
         }
 
         let mut state = self.state();
-        let meta = lookup(&resolved)?.ok_or(VfsError::new(Errno::ENOENT))?;
+        let meta = resolved.lookup()?.ok_or(VfsError::new(Errno::ENOENT))?;
         match entry_kind(&meta) {
             EntryKind::File => {}
             EntryKind::Directory => return Err(VfsError::new(Errno::EISDIR)),
             EntryKind::Other => return Err(VfsError::new(Errno::ENOENT)),
         }
 
-        fs::remove_file(&resolved).map_err(|err| io_error(&err))?;
-        release_entry(&mut state, file_key(&meta), meta.len());
+        unlinkat(&resolved.parent, &resolved.name, AtFlags::empty()).map_err(os_error)?;
+        release_entry(&mut state, meta.key, meta.len);
         Ok(())
     }
 
     fn rmdir(&self, path: &str) -> VfsResult<()> {
         let resolved = self.resolve(path)?;
-        if resolved == self.root {
+        if resolved.is_root() {
             return Err(VfsError::new(Errno::EBUSY));
         }
 
         let mut state = self.state();
-        match lookup(&resolved)?.as_ref().map(entry_kind) {
+        match resolved.lookup()?.as_ref().map(entry_kind) {
             Some(EntryKind::Directory) => {}
             Some(EntryKind::File) => return Err(VfsError::new(Errno::ENOTDIR)),
             Some(EntryKind::Other) | None => return Err(VfsError::new(Errno::ENOENT)),
         }
 
-        fs::remove_dir(&resolved).map_err(|err| {
+        unlinkat(&resolved.parent, &resolved.name, AtFlags::REMOVEDIR).map_err(|err| {
             // POSIX allows either code when the directory is non-empty.
-            let err = io_error(&err);
+            let err = os_error(err);
             if err.errno() == Errno::EEXIST {
                 VfsError::new(Errno::ENOTEMPTY)
             } else {
@@ -333,46 +345,53 @@ impl Vfs for LocalVfs {
         let resolved = self.resolve(path)?;
 
         let mut state = self.state();
-        let existing_len = match lookup(&resolved)? {
+        let creating = match resolved.lookup()? {
             Some(meta) => match entry_kind(&meta) {
                 EntryKind::Directory => return Err(VfsError::new(Errno::EISDIR)),
                 EntryKind::Other => return Err(VfsError::new(Errno::EACCES)),
                 EntryKind::File if mode.create_new => {
                     return Err(VfsError::new(Errno::EEXIST));
                 }
-                EntryKind::File => Some(meta.len()),
+                EntryKind::File => false,
             },
             None if mode.create || mode.create_new => {
                 self.ensure_entry_slot(&state)?;
-                None
+                true
             }
             None => return Err(VfsError::new(Errno::ENOENT)),
         };
-        let creating = existing_len.is_none();
-
         // O_NOFOLLOW keeps a symlink swapped in after the lookup from being
         // followed; O_NONBLOCK keeps a swapped-in FIFO from blocking the open.
-        // The fstat below then rejects anything that is not a regular file.
-        let file = OpenOptions::new()
-            .read(mode.read)
-            .write(mode.write || creating)
-            .create(creating)
-            .create_new(mode.create_new)
-            .truncate(mode.truncate)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&resolved)
-            .map_err(|err| io_error(&err))?;
+        // Validate the opened file before truncating so replacement with a
+        // special file cannot make truncation act on an unchecked object.
+        let mut flags = OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        flags |= match (mode.read, mode.write || creating) {
+            (true, true) => OFlags::RDWR,
+            (false, true) => OFlags::WRONLY,
+            _ => OFlags::RDONLY,
+        };
+        if creating {
+            // A racing host creation must not consume an unaccounted entry.
+            flags |= OFlags::CREATE | OFlags::EXCL;
+        }
+        let file = File::from(
+            openat(
+                &resolved.parent,
+                &resolved.name,
+                flags,
+                Mode::from_raw_mode(0o666),
+            )
+            .map_err(os_error)?,
+        );
 
         let meta = file.metadata().map_err(|err| io_error(&err))?;
         if !meta.is_file() {
             return Err(VfsError::new(Errno::EACCES));
         }
 
-        if mode.truncate
-            && let Some(old_len) = existing_len
-        {
-            // The open already truncated; usage drops by the previous length.
-            state.used_bytes = state.used_bytes.saturating_sub(old_len);
+        if mode.truncate {
+            file.set_len(0).map_err(|err| io_error(&err))?;
+            state.used_bytes = state.used_bytes.saturating_sub(meta.len());
         }
         if creating {
             state.file_count += 1;
@@ -543,21 +562,39 @@ enum EntryKind {
     Other,
 }
 
-fn entry_kind(meta: &fs::Metadata) -> EntryKind {
-    if meta.is_dir() {
-        EntryKind::Directory
-    } else if meta.is_file() {
-        EntryKind::File
-    } else {
-        EntryKind::Other
+/// The only namespace reference passed to mutations: an owned parent and a
+/// single entry name. Neither a host pathname nor a symlink is resolved again.
+struct Resolved {
+    parent: File,
+    name: String,
+    components: Vec<String>,
+}
+
+impl Resolved {
+    fn is_root(&self) -> bool {
+        self.components.is_empty()
+    }
+
+    fn lookup(&self) -> VfsResult<Option<EntryMetadata>> {
+        lookup(&self.parent, &self.name)
     }
 }
 
-fn metadata_from(meta: &fs::Metadata) -> Option<Metadata> {
+struct EntryMetadata {
+    kind: EntryKind,
+    key: FileKey,
+    len: u64,
+}
+
+fn entry_kind(meta: &EntryMetadata) -> EntryKind {
+    meta.kind
+}
+
+fn metadata_from(meta: &EntryMetadata) -> Option<Metadata> {
     match entry_kind(meta) {
         EntryKind::File => Some(Metadata {
             file_type: FileType::File,
-            len: meta.len(),
+            len: meta.len,
         }),
         EntryKind::Directory => Some(Metadata {
             file_type: FileType::Directory,
@@ -567,12 +604,45 @@ fn metadata_from(meta: &fs::Metadata) -> Option<Metadata> {
     }
 }
 
-/// Stats a path without following symlinks; `None` when it does not exist.
-fn lookup(path: &Path) -> VfsResult<Option<fs::Metadata>> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => Ok(Some(meta)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(io_error(&err)),
+/// Stats one entry without following symlinks; `None` when it does not exist.
+fn lookup(dir: &File, name: &str) -> VfsResult<Option<EntryMetadata>> {
+    lookup_io(dir, name).map_err(|err| io_error(&err))
+}
+
+// dev_t and ino_t have different widths/signedness across supported Unix hosts.
+#[allow(clippy::unnecessary_cast)]
+fn lookup_io(dir: impl AsFd, name: impl rustix::path::Arg) -> io::Result<Option<EntryMetadata>> {
+    match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(meta) => Ok(Some(EntryMetadata {
+            kind: match rustix::fs::FileType::from_raw_mode(meta.st_mode) {
+                rustix::fs::FileType::RegularFile => EntryKind::File,
+                rustix::fs::FileType::Directory => EntryKind::Directory,
+                _ => EntryKind::Other,
+            },
+            key: (meta.st_dev as u64, meta.st_ino as u64),
+            len: meta.st_size.max(0) as u64,
+        })),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn open_directory(parent: &File, name: &str) -> VfsResult<File> {
+    match openat(parent, name, directory_flags(), Mode::empty()) {
+        Ok(fd) => Ok(fd.into()),
+        // NOFOLLOW|DIRECTORY reports ELOOP on some Unix hosts and ENOTDIR
+        // on others. Preserve the VFS's invisible-link semantics in both.
+        Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) => {
+            match lookup(parent, name)?.as_ref().map(entry_kind) {
+                Some(EntryKind::File) => Err(VfsError::new(Errno::ENOTDIR)),
+                _ => Err(VfsError::new(Errno::ENOENT)),
+            }
+        }
+        Err(err) => Err(os_error(err)),
     }
 }
 
@@ -597,21 +667,61 @@ fn release_entry(state: &mut State, key: FileKey, len: u64) {
     }
 }
 
-fn scan_tree(dir: &Path, used_bytes: &mut u64, file_count: &mut u64) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
+fn scan_tree(root: &File, used_bytes: &mut u64, file_count: &mut u64) -> io::Result<()> {
+    // Keep only the active ancestry open, without recursive Rust calls or a
+    // pending descriptor for every sibling directory in a wide host tree.
+    let mut stack = vec![Dir::read_from(root)?];
+    loop {
+        let depth = stack.len();
+        let Some(entries) = stack.last_mut() else {
+            break;
+        };
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
         let entry = entry?;
-        // DirEntry::metadata does not follow symlinks, so links and special
-        // files fall through unaccounted, matching their invisibility.
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
-            *file_count += 1;
-            scan_tree(&entry.path(), used_bytes, file_count)?;
-        } else if meta.is_file() {
-            *file_count += 1;
-            *used_bytes = used_bytes.saturating_add(meta.len());
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let dir = entries.fd()?;
+        let Some(meta) = lookup_io(dir, name)? else {
+            continue;
+        };
+        if meta.kind != EntryKind::Other && depth > MAX_PATH_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LocalVfs tree exceeds maximum path depth",
+            ));
+        }
+        match meta.kind {
+            EntryKind::Directory => {
+                let child = match openat(dir, name, directory_flags(), Mode::empty()) {
+                    Ok(fd) => fd,
+                    // A concurrent unlink/symlink replacement is invisible.
+                    Err(
+                        rustix::io::Errno::NOENT
+                        | rustix::io::Errno::NOTDIR
+                        | rustix::io::Errno::LOOP,
+                    ) => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                *file_count = file_count.saturating_add(1);
+                stack.push(Dir::new(child)?);
+            }
+            EntryKind::File => {
+                *file_count = file_count.saturating_add(1);
+                *used_bytes = used_bytes.saturating_add(meta.len);
+            }
+            EntryKind::Other => {}
         }
     }
     Ok(())
+}
+
+fn os_error(err: rustix::io::Errno) -> VfsError {
+    io_error(&err.into())
 }
 
 fn io_error(err: &io::Error) -> VfsError {

@@ -11,17 +11,15 @@
 //! direct `Response` construction synthesizes a default reason phrase for
 //! `statusText`; and tinysandbox accepts a non-standard `Response` `url` init.
 //! JS execution uses the sandbox wall-clock budget, but timeout handling returns
-//! a clean 124 result and discards buffered JS stdout/stderr instead of returning
-//! partial output. Module stack traces still reflect QuickJS details: wrapper
-//! prefixes leave a line-1 column offset, method frames are named like `at boom`,
+//! a clean 124 result. Output streams directly through the command pipes, so
+//! partial output remains available when execution stops. Module stack traces
+//! still reflect QuickJS details: wrapper prefixes leave a line-1 column offset, method frames are named like `at boom`,
 //! and visible `<tinysandbox>` glue frames can appear below user frames.
 //!
-//! `quickjs.wasm` is machine code by the time a script runs. The build script
-//! compiles it for this crate's target and the module embeds the result, so the
-//! first `js` command loads it rather than running Cranelift. [`precompile`]
-//! and [`use_precompiled`] produce and install an artifact by hand, for a
-//! different machine or a differently built process, and
-//! [`runtime_source`] reports which path a process ended up on.
+//! The build script precompiles `quickjs.wasm` for this crate's target. The
+//! runtime loads that embedded artifact, falling back to compiling the fixed
+//! Wasm module when necessary. Applications configure the sandbox, not the
+//! engine or native artifacts.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -33,30 +31,32 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use wasmtime::{
     Caller, Engine, Extern, Linker, Memory, MemoryType, Module, ResourceLimiter, Store, Trap,
 };
 
+use crate::sandbox::HostContext;
 use crate::sandbox::command::{Command, CommandContext, CommandFuture, CommandResult};
 use crate::sandbox::fs::{Fs, join_path};
 use crate::sandbox::host::{Fetch, FetchRequest, FetchResponse, HostError, JsGlobal};
 use crate::vfs::{Errno, FileHandle, FileType, Metadata, OpenMode, VfsError};
 
-include!("engine_config.rs");
+use crate::wasm::EPOCH_TICK;
 
 const QUICKJS_WASM: &[u8] = include_bytes!("../../assets/quickjs.wasm");
 /// Machine code for [`QUICKJS_WASM`], produced by `build.rs` for this target.
 #[cfg(quickjs_precompiled)]
 const QUICKJS_CWASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quickjs.cwasm"));
-const EPOCH_TICK: Duration = Duration::from_millis(5);
 const WASM_PAGE_BYTES: usize = 64 * 1024;
 const QUICKJS_INITIAL_MEMORY_PAGES: u32 = 19;
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
-const OUTPUT_TRUNCATION_MARKER: &[u8] = b"\n[tinysandbox: output truncated]\n";
+const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+const MAX_CONCURRENT_JS: usize = 16;
 
 /// Registers the `js` command in a sandbox command registry.
-pub fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
+pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     commands.insert("js".to_owned(), Arc::new(js_command));
 }
 
@@ -76,15 +76,33 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
             ..
         } = ctx;
 
-        let invocation = match Invocation::parse(args, &fs).await {
+        let started = Instant::now();
+        let source_bytes = limits.host_input_bytes.min(limits.wasm_memory_bytes);
+        // Admission is bounded independently of Tokio's blocking pool. The
+        // worker owns the permit until it has actually exited, even when the
+        // command future is cancelled while a host callback is still running.
+        static WORKERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let workers = WORKERS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_JS)));
+        let remaining = fs
+            .remaining_wall_time()
+            .unwrap_or_else(|| limits.wall_time.saturating_sub(started.elapsed()));
+        let permit = match tokio::time::timeout(remaining, workers.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            _ => return CommandResult::new(124),
+        };
+        let invocation = match Invocation::parse(args, &fs, source_bytes).await {
             Ok(invocation) => invocation,
             Err(message) => {
+                if fs.is_cancelled() {
+                    return CommandResult::new(124);
+                }
                 let _ = stderr.write_all(message.as_bytes()).await;
                 return CommandResult::new(1);
             }
         };
         let host_runtime = tokio::runtime::Handle::current();
 
+        let (output, mut chunks) = mpsc::channel::<OutputChunk>(1);
         let config = JsRunConfig {
             invocation,
             env,
@@ -96,29 +114,51 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
             limits: JsRuntimeLimits {
                 wasm_memory_bytes: limits.wasm_memory_bytes,
                 fetch_response_bytes: limits.fetch_response_bytes,
-                source_bytes: limits.wasm_memory_bytes,
+                source_bytes,
                 // A serialized host response larger than the guest's entire
                 // linear-memory allowance can never cross successfully.
                 host_response_bytes: limits.wasm_memory_bytes,
-                stdout_bytes: limits.stdout_bytes,
-                stderr_bytes: limits.stderr_bytes,
+                host_input_bytes: limits.host_input_bytes,
+                max_open_files: limits.max_open_files,
                 wall_time: limits.wall_time,
             },
             host_runtime,
+            output,
+            started,
         };
 
-        let result =
-            match tokio::task::spawn_blocking(move || run_quickjs_on_host_stack(config)).await {
-                Ok(result) => result,
-                Err(err) => JsRunResult {
-                    exit_code: 1,
-                    stdout: Vec::new(),
-                    stderr: format!("js: runtime task failed: {err}\n").into_bytes(),
-                    peak_wasm_memory_bytes: 0,
-                },
-            };
+        let (finished, result) = oneshot::channel();
+        if let Err(err) = thread::Builder::new()
+            .name("tinysandbox-js-runtime".to_owned())
+            .stack_size(QUICKJS_HOST_THREAD_STACK_BYTES)
+            .spawn(move || {
+                let _permit = permit;
+                let _ = finished.send(run_quickjs(config));
+            })
+        {
+            let _ = stderr
+                .write_all(format!("js: failed to start runtime thread: {err}\n").as_bytes())
+                .await;
+            return CommandResult::failure();
+        }
 
-        let _ = stdout.write_all(&result.stdout).await;
+        // Ack only after the downstream write completes. This preserves bytes
+        // and ordering, applies backpressure, and lets early pipe closure stop
+        // the producer. Dropping this future also drops the pending ack.
+        while let Some(chunk) = chunks.recv().await {
+            let destination = if chunk.stdout {
+                &mut stdout
+            } else {
+                &mut stderr
+            };
+            let written = destination.write_all(&chunk.bytes).await;
+            let _ = chunk.ack.send(written);
+        }
+        let result = result.await.unwrap_or_else(|_| JsRunResult {
+            exit_code: 1,
+            stderr: b"js: runtime thread panicked\n".to_vec(),
+            peak_wasm_memory_bytes: 0,
+        });
         let _ = stderr.write_all(&result.stderr).await;
         CommandResult::new(result.exit_code).with_peak_wasm_memory(result.peak_wasm_memory_bytes)
     })
@@ -134,6 +174,8 @@ struct JsRunConfig {
     js_prelude: Arc<str>,
     limits: JsRuntimeLimits,
     host_runtime: tokio::runtime::Handle,
+    output: mpsc::Sender<OutputChunk>,
+    started: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -142,33 +184,15 @@ struct JsRuntimeLimits {
     fetch_response_bytes: usize,
     source_bytes: usize,
     host_response_bytes: usize,
-    stdout_bytes: usize,
-    stderr_bytes: usize,
+    host_input_bytes: usize,
+    max_open_files: usize,
     wall_time: Duration,
 }
 
-fn run_quickjs_on_host_stack(config: JsRunConfig) -> JsRunResult {
-    match thread::Builder::new()
-        .name("tinysandbox-js-runtime".to_owned())
-        .stack_size(QUICKJS_HOST_THREAD_STACK_BYTES)
-        .spawn(move || run_quickjs(config))
-    {
-        Ok(handle) => match handle.join() {
-            Ok(result) => result,
-            Err(_) => JsRunResult {
-                exit_code: 1,
-                stdout: Vec::new(),
-                stderr: b"js: runtime task panicked\n".to_vec(),
-                peak_wasm_memory_bytes: 0,
-            },
-        },
-        Err(err) => JsRunResult {
-            exit_code: 1,
-            stdout: Vec::new(),
-            stderr: format!("js: failed to start runtime thread: {err}\n").into_bytes(),
-            peak_wasm_memory_bytes: 0,
-        },
-    }
+struct OutputChunk {
+    stdout: bool,
+    bytes: Vec<u8>,
+    ack: oneshot::Sender<std::io::Result<()>>,
 }
 
 struct Invocation {
@@ -178,12 +202,17 @@ struct Invocation {
 }
 
 impl Invocation {
-    async fn parse(args: Vec<String>, fs: &Fs) -> Result<Self, String> {
+    async fn parse(args: Vec<String>, fs: &Fs, source_bytes: usize) -> Result<Self, String> {
         match args.as_slice() {
             [] => Err("js: usage: js [-e code] script.js [args...]\n".to_owned()),
             [flag, ..] if flag == "-e" => {
                 if args.len() < 2 {
                     return Err("js: option requires an argument -- e\n".to_owned());
+                }
+                if args[1].len() > source_bytes {
+                    return Err(format!(
+                        "js: script source exceeded limit of {source_bytes} bytes\n"
+                    ));
                 }
                 let code = args[1].clone();
                 let mut argv = vec!["js".to_owned(), "-e".to_owned()];
@@ -196,9 +225,12 @@ impl Invocation {
             }
             [flag, ..] if flag.starts_with('-') => Err(format!("js: unsupported option {flag}\n")),
             [script, rest @ ..] => {
-                let data = fs.read_file(script).await.map_err(|err| {
-                    format!("js: {script}: {}\n", node_errno_message(err.errno()))
-                })?;
+                let data = fs
+                    .read_file_bounded(script, source_bytes)
+                    .await
+                    .map_err(|err| {
+                        format!("js: {script}: {}\n", node_errno_message(err.errno()))
+                    })?;
                 let code = String::from_utf8(data)
                     .map_err(|_| format!("js: {script}: script is not valid UTF-8\n"))?;
                 let mut argv = vec!["js".to_owned(), script.clone()];
@@ -228,7 +260,6 @@ struct GuestConfig<'a> {
 
 struct JsRunResult {
     exit_code: i32,
-    stdout: Vec<u8>,
     stderr: Vec<u8>,
     peak_wasm_memory_bytes: usize,
 }
@@ -238,13 +269,22 @@ fn run_quickjs(config: JsRunConfig) -> JsRunResult {
         Ok(result) => result,
         Err(err) if is_epoch_timeout(&err) => JsRunResult {
             exit_code: 124,
-            stdout: Vec::new(),
             stderr: b"js: command timed out\n".to_vec(),
             peak_wasm_memory_bytes: 0,
         },
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            JsRunResult {
+                exit_code: 141,
+                stderr: Vec::new(),
+                peak_wasm_memory_bytes: 0,
+            }
+        }
         Err(err) => JsRunResult {
             exit_code: 1,
-            stdout: Vec::new(),
             stderr: format!("js: {err}\n").into_bytes(),
             peak_wasm_memory_bytes: 0,
         },
@@ -262,7 +302,17 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         js_prelude,
         limits,
         host_runtime,
+        output,
+        started,
     } = config;
+    if fs.is_cancelled()
+        || fs
+            .remaining_wall_time()
+            .unwrap_or_else(|| limits.wall_time.saturating_sub(started.elapsed()))
+            .is_zero()
+    {
+        return Err(Trap::Interrupt.into());
+    }
     let compiled = compiled_runtime()?;
     if invocation.code.len() > limits.source_bytes {
         return Err(wasmtime::Error::msg(format!(
@@ -282,10 +332,16 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
             globals: js_globals,
             fetch: js_fetch,
             limits,
+            output,
+            started,
         }),
     );
     store.limiter(|state| &mut state.limiter);
-    store.set_epoch_deadline(epoch_ticks(limits.wall_time));
+    let remaining = store.data().remaining_wall_time();
+    if remaining.is_zero() || store.data().fs.is_cancelled() {
+        return Err(Trap::Interrupt.into());
+    }
+    store.set_epoch_deadline(epoch_ticks(remaining));
     store.epoch_deadline_trap();
 
     let max_pages = (limits.wasm_memory_bytes / WASM_PAGE_BYTES).min(65_536);
@@ -329,7 +385,7 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         prelude: &js_prelude,
         vfs: true,
     };
-    let input = serde_json::to_vec(&config).map_err(wasmtime::Error::new)?;
+    let input = bounded_json(&config, limits.wasm_memory_bytes).map_err(wasmtime::Error::new)?;
     let len = i32::try_from(input.len()).map_err(|_| wasmtime::Error::msg("script too large"))?;
     let ptr = alloc.call(&mut store, len)?;
     memory.write(&mut store, ptr_usize(ptr)?, &input)?;
@@ -339,28 +395,33 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         Err(_) if store.data().limiter.limit_exceeded => {
             return Ok(JsRunResult {
                 exit_code: 1,
-                stdout: store.data().stdout.finish_payload(),
                 stderr: b"js: wasm memory limit exceeded\n".to_vec(),
                 peak_wasm_memory_bytes: store.data().limiter.peak_memory_bytes,
             });
         }
         Err(err) => {
-            if store.data().timed_out {
+            if store.data().timed_out
+                || store.data().fs.is_cancelled()
+                || store.data().remaining_wall_time().is_zero()
+            {
                 return Err(Trap::Interrupt.into());
             }
             return Err(err);
         }
     };
-    if store.data().timed_out {
+    if store.data().timed_out
+        || store.data().fs.is_cancelled()
+        || store.data().remaining_wall_time().is_zero()
+    {
         return Err(Trap::Interrupt.into());
     }
     free.call(&mut store, ptr)?;
 
+    store.data_mut().finish_files(exit_code == 0)?;
     let state = store.data();
     Ok(JsRunResult {
         exit_code,
-        stdout: state.stdout.finish_payload(),
-        stderr: state.stderr.finish_payload(),
+        stderr: Vec::new(),
         peak_wasm_memory_bytes: state.limiter.peak_memory_bytes,
     })
 }
@@ -378,7 +439,6 @@ fn epoch_ticks(wall_time: Duration) -> u64 {
 struct CompiledRuntime {
     engine: Engine,
     module: Module,
-    source: RuntimeSource,
 }
 
 static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
@@ -386,155 +446,23 @@ static RUNTIME: OnceLock<wasmtime::Result<CompiledRuntime>> = OnceLock::new();
 fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
     RUNTIME
         .get_or_init(|| {
-            let engine = Engine::new(&quickjs_engine_config(None)?)?;
-            let (module, source) = load_module(&engine)?;
-            link_runtime(engine, module, source)
+            let engine = crate::wasm::engine()?.clone();
+            let module = load_module(&engine)?;
+            Ok(CompiledRuntime { engine, module })
         })
         .as_ref()
         .map_err(|err| wasmtime::Error::msg(err.to_string()))
 }
 
-/// Where the machine code backing the JavaScript runtime came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeSource {
-    /// Loaded from the artifact the build script precompiled, or from one
-    /// installed with [`use_precompiled`].
-    Precompiled,
-    /// Compiled in this process, the slow path the build normally avoids.
-    Compiled,
-}
-
-/// Reports where this process's JavaScript runtime came from, initializing it
-/// if no `js` command has run yet.
-///
-/// [`RuntimeSource::Compiled`] means the process paid for compilation: the
-/// build script produced no artifact, or the one it produced was rejected by
-/// this engine.
-pub fn runtime_source() -> Result<RuntimeSource, PrecompileError> {
-    compiled_runtime()
-        .map(|runtime| runtime.source)
-        .map_err(|err| PrecompileError::new(err.to_string()))
-}
-
-fn engine() -> Result<Engine, PrecompileError> {
-    quickjs_engine_config(None)
-        .and_then(|config| Engine::new(&config))
-        .map_err(|err| PrecompileError::new(format!("wasmtime engine: {err}")))
-}
-
-/// Loads the module, preferring the build script's artifact.
-///
-/// A rejected artifact is not an error: an engine or CPU the build did not
-/// target falls back to compiling, which is slower but correct.
-fn load_module(engine: &Engine) -> wasmtime::Result<(Module, RuntimeSource)> {
+/// Loads the module, preferring the build script's trusted artifact.
+fn load_module(engine: &Engine) -> wasmtime::Result<Module> {
     #[cfg(quickjs_precompiled)]
-    if let Ok(module) = deserialize_module(engine, QUICKJS_CWASM) {
-        return Ok((module, RuntimeSource::Precompiled));
-    }
-    Module::new(engine, QUICKJS_WASM).map(|module| (module, RuntimeSource::Compiled))
-}
-
-fn deserialize_module(engine: &Engine, artifact: &[u8]) -> wasmtime::Result<Module> {
-    // SAFETY: Wasmtime validates its own header and rejects artifacts from a
-    // different version or for CPU features this machine lacks; the remaining
-    // contract, that the bytes came from `precompile`, is documented on the
-    // public entry points.
+    // SAFETY: build.rs generated these embedded bytes from our fixed guest.
     #[allow(unsafe_code)]
-    unsafe {
-        Module::deserialize(engine, artifact)
+    if let Ok(module) = unsafe { Module::deserialize(engine, QUICKJS_CWASM) } {
+        return Ok(module);
     }
-}
-
-fn link_runtime(
-    engine: Engine,
-    module: Module,
-    source: RuntimeSource,
-) -> wasmtime::Result<CompiledRuntime> {
-    start_epoch_thread(engine.clone());
-    Ok(CompiledRuntime {
-        engine,
-        module,
-        source,
-    })
-}
-
-/// Error from the precompiled-runtime APIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrecompileError {
-    message: String,
-}
-
-impl PrecompileError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for PrecompileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for PrecompileError {}
-
-/// Compiles the embedded QuickJS module and returns the machine-code artifact.
-///
-/// The build script already does this for the crate's own target, so a normal
-/// build never runs Cranelift at runtime. Use this to produce an artifact
-/// yourself: to target a different machine, or to share one across processes
-/// that build separately.
-///
-/// The engine here matches the one the runtime uses, so the artifact loads
-/// through [`use_precompiled`] on any machine of the same architecture.
-///
-/// The artifact is tied to this Wasmtime version and to the CPU features of the
-/// machine it targets; Wasmtime rejects a mismatched artifact rather than
-/// running it, so treat it as a build output, never as a portable asset.
-pub fn precompile() -> Result<Vec<u8>, PrecompileError> {
-    engine()?
-        .precompile_module(QUICKJS_WASM)
-        .map_err(|err| PrecompileError::new(format!("precompile quickjs module: {err}")))
-}
-
-/// Installs an artifact from [`precompile`] as this process's JavaScript
-/// runtime, in place of the one the build script embedded.
-///
-/// Call it before the first `js` command: the runtime is initialized once per
-/// process, so a later call fails and leaves the existing runtime in place. A
-/// stale or foreign artifact fails here too, which is the signal to fall back to
-/// the normal path and let the next `js` command compile the module.
-///
-/// # Safety
-///
-/// Wasmtime trusts these bytes as its own output. Load only an artifact your
-/// build produced with [`precompile`], from a location you control.
-pub fn use_precompiled(artifact: &[u8]) -> Result<(), PrecompileError> {
-    let engine = engine()?;
-    let module = deserialize_module(&engine, artifact)
-        .map_err(|err| PrecompileError::new(format!("deserialize quickjs module: {err}")))?;
-    let runtime = link_runtime(engine, module, RuntimeSource::Precompiled)
-        .map_err(|err| PrecompileError::new(format!("link quickjs runtime: {err}")))?;
-    RUNTIME.set(Ok(runtime)).map_err(|_| {
-        PrecompileError::new("the JavaScript runtime is already initialized in this process")
-    })
-}
-
-fn start_epoch_thread(engine: Engine) {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        thread::Builder::new()
-            .name("tinysandbox-js-epoch".to_owned())
-            .spawn(move || {
-                loop {
-                    thread::sleep(EPOCH_TICK);
-                    engine.increment_epoch();
-                }
-            })
-            .expect("start tinysandbox js epoch thread");
-    });
+    Module::new(engine, QUICKJS_WASM)
 }
 
 struct HostState {
@@ -543,14 +471,15 @@ struct HostState {
     host_runtime: tokio::runtime::Handle,
     globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     fetch: Option<Arc<dyn Fetch>>,
-    stdout: BoundedOutput,
-    stderr: BoundedOutput,
+    output: mpsc::Sender<OutputChunk>,
     response: Vec<u8>,
     fds: BTreeMap<i32, OpenFile>,
     next_fd: i32,
     limiter: WasmLimiter,
     fetch_response_bytes: usize,
     host_response_bytes: usize,
+    host_input_bytes: usize,
+    max_open_files: usize,
     rng: u64,
     started: Instant,
     wall_time: Duration,
@@ -564,6 +493,8 @@ struct HostStateConfig {
     globals: Arc<BTreeMap<String, Arc<dyn JsGlobal>>>,
     fetch: Option<Arc<dyn Fetch>>,
     limits: JsRuntimeLimits,
+    output: mpsc::Sender<OutputChunk>,
+    started: Instant,
 }
 
 impl HostState {
@@ -575,6 +506,8 @@ impl HostState {
             globals,
             fetch,
             limits,
+            output,
+            started,
         } = config;
         Self {
             fs,
@@ -582,16 +515,17 @@ impl HostState {
             host_runtime,
             globals,
             fetch,
-            stdout: BoundedOutput::new(limits.stdout_bytes),
-            stderr: BoundedOutput::new(limits.stderr_bytes),
+            output,
             response: Vec::new(),
             fds: BTreeMap::new(),
             next_fd: 3,
             limiter: WasmLimiter::new(limits.wasm_memory_bytes),
             fetch_response_bytes: limits.fetch_response_bytes,
             host_response_bytes: limits.host_response_bytes,
+            host_input_bytes: limits.host_input_bytes,
+            max_open_files: limits.max_open_files,
             rng: 0x7468_696e_626f_7821,
-            started: Instant::now(),
+            started,
             wall_time: limits.wall_time,
             timed_out: false,
         }
@@ -602,138 +536,104 @@ impl HostState {
     }
 
     fn remaining_wall_time(&self) -> Duration {
-        self.wall_time.saturating_sub(self.started.elapsed())
+        self.fs
+            .remaining_wall_time()
+            .unwrap_or_else(|| self.wall_time.saturating_sub(self.started.elapsed()))
+    }
+
+    fn host_read_bytes(&self) -> usize {
+        // Reserve room for JSON framing and base64 expansion before reading.
+        self.host_input_bytes
+            .min(self.host_response_bytes.saturating_sub(128) / 4 * 3)
+    }
+
+    fn finish_files(&mut self, commit: bool) -> wasmtime::Result<()> {
+        let mut failure = None;
+        for (_, file) in std::mem::take(&mut self.fds) {
+            let result = if commit && !self.fs.is_cancelled() {
+                self.block_on(self.fs.close(file.handle))
+            } else {
+                self.block_on(self.fs.abort(file.handle))
+            };
+            if let Err(err) = result {
+                failure.get_or_insert(err);
+            }
+        }
+        failure.map_or(Ok(()), |err| Err(wasmtime::Error::new(err)))
     }
 }
 
+impl Drop for HostState {
+    fn drop(&mut self) {
+        // Covers traps, initialization errors, timeout, and unwinding. Staged
+        // outputs from an unsuccessful execution must not be committed here.
+        let _ = self.finish_files(false);
+    }
+}
+
+struct HostCallTimeout;
+
 fn block_on_host_timeout<F, T>(
     state: &HostState,
-    future: F,
-) -> Result<T, tokio::time::error::Elapsed>
+    call: impl FnOnce(HostContext) -> F,
+) -> Result<T, HostCallTimeout>
 where
     F: Future<Output = T>,
 {
-    // Fire before the outer command deadline so the guest can observe the
-    // host-call error. A measured 50ms is sufficient for QuickJS to
-    // catch/render it, while the quarter-budget ceiling keeps short budgets
-    // useful instead of timing out immediately.
+    // Preserve time for the guest to catch/render host errors before the outer
+    // command expires. This shorter deadline is visible to the callback too.
     let headroom = (EPOCH_TICK * 10).min(state.wall_time / 4);
     let remaining = state.remaining_wall_time().saturating_sub(headroom);
-    state
-        .host_runtime
-        .block_on(async move { tokio::time::timeout(remaining, future).await })
+    let deadline = Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(Instant::now);
+    let context = state.fs.host_context().child(deadline);
+    struct CancelOnDrop(HostContext);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    let _guard = CancelOnDrop(context.clone());
+    state.host_runtime.block_on(async {
+        if context.is_cancelled() {
+            return Err(HostCallTimeout);
+        }
+        let future = call(context.clone());
+        let mut future = std::pin::pin!(future);
+        let mut cancelled = std::pin::pin!(context.cancelled());
+        std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            if context.is_cancelled() {
+                return Poll::Ready(Err(HostCallTimeout));
+            }
+            if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                return Poll::Ready(if context.is_cancelled() {
+                    Err(HostCallTimeout)
+                } else {
+                    Ok(value)
+                });
+            }
+            if cancelled.as_mut().poll(cx).is_ready() {
+                Poll::Ready(Err(HostCallTimeout))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    })
 }
 
 #[derive(Clone)]
 struct OpenFile {
     handle: FileHandle,
     position: u64,
-    path: String,
 }
 
 struct WasmLimiter {
     max_memory_bytes: usize,
     peak_memory_bytes: usize,
     limit_exceeded: bool,
-}
-
-struct BoundedOutput {
-    cap: usize,
-    total: usize,
-    pre_truncation: Vec<u8>,
-    head: Vec<u8>,
-    tail: Vec<u8>,
-    truncated: bool,
-}
-
-impl BoundedOutput {
-    fn new(cap: usize) -> Self {
-        Self {
-            cap,
-            total: 0,
-            pre_truncation: Vec::new(),
-            head: Vec::new(),
-            tail: Vec::new(),
-            truncated: false,
-        }
-    }
-
-    fn plan(&self, len: usize) -> (usize, usize) {
-        if !self.truncated && len <= self.cap.saturating_sub(self.total) {
-            return (len, 0);
-        }
-        let prefix = if self.truncated {
-            0
-        } else {
-            self.cap.saturating_sub(self.total)
-        };
-        let tail_limit = self
-            .cap
-            .saturating_sub(OUTPUT_TRUNCATION_MARKER.len())
-            .div_ceil(2);
-        (prefix, len.min(tail_limit))
-    }
-
-    fn append(&mut self, len: usize, prefix: &[u8], suffix: &[u8]) {
-        if !self.truncated && len <= self.cap.saturating_sub(self.total) {
-            self.pre_truncation.extend_from_slice(prefix);
-            self.total = self.total.saturating_add(len);
-            return;
-        }
-        if !self.truncated {
-            self.pre_truncation.extend_from_slice(prefix);
-            self.truncated = true;
-            if self.cap > OUTPUT_TRUNCATION_MARKER.len() {
-                let keep = self.cap - OUTPUT_TRUNCATION_MARKER.len();
-                let head_len = keep / 2;
-                let tail_len = keep - head_len;
-                self.head.extend_from_slice(
-                    &self.pre_truncation[..head_len.min(self.pre_truncation.len())],
-                );
-                let preserved =
-                    self.pre_truncation[head_len.min(self.pre_truncation.len())..].to_vec();
-                self.push_tail(&preserved, tail_len);
-            }
-            self.pre_truncation.clear();
-        }
-        self.total = self.total.saturating_add(len);
-        if self.cap > OUTPUT_TRUNCATION_MARKER.len() {
-            let keep = self.cap - OUTPUT_TRUNCATION_MARKER.len();
-            self.push_tail(suffix, keep - keep / 2);
-        }
-    }
-
-    fn push_tail(&mut self, data: &[u8], limit: usize) {
-        if data.len() >= limit {
-            self.tail.clear();
-            self.tail.extend_from_slice(&data[data.len() - limit..]);
-        } else {
-            let overflow = self
-                .tail
-                .len()
-                .saturating_add(data.len())
-                .saturating_sub(limit);
-            self.tail.drain(..overflow);
-            self.tail.extend_from_slice(data);
-        }
-    }
-
-    fn finish_payload(&self) -> Vec<u8> {
-        if !self.truncated {
-            return self.pre_truncation.clone();
-        }
-        if self.cap <= OUTPUT_TRUNCATION_MARKER.len() {
-            return OUTPUT_TRUNCATION_MARKER.to_vec();
-        }
-        let mut out = Vec::with_capacity(self.cap + 1);
-        out.extend_from_slice(&self.head);
-        // The outer CaptureWriter remains the public source of the marker and
-        // truncated metric. Feed it one opaque byte over its cap, bracketed by
-        // the already-bounded head/tail, so its existing semantics stay exact.
-        out.resize(out.len() + OUTPUT_TRUNCATION_MARKER.len() + 1, 0);
-        out.extend_from_slice(&self.tail);
-        out
-    }
 }
 
 fn capture_output(
@@ -745,29 +645,72 @@ fn capture_output(
 ) -> wasmtime::Result<i32> {
     let len = usize_len(len)?;
     let ptr = ptr_usize(ptr)?;
-    let (prefix_len, suffix_len) = {
-        let output = if stdout {
-            &caller.data().stdout
-        } else {
-            &caller.data().stderr
-        };
-        output.plan(len)
-    };
-    let mut prefix = vec![0; prefix_len];
-    memory.read(&*caller, ptr, &mut prefix)?;
-    let mut suffix = vec![0; suffix_len];
-    memory.read(
-        &*caller,
-        ptr.saturating_add(len.saturating_sub(suffix_len)),
-        &mut suffix,
-    )?;
-    let output = if stdout {
-        &mut caller.data_mut().stdout
-    } else {
-        &mut caller.data_mut().stderr
-    };
-    output.append(len, &prefix, &suffix);
+    let end = ptr
+        .checked_add(len)
+        .ok_or_else(|| wasmtime::Error::msg("invalid output range"))?;
+    if end > memory.data_size(&*caller) {
+        return Err(wasmtime::Error::msg("output range exceeds guest memory"));
+    }
+    for offset in (ptr..end).step_by(OUTPUT_CHUNK_BYTES) {
+        if caller.data().fs.is_cancelled() || caller.data().remaining_wall_time().is_zero() {
+            return Err(Trap::Interrupt.into());
+        }
+        let bytes = memory.data(&*caller)[offset..end.min(offset + OUTPUT_CHUNK_BYTES)].to_vec();
+        let (ack, written) = oneshot::channel();
+        let state = caller.data();
+        let result = state.host_runtime.block_on(async {
+            tokio::time::timeout(state.remaining_wall_time(), async {
+                state
+                    .output
+                    .send(OutputChunk { stdout, bytes, ack })
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                written
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+            })
+            .await
+        });
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(wasmtime::Error::new(err)),
+            Err(_) => return Err(Trap::Interrupt.into()),
+        }
+    }
     Ok(i32::try_from(len).unwrap_or(i32::MAX))
+}
+
+/// Stops serialization before allocation exceeds the response budget.
+fn bounded_json(value: &impl Serialize, cap: usize) -> serde_json::Result<Vec<u8>> {
+    struct Writer {
+        bytes: Vec<u8>,
+        cap: usize,
+    }
+    impl std::io::Write for Writer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if data.len() > self.cap.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("host response exceeded limit"));
+            }
+            let needed = self.bytes.len() + data.len();
+            if needed > self.bytes.capacity() {
+                let capacity = needed
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(self.cap);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        cap,
+    };
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
 }
 
 impl WasmLimiter {
@@ -821,7 +764,7 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
         "tinysandbox",
         "should_interrupt",
         |mut caller: Caller<'_, HostState>| -> i32 {
-            if caller.data().started.elapsed() >= caller.data().wall_time {
+            if caller.data().fs.is_cancelled() || caller.data().remaining_wall_time().is_zero() {
                 caller.data_mut().timed_out = true;
                 1
             } else {
@@ -838,6 +781,9 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
          json_ptr: i32,
          json_len: i32|
          -> wasmtime::Result<i32> {
+            if caller.data().fs.is_cancelled() || caller.data().remaining_wall_time().is_zero() {
+                return Err(Trap::Interrupt.into());
+            }
             let memory = memory(&mut caller)?;
             let op = read_utf8(&caller, &memory, op_ptr, op_len)?;
             let input = read_utf8(&caller, &memory, json_ptr, json_len)?;
@@ -845,18 +791,17 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
                 Ok(args) => handle_host_call(caller.data_mut(), &op, args),
                 Err(err) => HostResponse::error(HostCallError::invalid_json(err)),
             };
-            let mut bytes = serde_json::to_vec(&response).map_err(wasmtime::Error::new)?;
             let cap = caller.data().host_response_bytes;
-            if bytes.len() > cap {
-                bytes = serde_json::to_vec(&HostResponse::error(HostCallError {
-                    code: "E2BIG",
-                    message: format!("host response exceeded limit of {cap} bytes"),
-                }))
-                .map_err(wasmtime::Error::new)?;
-                if bytes.len() > cap {
-                    bytes.clear();
-                }
-            }
+            let bytes = bounded_json(&response, cap).unwrap_or_else(|_| {
+                bounded_json(
+                    &HostResponse::error(HostCallError {
+                        code: "E2BIG",
+                        message: format!("host response exceeded limit of {cap} bytes"),
+                    }),
+                    cap,
+                )
+                .unwrap_or_default()
+            });
             caller.data_mut().response = bytes;
             Ok(0)
         },
@@ -874,9 +819,12 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<i32> {
             let memory = memory(&mut caller)?;
             let len = usize_len(len)?;
-            let data = caller.data().response.clone();
+            let ptr = ptr_usize(ptr)?;
+            let data = std::mem::take(&mut caller.data_mut().response);
             let n = data.len().min(len);
-            memory.write(&mut caller, ptr_usize(ptr)?, &data[..n])?;
+            let result = memory.write(&mut caller, ptr, &data[..n]);
+            caller.data_mut().response = data;
+            result?;
             Ok(i32::try_from(n).unwrap_or(i32::MAX))
         },
     )?;
@@ -1179,15 +1127,23 @@ fn handle_fetch(state: &mut HostState, args: &Value) -> Result<Value, HostError>
         headers: payload.headers,
         body,
     };
-    let response = match block_on_host_timeout(state, fetch.fetch(request)) {
-        Ok(result) => result?,
-        Err(_) => return Err(HostError::new("fetch timed out")),
-    };
+    let response =
+        match block_on_host_timeout(state, |context| fetch.fetch_with_context(request, context)) {
+            Ok(result) => result?,
+            Err(_) => return Err(HostError::new("fetch timed out")),
+        };
     if response.body.len() > state.fetch_response_bytes {
         return Err(HostError::new(format!(
             "fetch response body exceeded limit of {} bytes",
             state.fetch_response_bytes
         )));
+    }
+    if response.body.len() > state.host_response_bytes.saturating_sub(128) / 4 * 3 {
+        return Err(HostError::new(format!(
+            "host response exceeded limit of {} bytes",
+            state.host_response_bytes
+        ))
+        .with_code("E2BIG"));
     }
     fetch_response_json(response).map_err(|err| HostError::new(err.to_string()))
 }
@@ -1211,7 +1167,7 @@ fn handle_js_global(state: &mut HostState, args: &Value) -> Result<Value, HostEr
         .cloned()
         .ok_or_else(|| HostError::new(format!("unknown global '{name}'")))?;
     let payload = args.get("args").cloned().unwrap_or(Value::Null);
-    match block_on_host_timeout(state, global.call(payload)) {
+    match block_on_host_timeout(state, |context| global.call_with_context(payload, context)) {
         Ok(result) => result,
         Err(_) => Err(HostError::new(format!("global '{name}' timed out"))),
     }
@@ -1226,7 +1182,7 @@ fn handle_host_call_result(
         "readFile" => {
             let path = string_arg(args, "path")?;
             let data = state
-                .block_on(state.fs.read_file(&path))
+                .block_on(state.fs.read_file_bounded(&path, state.host_read_bytes()))
                 .map_err(|err| node_error(err, "open", Some(path.clone())))?;
             Ok(json!(base64_encode(&data)))
         }
@@ -1328,6 +1284,9 @@ fn handle_host_call_result(
             Ok(json!(state.block_on(state.fs.stat(&path)).is_ok()))
         }
         "open" => {
+            if state.fds.len() >= state.max_open_files || state.next_fd == i32::MAX {
+                return Err(node_error(VfsError::new(Errno::ENOSPC), "open", None));
+            }
             let path = string_arg(args, "path")?;
             let flags = string_arg(args, "flags")?;
             let mode =
@@ -1342,7 +1301,6 @@ fn handle_host_call_result(
                 OpenFile {
                     handle,
                     position: 0,
-                    path,
                 },
             );
             Ok(json!(fd))
@@ -1357,7 +1315,9 @@ fn handle_host_call_result(
                 .cloned()
                 .ok_or_else(|| node_error(VfsError::new(Errno::EBADF), "read", None))?;
             let read_offset = offset.unwrap_or(file.position);
-            let len = clamped_read_len(state, &file, read_offset, len);
+            // File identity belongs to the open handle, regardless of what
+            // currently occupies its original path. Short reads are valid.
+            let len = len.min(MAX_HOST_READ_BYTES).min(state.host_read_bytes());
             let (mut data, n) = state
                 .block_on(state.fs.read_at(file.handle, read_offset, vec![0; len]))
                 .map_err(|err| node_error(err, "read", None))?;
@@ -1415,7 +1375,7 @@ fn handle_host_call_result(
             let src = string_arg(args, "src")?;
             let dest = string_arg(args, "dest")?;
             let data = state
-                .block_on(state.fs.read_file(&src))
+                .block_on(state.fs.read_file_bounded(&src, state.host_input_bytes))
                 .map_err(|err| node_error(err, "copyfile", Some(src)))?;
             state
                 .block_on(state.fs.write_file(&dest, &data, false))
@@ -1427,17 +1387,6 @@ fn handle_host_call_result(
             "tinysandbox",
             None,
         )),
-    }
-}
-
-fn clamped_read_len(state: &HostState, file: &OpenFile, offset: u64, requested: usize) -> usize {
-    let capped = requested.min(MAX_HOST_READ_BYTES);
-    match state.block_on(state.fs.stat(&file.path)) {
-        Ok(metadata) if metadata.file_type == FileType::File => {
-            let remaining = metadata.len.saturating_sub(offset);
-            capped.min(usize::try_from(remaining).unwrap_or(usize::MAX))
-        }
-        _ => capped,
     }
 }
 
@@ -1640,9 +1589,14 @@ fn read_bytes<T>(
 ) -> wasmtime::Result<Vec<u8>> {
     let ptr = ptr_usize(ptr)?;
     let len = usize_len(len)?;
-    let mut out = vec![0; len];
-    memory.read(caller, ptr, &mut out)?;
-    Ok(out)
+    let end = ptr
+        .checked_add(len)
+        .ok_or_else(|| wasmtime::Error::msg("invalid guest range"))?;
+    memory
+        .data(caller)
+        .get(ptr..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| wasmtime::Error::msg("range exceeds guest memory"))
 }
 
 fn read_u32<T>(caller: &Caller<'_, T>, memory: &Memory, ptr: usize) -> wasmtime::Result<u32> {
@@ -1667,4 +1621,77 @@ fn ptr_usize(ptr: i32) -> wasmtime::Result<usize> {
 
 fn usize_len(len: i32) -> wasmtime::Result<usize> {
     usize::try_from(len).map_err(|_| wasmtime::Error::msg("negative guest length"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(quickjs_precompiled)]
+    #[test]
+    fn embedded_artifact_matches_the_runtime_engine() {
+        // Check compatibility directly so a silent runtime compile fallback
+        // cannot hide a build/runtime configuration mismatch.
+        #[allow(unsafe_code)]
+        // SAFETY: the artifact is the fixed build output embedded in this crate.
+        unsafe { Module::deserialize(crate::wasm::engine().unwrap(), QUICKJS_CWASM) }
+            .expect("embedded QuickJS artifact is compatible");
+    }
+
+    #[test]
+    fn concurrent_runtime_initialization_keeps_the_engine_ticking() {
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    compiled_runtime().expect("initialize runtime")
+                })
+            })
+            .collect::<Vec<_>>();
+        let runtime = compiled_runtime().expect("shared runtime");
+        for thread in threads {
+            let initialized = thread.join().expect("initialization did not panic");
+            assert!(std::ptr::eq(initialized, runtime));
+        }
+        // A tiny module with one empty exported function checks epoch handling
+        // at function entry. It cannot hang if the ticker is broken, and does
+        // not rely on QuickJS's separate should_interrupt host callback.
+        let module = Module::new(
+            &runtime.engine,
+            [
+                0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 7, 7, 1, 3, 114, 117,
+                110, 0, 0, 10, 4, 1, 2, 0, 11,
+            ],
+        )
+        .expect("valid empty wasm function");
+        let mut store = Store::new(&runtime.engine, ());
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_trap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("export");
+        let started = Instant::now();
+        loop {
+            thread::sleep(EPOCH_TICK);
+            if let Err(error) = run.call(&mut store, ()) {
+                assert!(is_epoch_timeout(&error), "{error}");
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "shared engine has no ticker"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_serialization_stops_before_writing_an_oversized_value() {
+        let value = json!({ "data": "x".repeat(512) });
+        assert!(bounded_json(&value, 128).is_err());
+        let exact = serde_json::to_vec(&value).unwrap();
+        assert_eq!(bounded_json(&value, exact.len()).unwrap(), exact);
+    }
 }

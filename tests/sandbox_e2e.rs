@@ -66,6 +66,42 @@ async fn custom_commands_use_same_registry_and_pipelines_as_builtins() {
 }
 
 #[tokio::test]
+async fn removing_commands_disables_lookup_and_bin_without_session_effects() {
+    for (name, invocation) in [
+        ("cd", "cd /"),
+        ("export", "export FOO=changed"),
+        ("unset", "unset FOO"),
+        ("cat", "cat"),
+    ] {
+        let sandbox = Sandbox::builder()
+            .env("FOO", "original")
+            .persist_session(true)
+            .without_command(name)
+            .build();
+        assert!(
+            sandbox
+                .fs()
+                .readdir("/bin")
+                .await
+                .expect("list commands")
+                .iter()
+                .all(|entry| entry.name != name)
+        );
+
+        for input in [invocation.to_owned(), format!("echo input | {invocation}")] {
+            let result = sandbox.exec(&input).await;
+            assert_eq!(result.exit_code, 127, "{input}");
+            assert_eq!(result.stderr, format!("{name}: command not found\n"));
+        }
+        assert_eq!(
+            sandbox.exec("pwd; echo $FOO").await.stdout,
+            "/workspace\noriginal\n",
+            "disabled {name} must not affect the stored session"
+        );
+    }
+}
+
+#[tokio::test]
 async fn builtin_text_tools_match_supported_gnu_shapes() {
     // Covers representative supported flags for text builtins without relying
     // on host BSD/GNU tool availability.
@@ -504,7 +540,7 @@ async fn redirect_setup_failures_close_opened_handles() {
     assert_eq!(input_vfs.live_handles(), 0);
 
     let output_vfs = Arc::new(TrackingVfs::default());
-    output_vfs.fail_second_open_for("/stderr");
+    output_vfs.fail_open_for("/stderr");
     let output_sandbox = Sandbox::builder()
         .mount_arc("workspace", output_vfs.clone())
         .command("both", |mut ctx| async move {
@@ -756,7 +792,7 @@ struct TrackingVfs {
     inner: InMemoryVfs,
     live_handles: Mutex<BTreeSet<FileHandle>>,
     opens_by_path: Mutex<BTreeMap<String, usize>>,
-    fail_second_open_path: Mutex<Option<String>>,
+    fail_open_path: Mutex<Option<String>>,
 }
 
 impl TrackingVfs {
@@ -771,9 +807,9 @@ impl TrackingVfs {
         self.inner.close(handle).expect("close seed file");
     }
 
-    fn fail_second_open_for(&self, path: &str) {
+    fn fail_open_for(&self, path: &str) {
         *self
-            .fail_second_open_path
+            .fail_open_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(path.to_owned());
     }
@@ -812,21 +848,20 @@ impl Vfs for TrackingVfs {
     }
 
     fn open(&self, path: &str, mode: OpenMode) -> VfsResult<FileHandle> {
-        let open_count = {
+        {
             let mut opens = self
                 .opens_by_path
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let count = opens.entry(path.to_owned()).or_default();
             *count += 1;
-            *count
         };
         let fail_path = self
-            .fail_second_open_path
+            .fail_open_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if fail_path.as_deref() == Some(path) && open_count == 2 {
+        if fail_path.as_deref() == Some(path) {
             return Err(tinysandbox::vfs::VfsError::new(
                 tinysandbox::vfs::Errno::EACCES,
             ));

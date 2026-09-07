@@ -223,6 +223,14 @@ async fn pipeline_shell_builtins_do_not_mutate_session_but_still_write_stdout() 
     let export = sandbox.exec("export FOO=bar; export | cat").await;
     assert_eq!(export.exit_code, 0);
     assert!(export.stdout.contains("declare -x FOO=\"bar\"\n"));
+
+    for mutation in ["export FOO=changed", "unset FOO"] {
+        let result = sandbox
+            .exec(&format!("export FOO=bar; {mutation} | cat; echo $FOO"))
+            .await;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "bar\n", "{mutation}");
+    }
 }
 
 #[tokio::test]
@@ -386,9 +394,9 @@ fn jq_timeout_cancels_no_output_range_reduction() {
         .expect("build single-blocking-thread runtime");
 
     rt.block_on(async {
-        // This filter does substantial work before producing any output. With a
-        // single blocking thread, the following jq proves the timed-out worker
-        // released its blocking slot instead of continuing in the background.
+        // This filter does substantial work before producing any output. The
+        // public timeout result must preserve subsequent command health. The
+        // jq_runtime unit test separately proves an entered guest worker exits.
         let timed_out_sandbox = Sandbox::builder()
             .limits(Limits {
                 wall_time: Duration::from_millis(25),
@@ -404,7 +412,7 @@ fn jq_timeout_cancels_no_output_range_reduction() {
         let after_sandbox = Sandbox::builder().build();
         let after = tokio::time::timeout(Duration::from_secs(1), after_sandbox.exec("jq -n '1'"))
             .await
-            .expect("subsequent jq should acquire the only blocking thread");
+            .expect("subsequent jq should remain usable");
         assert_eq!(after.exit_code, 0, "{}", after.stderr);
         assert_eq!(after.stdout, "1\n");
     });

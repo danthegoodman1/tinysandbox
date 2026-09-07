@@ -1,10 +1,6 @@
 //! Internal jq filter engine backed by jaq.
 
-use std::cell::RefCell;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 use jaq_core::load::lex::StrPart;
 use jaq_core::load::parse::{BinaryOp, Pattern, Term};
@@ -19,16 +15,6 @@ type JaqFilter = jaq_core::Filter<JaqData>;
 const MAX_JQ_FILTER_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_JQ_FILTER_NESTING: usize = 512;
 const MAX_JQ_FILTER_SYNTAX_TOKENS: usize = 1024;
-
-thread_local! {
-    static CONTROL: RefCell<Option<JqControl>> = const { RefCell::new(None) };
-}
-
-#[derive(Clone)]
-struct JqControl {
-    deadline: Option<Instant>,
-    cancelled: Arc<AtomicBool>,
-}
 
 /// Compiled jq filter ready to evaluate against JSON input.
 pub(crate) struct JqProgram {
@@ -58,29 +44,6 @@ impl fmt::Display for JqError {
 
 impl std::error::Error for JqError {}
 
-/// Guard that restores the previous jq deadline when dropped.
-pub(crate) struct JqDeadlineGuard {
-    previous: Option<JqControl>,
-}
-
-impl Drop for JqDeadlineGuard {
-    fn drop(&mut self) {
-        CONTROL.replace(self.previous.take());
-    }
-}
-
-/// Installs thread-local cancellation checked by tinysandbox jq native wrappers.
-pub(crate) fn set_control(
-    deadline: Option<Instant>,
-    cancelled: Arc<AtomicBool>,
-) -> JqDeadlineGuard {
-    let previous = CONTROL.replace(Some(JqControl {
-        deadline,
-        cancelled,
-    }));
-    JqDeadlineGuard { previous }
-}
-
 /// Compiles a jq filter with the given jq global variable names.
 pub(crate) fn compile_with_vars(
     filter: &str,
@@ -103,11 +66,20 @@ pub(crate) fn compile_with_vars(
         )
         .map_err(|errs| JqError::Compile(format!("{errs:?}")))?;
 
-    let funs = tinysandbox_funs()
-        .into_iter()
-        .chain(jaq_core::funs::<JaqData>())
-        .chain(jaq_std::funs::<JaqData>())
-        .chain(jaq_json::funs::<JaqData>());
+    let utc_aliases = jaq_std::funs::<JaqData>().filter_map(|(name, args, fun)| match name {
+        "gmtime" => Some(("localtime", args, fun)),
+        "strftime" => Some(("strflocaltime", args, fun)),
+        _ => None,
+    });
+    let funs =
+        tinysandbox_funs()
+            .into_iter()
+            .chain(utc_aliases)
+            .chain(jaq_core::funs::<JaqData>())
+            .chain(jaq_std::funs::<JaqData>().filter(|(name, _, _)| {
+                !matches!(*name, "now" | "env" | "localtime" | "strflocaltime")
+            }))
+            .chain(jaq_json::funs::<JaqData>());
     let global_vars = global_vars.iter().map(String::as_str);
     let filter = jaq_core::Compiler::default()
         .with_funs(funs)
@@ -398,9 +370,6 @@ impl JqProgram {
         let ctx = Ctx::<JaqData>::new(&self.filter.lut, Vars::new(vars.iter().cloned()));
         let mut iter = self.filter.id.run((ctx, input));
         std::iter::from_fn(move || {
-            if let Err(err) = check_deadline() {
-                return Some(Err(err));
-            }
             iter.next()
                 .map(|result| result.map_err(jq_exception_to_error))
         })
@@ -417,13 +386,31 @@ impl JqProgram {
     }
 }
 
-fn tinysandbox_funs() -> [jaq_core::native::Fun<JaqData>; 1] {
+fn tinysandbox_funs() -> [jaq_core::native::Fun<JaqData>; 3] {
     let range: jaq_core::RunPtr<JaqData> = tinysandbox_range;
-    [(
-        "range",
-        jaq_core::native::v(3),
-        jaq_core::Native::<JaqData>::new(range),
-    )]
+    [
+        (
+            "env",
+            jaq_core::native::v(0),
+            jaq_core::Native::<JaqData>::new(|_| {
+                Box::new(std::iter::once(
+                    JaqValue::from_map(std::iter::empty()).map_err(Exn::from),
+                ))
+            }),
+        ),
+        (
+            "range",
+            jaq_core::native::v(3),
+            jaq_core::Native::<JaqData>::new(range),
+        ),
+        (
+            "now",
+            jaq_core::native::v(0),
+            jaq_core::Native::<JaqData>::new(|_| {
+                Box::new(std::iter::once(Ok(JaqValue::from(crate::host_now()))))
+            }),
+        ),
+    ]
 }
 
 fn tinysandbox_range<'a>(
@@ -432,10 +419,10 @@ fn tinysandbox_range<'a>(
     let by = cv.0.pop_var();
     let to = cv.0.pop_var();
     let from = cv.0.pop_var();
-    Box::new(deadline_checked_range(Ok(from), to, by))
+    Box::new(tinysandbox_range_values(Ok(from), to, by))
 }
 
-fn deadline_checked_range<'a, V: ValT + 'a>(
+fn tinysandbox_range_values<'a, V: ValT + 'a>(
     mut from: ValX<'a, V>,
     to: V,
     by: V,
@@ -443,39 +430,18 @@ fn deadline_checked_range<'a, V: ValT + 'a>(
     use std::cmp::Ordering::{Equal, Greater, Less};
 
     let cmp = by.partial_cmp(&0isize.into()).unwrap_or(Equal);
-    std::iter::from_fn(move || {
-        if let Err(err) = check_deadline() {
-            from = Ok(to.clone());
-            return Some(Err(Exn::from(jaq_core::Error::str(err.to_string()))));
+    std::iter::from_fn(move || match from.clone() {
+        Ok(x) => match cmp {
+            Greater => x < to,
+            Less => x > to,
+            Equal => x != to,
         }
-        match from.clone() {
-            Ok(x) => match cmp {
-                Greater => x < to,
-                Less => x > to,
-                Equal => x != to,
-            }
-            .then(|| std::mem::replace(&mut from, (x + by.clone()).map_err(Exn::from))),
-            e @ Err(_) => {
-                from = Ok(to.clone());
-                Some(e)
-            }
+        .then(|| std::mem::replace(&mut from, (x + by.clone()).map_err(Exn::from))),
+        e @ Err(_) => {
+            from = Ok(to.clone());
+            Some(e)
         }
     })
-}
-
-fn check_deadline() -> Result<(), JqError> {
-    if CONTROL.with(|control| {
-        control.borrow().as_ref().is_some_and(|control| {
-            control.cancelled.load(Ordering::Relaxed)
-                || control
-                    .deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-        })
-    }) {
-        Err(JqError::Runtime("execution timed out".to_owned()))
-    } else {
-        Ok(())
-    }
 }
 
 fn jq_exception_to_error(err: jaq_core::Exn<'_, JaqValue>) -> JqError {

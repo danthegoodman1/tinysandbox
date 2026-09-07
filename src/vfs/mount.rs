@@ -215,6 +215,28 @@ impl Vfs for MountedVfs {
         mounted.vfs.close(mounted.inner)
     }
 
+    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
+        let mounted = self
+            .handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&handle)
+            .ok_or(VfsError::new(Errno::EBADF))?;
+        mounted.vfs.abort(mounted.inner)
+    }
+
+    fn is_fast_path(&self, path: &str) -> bool {
+        match self.mounted_path(path) {
+            Ok(Some(mounted)) => mounted.vfs.is_fast_path(&mounted.inner),
+            _ => true,
+        }
+    }
+
+    fn is_fast_handle(&self, handle: FileHandle) -> bool {
+        self.handle(handle)
+            .map_or(true, |(vfs, inner)| vfs.is_fast_handle(inner))
+    }
+
     fn is_fast(&self) -> bool {
         self.fast
     }

@@ -325,6 +325,22 @@ pub trait Vfs: Send + Sync {
     /// Closes a file handle.
     fn close(&self, handle: FileHandle) -> VfsResult<()>;
 
+    /// Releases a handle without publishing staged writes. The default closes it;
+    /// nontransactional backends do not roll back writes already performed.
+    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
+        self.close(handle)
+    }
+
+    /// Classifies an operation on one path for async dispatch.
+    fn is_fast_path(&self, _path: &str) -> bool {
+        self.is_fast()
+    }
+
+    /// Classifies an operation on an existing handle for async dispatch.
+    fn is_fast_handle(&self, _handle: FileHandle) -> bool {
+        self.is_fast()
+    }
+
     /// Returns true when operations are cheap enough to run inline.
     fn is_fast(&self) -> bool {
         false

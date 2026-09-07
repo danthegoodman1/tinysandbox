@@ -28,6 +28,38 @@ console.log(result.stdout)
 - A sandboxed `js` command with a Node-compatible synchronous `fs` subset, `require`, `Buffer`, `process`, and `console`; expose JS-facing custom host functionality as host globals.
 - Limits and metrics for wall time, output size, command timings, pipe bytes, jq input bytes, and wasm memory. jq input bytes and JSON nesting are capped before evaluation, and the jq filter program text (not input data) is capped on size, nesting, and syntax complexity; jq filter evaluation has the limitations documented in the repository README.
 
+## Cooperative host cancellation
+
+Host globals and fetch handlers receive a second argument with `signal`,
+`deadlineMs`, `remainingTimeMs()`, and `isCancelled()`. Custom commands receive
+the same properties on their command context. Existing callbacks that accept
+one argument keep working.
+
+```ts
+const sandbox = new Sandbox({
+  limits: { wallTimeMs: 2000, jqMemoryBytes: 64 * 1024 * 1024 },
+  globals: {
+    'tools.search': async ({ query }, { signal }) => {
+      const response = await fetch(`https://example.test/search?q=${encodeURIComponent(query)}`, { signal })
+      return response.json()
+    }
+  }
+})
+```
+
+The signal follows the actual Rust callback deadline and execution
+cancellation, including time already used by earlier shell commands.
+`deadlineMs` is an approximate Unix timestamp for display;
+`remainingTimeMs()` uses the runtime's monotonic clock. Cancellation is
+cooperative: pass the signal to abortable APIs or poll `isCancelled()` in host
+CPU loops. Node cannot deliver asynchronous abort events while a synchronous
+callback blocks its event loop. The signal also aborts when its callback settles,
+and its cancellation subscription is released. An expired callback still queued
+for Node is rejected before invoking your handler.
+
+`jqMemoryBytes` caps the jq guest's linear memory (64 MiB by default), separate
+from `jqInputBytes` and JavaScript's `wasmMemoryBytes`.
+
 ## S3 filesystem
 
 ```ts
