@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/tinysandbox-linux-arm64-gnu",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "cpu": [
     "arm64"
   ],

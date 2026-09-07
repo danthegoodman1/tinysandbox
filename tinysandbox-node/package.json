@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/tinysandbox",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "description": "Node.js bindings for the tinysandbox in-process AI agent sandbox",
   "main": "index.js",
   "types": "index.d.ts",
@@ -41,10 +41,10 @@
     "typescript": "^7.0.2"
   },
   "optionalDependencies": {
-    "@tinysandbox/tinysandbox-darwin-arm64": "0.6.6",
-    "@tinysandbox/tinysandbox-darwin-x64": "0.6.6",
-    "@tinysandbox/tinysandbox-linux-arm64-gnu": "0.6.6",
-    "@tinysandbox/tinysandbox-linux-x64-gnu": "0.6.6"
+    "@tinysandbox/tinysandbox-darwin-arm64": "0.6.7",
+    "@tinysandbox/tinysandbox-darwin-x64": "0.6.7",
+    "@tinysandbox/tinysandbox-linux-arm64-gnu": "0.6.7",
+    "@tinysandbox/tinysandbox-linux-x64-gnu": "0.6.7"
   },
   "files": [
     "README.md",
