@@ -100,7 +100,7 @@ async fn contextual_global_registration_and_fetch_preserve_legacy_callbacks() {
             }),
         )
         .unwrap();
-    let result = sandbox.exec("js -e 'console.log(legacy(), scoped(2), dynamic(), grouped()); fetch(\"https://example.test/\").then(r => r.text()).then(console.log)'").await;
+    let result = sandbox.exec("js -e '(async () => { console.log(await legacy(), await scoped(2), await dynamic(), await grouped()); fetch(\"https://example.test/\").then(r => r.text()).then(console.log) })()'").await;
     assert_eq!(result.exit_code, 0, "{}", result.stderr);
     assert_eq!(result.stdout, "1 2 3 4\nfetch\n");
 }
@@ -120,7 +120,7 @@ async fn host_callback_timeout_is_visible_through_its_context() {
         })
         .build();
     let result = sandbox
-        .exec("js -e 'try { hang() } catch (error) { console.log(error.message) }'")
+        .exec("js -e '(async () => { try { await hang() } catch (error) { console.log(error.message) } })()'")
         .await;
     assert_eq!(result.exit_code, 0, "{}", result.stderr);
     assert_eq!(result.stdout, "global 'hang' timed out\n");
@@ -204,7 +204,7 @@ async fn settled_callback_contexts_cancel_without_ending_the_execution() {
         })
         .build();
     let result = sandbox
-        .exec("js -e 'complete(false); console.log(inspect()); try { complete(true) } catch (_) {} console.log(inspect())'")
+        .exec("js -e '(async () => { await complete(false); console.log(await inspect()); try { await complete(true) } catch (_) {} console.log(await inspect()) })()'")
         .await;
     assert_eq!(result.exit_code, 0, "{}", result.stderr);
     assert_eq!(result.stdout, "1\n2\n");

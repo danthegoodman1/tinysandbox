@@ -70,7 +70,7 @@ where
         format!(" The bound names are {list}.")
     };
     format!(
-        "Inside `js`, host-provided functions are bound as globals you call synchronously; each takes and returns one JSON value.{bound} Failures throw a normal `Error`, with `err.code` set when the host provides one."
+        "Inside `js`, host-provided functions are bound as globals; each takes one JSON value and returns a promise for one JSON value, so `await` every call.{bound} A failure rejects with a normal `Error`, with `err.code` set when the host provides one, so `try`/`catch` around an awaited call works as usual."
     )
 }
 

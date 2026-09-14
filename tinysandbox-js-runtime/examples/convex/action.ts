@@ -4,11 +4,12 @@ import { action } from "./_generated/server";
 
 export const jsRuntimeSmoke = action({
   handler: async (): Promise<string> => {
-    // Finish awaited Convex/database work before entering synchronous QuickJS.
-    const valueFromConvex = await Promise.resolve("convex");
     const engine = await createEngine(quickjsModule);
-    const result = engine.runCode("console.log(context.value(null))", {
-      globals: { "context.value": () => valueFromConvex },
+    // Awaited work can happen inside a global: the guest suspends while the
+    // promise settles, so Convex queries no longer have to be hoisted above
+    // the run.
+    const result = await engine.runCode("(async () => { console.log(await context.value(null)) })()", {
+      globals: { "context.value": async () => await Promise.resolve("convex") },
     });
     if (result.exitCode !== 0) throw new Error(result.stderr);
     return result.stdout.trim();

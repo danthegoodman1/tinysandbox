@@ -122,7 +122,7 @@ async fn js_global_is_callable_from_guest() {
         .build();
 
     let result = sandbox
-        .exec("js -e 'const out = echo({ value: \"hello\" }); console.log(out.seen, out.ok)'")
+        .exec("js -e '(async () => { const out = await echo({ value: \"hello\" }); console.log(out.seen, out.ok) })()'")
         .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -144,12 +144,14 @@ async fn js_global_json_values_round_trip_faithfully() {
         })
         .build();
     let script = r#"
-const value = roundTrip({
-  text: 'hi λ 🙂',
-  list: [1, 2.5, { deep: true }],
-  nothing: null
-})
-console.log(JSON.stringify(value))
+(async () => {
+  const value = await roundTrip({
+    text: 'hi λ 🙂',
+    list: [1, 2.5, { deep: true }],
+    nothing: null
+  })
+  console.log(JSON.stringify(value))
+})()
 "#;
 
     let result = sandbox
@@ -181,11 +183,13 @@ async fn js_global_arguments_preserve_undefined_and_scalars() {
         .js_global("echo", |args| async move { Ok(args) })
         .build();
     let script = r#"
-console.log(JSON.stringify([
-  echo(),
-  echo(42),
-  echo('s')
-]))
+(async () => {
+  console.log(JSON.stringify([
+    await echo(),
+    await echo(42),
+    await echo('s')
+  ]))
+})()
 "#;
 
     let result = sandbox
@@ -207,12 +211,14 @@ async fn js_global_error_is_catchable_with_code() {
         })
         .build();
     let script = r#"
+(async () => {
 try {
-  fail({ id: 1 })
+  await fail({ id: 1 })
 } catch (err) {
   console.log(err.message)
   console.log(err.code)
 }
+})()
 "#;
 
     let result = sandbox
@@ -233,7 +239,7 @@ async fn js_global_handlers_use_embedder_runtime_and_wall_timeout() {
             Ok(json!("done"))
         })
         .build()
-        .exec("js -e 'console.log(delay())'")
+        .exec("js -e '(async () => console.log(await delay()))()'")
         .await;
     assert_eq!(timed.exit_code, 0, "stderr: {}", timed.stderr);
     assert_eq!(timed.stdout, "done\n");
@@ -246,7 +252,7 @@ async fn js_global_handlers_use_embedder_runtime_and_wall_timeout() {
         .build();
     let start = Instant::now();
     let result = sandbox
-        .exec("js -e 'try { hang() } catch (err) { console.log(err.message) }'")
+        .exec("js -e '(async () => { try { await hang() } catch (err) { console.log(err.message) } })()'")
         .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -768,11 +774,11 @@ async fn js_prelude_can_wrap_and_delete_host_global() {
     let sandbox = Sandbox::builder()
         .js_global("secret", |args| async move { Ok(json!({ "value": args["value"].clone() })) })
         .js_prelude(
-            "const bound = globalThis.secret; globalThis.callSecret = value => bound({ value }).value; delete globalThis.secret",
+            "const bound = globalThis.secret; globalThis.callSecret = async value => (await bound({ value })).value; delete globalThis.secret",
         )
         .build();
     let result = sandbox
-        .exec("js -e 'console.log(callSecret(\"ok\"), typeof secret, typeof __tinysandbox_host_call, typeof __tinysandboxConfig)'")
+        .exec("js -e '(async () => console.log(await callSecret(\"ok\"), typeof secret, typeof __tinysandbox_host_call, typeof __tinysandboxConfig))()'")
         .await;
 
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -855,9 +861,11 @@ async fn js_globals_bind_bare_names_and_namespaces() {
         .js_global("tools.b", |_args| async { Ok(json!("b")) })
         .build();
     let script = r#"
-console.log(search())
-console.log(tools.a(), tools.b())
-console.log(Object.keys(tools).join(','))
+(async () => {
+  console.log(await search())
+  console.log(await tools.a(), await tools.b())
+  console.log(Object.keys(tools).join(','))
+})()
 "#;
 
     let result = sandbox
@@ -1871,7 +1879,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
             Ok(json!("x".repeat(RESPONSE_CAP)))
         })
         .build()
-        .exec("js -e 'try { exact(null) } catch (err) { console.log(err.code) }'")
+        .exec("js -e '(async () => { try { await exact(null) } catch (err) { console.log(err.code) } })()'")
         .await;
     assert_eq!(over.exit_code, 0, "{}", over.stderr);
     assert_eq!(over.stdout, "E2BIG\n");
@@ -1880,7 +1888,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
         .limits(Limits::default().with_fetch_response_bytes(0))
         .js_global("small", |_args| async { Ok(Value::Null) })
         .build()
-        .exec("echo file > /workspace/a; js -e 'console.log(small(null), require(\"fs\").readFileSync(\"/workspace/a\", \"utf8\").trim())'")
+        .exec("echo file > /workspace/a; js -e '(async () => console.log(await small(null), require(\"fs\").readFileSync(\"/workspace/a\", \"utf8\").trim()))()'")
         .await;
     assert_eq!(
         independent_fetch_cap.exit_code, 0,
@@ -1910,7 +1918,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
         .limits(Limits::default().with_wall_time(Duration::from_millis(40)))
         .js_global("fast", |_args| async { Ok(json!("ok")) })
         .build()
-        .exec("js -e 'console.log(fast(null))'")
+        .exec("js -e '(async () => console.log(await fast(null)))()'")
         .await;
     assert_eq!(short_budget.exit_code, 0, "{}", short_budget.stderr);
     assert_eq!(short_budget.stdout, "ok\n");
@@ -2036,7 +2044,9 @@ async fn js_global_mutations_validate_without_disturbing_the_live_set() {
     sandbox
         .set_js_global("tools.a", |_args| async { Ok(json!("second")) })
         .expect("replace handler");
-    let result = sandbox.exec("js -e 'console.log(tools.a())'").await;
+    let result = sandbox
+        .exec("js -e '(async () => console.log(await tools.a()))()'")
+        .await;
     assert_eq!(result.stdout, "second\n");
 }
 
@@ -2055,7 +2065,11 @@ async fn js_global_removal_does_not_disturb_a_running_command() {
 
     let running = tokio::spawn({
         let sandbox = Arc::clone(&sandbox);
-        async move { sandbox.exec("js -e 'console.log(slow(), slow())'").await }
+        async move {
+            sandbox
+                .exec("js -e '(async () => console.log(await slow(), await slow()))()'")
+                .await
+        }
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2093,7 +2107,9 @@ async fn js_globals_extend_adds_without_dropping_the_rest() {
         ]
     );
     let result = sandbox
-        .exec("js -e 'console.log(whoami(), tools.a(), tools.b())'")
+        .exec(
+            "js -e '(async () => console.log(await whoami(), await tools.a(), await tools.b()))()'",
+        )
         .await;
     assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
     assert_eq!(result.stdout, "agent-1 a b\n");
@@ -2129,7 +2145,9 @@ async fn js_globals_extend_adds_without_dropping_the_rest() {
     sandbox
         .extend_js_globals(JsGlobals::new().with("whoami", |_args| async { Ok(json!("agent-2")) }))
         .expect("rebind whoami");
-    let rebound = sandbox.exec("js -e 'console.log(whoami())'").await;
+    let rebound = sandbox
+        .exec("js -e '(async () => console.log(await whoami()))()'")
+        .await;
     assert_eq!(rebound.stdout, "agent-2\n");
 
     // replace drops everything the set does not name, builder globals included.

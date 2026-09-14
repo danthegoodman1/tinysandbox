@@ -309,7 +309,7 @@ console.log("document:", typeof document);
       let returned;
       const started = performance.now();
       try {
-        const result = engine.runCode(guestProgram(source.value), {
+        const result = await engine.runCode(guestProgram(source.value), {
           globals: {
             "playground.capture": value => {
               returned = value;

@@ -26,7 +26,7 @@ async function main() {
     },
     // The prelude still runs before the script, so host globals can be wrapped
     // in friendlier JavaScript.
-    jsPrelude: 'globalThis.kvGet = key => kv.get({ key }).value',
+    jsPrelude: 'globalThis.kvGet = async key => (await kv.get({ key })).value',
     fetch: async (request) => {
       if (request.url !== 'https://example.test/echo') {
         const err = new Error(`no canned response for ${request.url}`) as Error & { code?: string }
@@ -41,17 +41,18 @@ async function main() {
     }
   })
 
+  // Host globals return promises, so the whole script is one async scope.
   const script = `
-kv.put({ key: 'answer', value: 42 })
-console.log(\`answer=\${kvGet('answer')} user=\${whoami().name}\`)
-
-try {
-  kv.get({})
-} catch (err) {
-  console.log(\`\${err.code}:\${err.message}\`)
-}
-
 (async () => {
+  await kv.put({ key: 'answer', value: 42 })
+  console.log(\`answer=\${await kvGet('answer')} user=\${(await whoami()).name}\`)
+
+  try {
+    await kv.get({})
+  } catch (err) {
+    console.log(\`\${err.code}:\${err.message}\`)
+  }
+
   const response = await fetch('https://example.test/echo', {
     method: 'POST',
     body: Buffer.from('ping')

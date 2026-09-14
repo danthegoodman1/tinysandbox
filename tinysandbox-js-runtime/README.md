@@ -19,7 +19,7 @@ const bytes = await readFile(new URL(
 ));
 const engine = await createEngine(bytes);
 
-const result = engine.runCode("console.log(tools.search({ query: 'hello' }))", {
+const result = await engine.runCode("console.log(tools.search({ query: 'hello' }))", {
   globals: {
     "tools.search": ({ query }) => ({ query, hits: 1 }),
   },
@@ -36,10 +36,9 @@ such as Convex that compile `.wasm` imports use the exported subpath directly:
 import { createEngine } from "@tinysandbox/js-runtime";
 import quickjsModule from "@tinysandbox/js-runtime/quickjs.wasm";
 
-const value = await doConvexWork();
 const engine = await createEngine(quickjsModule);
-const result = engine.runCode("console.log(context.value(null))", {
-  globals: { "context.value": () => value },
+const result = await engine.runCode("(async () => { console.log(await context.value(null)) })()", {
+  globals: { "context.value": async () => await doConvexWork() },
 });
 ```
 
@@ -77,23 +76,38 @@ No environment variables, Pages Functions, Wrangler configuration, or separate
 deployment workflow are required. `build:site` creates a clean output directory
 containing only the playground, `runtime.js`, and `quickjs.wasm`.
 
-`runCode(code, options)` returns `exitCode`, UTF-8 `stdout` and `stderr`, and
+`runCode(code, options)` resolves to `exitCode`, UTF-8 `stdout` and `stderr`, and
 initial/peak wasm memory bytes. Its defaults are a 64 MiB wasm maximum, 32 MiB
 QuickJS heap, 30 second monotonic deadline, and 1 MiB each for source, serialized
 host responses, stdout, and stderr. A `wasmMemoryBytes` value below the artifact
 minimum of 1,245,184 bytes is rejected before instantiation. Non-page-aligned
 values are rounded down for the actual WebAssembly maximum.
 
-Global names use dot-separated JavaScript identifier segments. Each value must
-be a synchronous function. Its first argument is the guest value; a second
-context argument exposes `signal`, `deadlineMs`, `remainingTimeMs()`, and
-`isCancelled()`. Existing one-argument functions keep working. Guest arguments cross the boundary
-with JavaScript's normal `JSON.stringify` semantics (including its omission and
-coercion rules); host return values must already be strict JSON values and are
-validated without coercion. Promises, invalid returns, invalid names, namespace
-conflicts, and runtime-global shadowing fail deterministically. Complete awaited
-host work before calling `runCode()`; wasm execution is synchronous and blocks
-the V8 event loop until it finishes.
+Global names use dot-separated JavaScript identifier segments. A global's first
+argument is the guest value; a second context argument exposes `signal`,
+`deadlineMs`, `remainingTimeMs()`, and `isCancelled()`. Existing one-argument
+functions keep working. Guest arguments cross the boundary with JavaScript's
+normal `JSON.stringify` semantics (including its omission and coercion rules);
+host return values must already be strict JSON values and are validated without
+coercion. Invalid returns, invalid names, namespace conflicts, and
+runtime-global shadowing fail deterministically.
+
+A global may be `async`. Returning a promise suspends the guest and returns
+control to the V8 event loop, so `runCode()` and `runFile()` are awaited:
+
+```js
+const result = await engine.runCode(
+  "(async () => { console.log(JSON.stringify(await tools.search({ q: 'kittens' }))) })()",
+  { globals: { "tools.search": async (args) => await performSearch(args) } },
+);
+```
+
+Every global returns a promise in the guest, so one script shape works on this
+runtime and on tinysandbox's Rust and Node hosts. A synchronous host global is
+answered inline and its promise is already settled: a microtask, not a
+suspension, so only the globals that need it pay for suspending. Concurrent
+awaits settle in completion order, and a rejected promise surfaces in the guest
+as a catchable error. At most 64 host calls may be outstanding at once.
 
 ## Optional filesystem capability
 
@@ -101,7 +115,7 @@ Pass a synchronous `Vfs` implementation to enable the same `Buffer`, `fs`
 subset, and relative/absolute CommonJS loader as tinysandbox's `/bin/js`:
 
 ```ts
-const result = engine.runFile("main.js", {
+const result = await engine.runFile("main.js", {
   vfs,
   cwd: "/app",
   argv: ["js", "main.js", "one"],

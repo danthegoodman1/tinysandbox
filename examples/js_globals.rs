@@ -37,7 +37,7 @@ async fn main() {
         .js_global("whoami", |_args| async { Ok(json!({ "name": "agent-1" })) })
         // The prelude still runs before the script, so host globals can be
         // wrapped in friendlier JavaScript.
-        .js_prelude("globalThis.kvGet = key => kv.get({ key }).value")
+        .js_prelude("globalThis.kvGet = async key => (await kv.get({ key })).value")
         .fetch(|request| async move {
             if request.url == "https://example.test/config" {
                 Ok(FetchResponse {
@@ -54,17 +54,18 @@ async fn main() {
         })
         .build();
 
+    // Host globals return promises, so the whole script is one async scope.
     let script = r#"
-kv.put({ key: 'answer', value: 42 })
-console.log(`answer=${kvGet('answer')} user=${whoami().name}`)
-
-try {
-  kv.get({})
-} catch (err) {
-  console.log(`${err.code}:${err.message}`)
-}
-
 (async () => {
+  await kv.put({ key: 'answer', value: 42 })
+  console.log(`answer=${await kvGet('answer')} user=${(await whoami()).name}`)
+
+  try {
+    await kv.get({})
+  } catch (err) {
+    console.log(`${err.code}:${err.message}`)
+  }
+
   const response = await fetch('https://example.test/config')
   console.log(`${response.status}:${await response.text()}`)
 })()

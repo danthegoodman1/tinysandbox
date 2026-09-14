@@ -21,12 +21,12 @@ network, process, or environment capability; time comes from one explicit import
 - Commit: `fd0a0210b7be00957751871e7e01b8291268fc29`
 - Toolchain: WASI SDK `27.0`, `wasm32-wasip1`, downloaded from https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-27
 - Host used for the checked-in artifact: macOS 26.6.2 arm64, WASI SDK asset `wasi-sdk-27.0-arm64-macos.tar.gz`. The previous artifact was also verified byte for byte across Linux x86_64 and macOS arm64 builds.
-- Build flags: `-Oz -DNDEBUG -D_GNU_SOURCE -DTINYSANDBOX_WASI_STACK_LIMIT -mexec-model=reactor`, linked with `--allow-undefined`, `--import-memory`, `-z stack-size=1048576`, explicit exports `tinysandbox_alloc`, `tinysandbox_free`, `tinysandbox_abi_version`, `tinysandbox_run`, and the imported memory, then stripped with `llvm-strip`
+- Build flags: `-Oz -DNDEBUG -D_GNU_SOURCE -DTINYSANDBOX_WASI_STACK_LIMIT -mexec-model=reactor`, linked with `--allow-undefined`, `--import-memory`, `-z stack-size=1048576`, explicit exports `tinysandbox_alloc`, `tinysandbox_free`, `tinysandbox_abi_version`, `tinysandbox_run`, `tinysandbox_resolve`, and the imported memory, then stripped with `llvm-strip`
 - Source patch: the build script enables QuickJS's stack-limit branch under WASI so `JS_SetMaxStackSize` raises catchable `RangeError` exceptions before wasmtime stack traps.
 - QuickJS stack limit: 786,432 bytes (`768 KiB`), leaving headroom inside the linked 1 MiB C stack
 - QuickJS sources linked: `quickjs.c`, `dtoa.c`, `libregexp.c`, `libunicode.c`
 - Tinysandbox shim: `src/js/quickjs_shim.c`
-- Artifact: 626,766 bytes, SHA-256 `9b7686bc01fc7f09a6109ac516fb1bbd04771803cc1dc2b2e18726a1d3e8c3af`
+- Artifact: 628,082 bytes, SHA-256 `09ba7582b5a3e737a8c27b63fdc613e9d49de98c030b671b3b4f7d7ff0a14c60`
 - Initial linear memory: 19 WebAssembly pages, 1,245,184 bytes (1.1875 MiB)
 
 Inspect the artifact without installing `wasm-tools` or another package:
