@@ -307,6 +307,8 @@ jobs:
       - build-macos-native
     if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-26.04
+    env:
+      RELEASE_PATHS: Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json tinysandbox-node/native.cjs tinysandbox-node/npm/*/package.json
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -401,6 +403,25 @@ jobs:
           node scripts/write-native-lockfile.mjs "${VERSION}"
           node scripts/release-version.mjs check "${VERSION}"
 
+      - name: Commit the release version
+        id: release_commit
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Commit before publishing so `cargo publish --locked` sees a clean
+          # tree. This stays local; the push below waits until the packages are
+          # out, which is what keeps main untouched when a publish fails.
+          git diff --check
+          if git diff --quiet; then
+            echo "no release version changes to commit"
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git add ${RELEASE_PATHS}
+          git commit -m "chore(release): ${VERSION} [skip release]"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
       - name: Publish crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -444,23 +465,16 @@ jobs:
             npm publish --access public
           fi
 
-      - name: Commit and push the release version
+      - name: Push the release version
+        if: steps.release_commit.outputs.committed == 'true'
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           # Last, so a failure anywhere above leaves main untouched instead of
           # carrying a version whose packages were never published, or a
-          # lockfile only a later release could repair. Everything this commits
+          # lockfile only a later release could repair. Everything this pushes
           # was already verified against the artifacts that just shipped.
-          git diff --check
-          if git diff --quiet; then
-            echo "no release version changes to commit"
-            exit 0
-          fi
-          release_paths=(Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json tinysandbox-node/native.cjs tinysandbox-node/npm/*/package.json)
-          git add "${release_paths[@]}"
-          git commit -m "chore(release): ${VERSION} [skip release]"
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
               exit 0
@@ -474,7 +488,7 @@ jobs:
             cargo update -w
             node scripts/write-native-lockfile.mjs "${VERSION}"
             node scripts/release-version.mjs check "${VERSION}"
-            git add "${release_paths[@]}"
+            git add ${RELEASE_PATHS}
             git commit --amend --no-edit
           done
           git push origin HEAD:main
