@@ -157,12 +157,13 @@ test("release versioning preserves unpublished optional packages and uses OIDC p
 })
 
 test("the release commit lands after publishing and repairs itself on rebase", () => {
-  // Committing last is what keeps main consistent: a failure anywhere earlier
+  // Pushing last is what keeps main consistent: a failure anywhere earlier
   // leaves it untouched rather than carrying a version whose packages were
-  // never published.
+  // never published. The commit itself comes before the crate goes out,
+  // because `cargo publish --locked` refuses to package a dirty tree.
   const publish = workflow.match(/\n  publish:\n(?<body>[\s\S]*)$/)?.groups?.body
   assert.ok(publish, "release workflow must define the publish job")
-  const order = ["Apply lockstep version", "Resolve the native lockfile entries", "Publish crate", "Publish native and facade npm packages", "Commit and push the release version"]
+  const order = ["Apply lockstep version", "Resolve the native lockfile entries", "Commit the release version", "Publish crate", "Publish native and facade npm packages", "Push the release version"]
   const positions = order.map((name) => publish.indexOf(`- name: ${name}`))
   assert.ok(positions.every((at) => at >= 0), `publish must define ${order.join(", ")}`)
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "publish steps are out of order")
