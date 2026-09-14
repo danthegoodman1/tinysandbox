@@ -1,14 +1,12 @@
 //! Async filesystem facade exposed to sandbox commands.
 
+use super::pools::Pools;
 use super::{HostContext, Limits, control::ExecutionControl};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -39,8 +37,9 @@ impl Fs {
         bin_commands: Arc<BTreeSet<String>>,
         cwd: String,
         limits: Limits,
+        pools: Arc<Pools>,
     ) -> Self {
-        Self::build(vfs, bin_commands, cwd, limits, None)
+        Self::build(vfs, bin_commands, cwd, limits, pools, None)
     }
 
     /// Builds a command's filesystem, taking its limits from the execution it
@@ -50,9 +49,10 @@ impl Fs {
         bin_commands: Arc<BTreeSet<String>>,
         cwd: String,
         control: Arc<ExecutionControl>,
+        pools: Arc<Pools>,
     ) -> Self {
         let limits = control.limits;
-        Self::build(vfs, bin_commands, cwd, limits, Some(control))
+        Self::build(vfs, bin_commands, cwd, limits, pools, Some(control))
     }
 
     fn build(
@@ -60,11 +60,13 @@ impl Fs {
         bin_commands: Arc<BTreeSet<String>>,
         cwd: String,
         limits: Limits,
+        pools: Arc<Pools>,
         control: Option<Arc<ExecutionControl>>,
     ) -> Self {
         let handles = Arc::new(HandleRegistry {
             vfs: Arc::clone(&vfs),
             files: Mutex::new(BTreeSet::new()),
+            pools,
             control,
         });
         if let Some(control) = &handles.control {
@@ -90,6 +92,11 @@ impl Fs {
     /// retain a 64 KiB allowance even when the whole-file input limit is lower.
     pub fn max_io_bytes(&self) -> usize {
         self.limits().host_input_bytes.max(STREAM_CHUNK_BYTES)
+    }
+
+    /// Shared pools this filesystem and its sandbox draw their resources from.
+    pub(crate) fn pools(&self) -> &Arc<Pools> {
+        &self.handles.pools
     }
 
     /// Cooperative cancellation and deadline for trusted work in this execution.
@@ -479,9 +486,11 @@ impl Fs {
         if fast {
             return op(self.vfs.as_ref());
         }
-        static WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
-        let permit = WORKERS
-            .acquire()
+        let permit = self
+            .handles
+            .pools
+            .blocking_vfs_workers()
+            .acquire_owned()
             .await
             .map_err(|_| VfsError::new(Errno::EIO))?;
         let registry = Arc::clone(&self.handles);
@@ -526,38 +535,41 @@ impl Fs {
     }
 }
 
-// A global handle ceiling also bounds pending fallback cleanup. Cleanup has a
-// fixed worker count, works without a Tokio runtime, and retains admission until
-// the backend actually releases the handle.
-static OPEN_FILES: AtomicUsize = AtomicUsize::new(0);
+// The shared handle ceiling also bounds pending fallback cleanup. Cleanup runs
+// on the pool's own threads, works without a Tokio runtime, and retains
+// admission until the backend actually releases the handle.
 pub(crate) struct HandleRegistry {
     vfs: Arc<dyn Vfs>,
     files: Mutex<BTreeSet<FileHandle>>,
+    pools: Arc<Pools>,
     control: Option<Arc<ExecutionControl>>,
 }
 impl HandleRegistry {
     pub(crate) fn abandon_all(&self) {
         let files = std::mem::take(&mut *self.files.lock().unwrap_or_else(|e| e.into_inner()));
         for handle in files {
-            cleanup_handle(Arc::clone(&self.vfs), handle, self.control.clone());
+            cleanup_handle(
+                Arc::clone(&self.vfs),
+                handle,
+                Arc::clone(&self.pools),
+                self.control.clone(),
+            );
         }
     }
     fn reserve(&self) -> VfsResult<()> {
-        OPEN_FILES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < 16384).then_some(n + 1)
-            })
-            .map_err(|_| VfsError::new(Errno::ENOSPC))?;
+        if !self.pools.acquire_file() {
+            return Err(VfsError::new(Errno::ENOSPC));
+        }
         if let Some(control) = &self.control
             && let Err(err) = control.acquire_file()
         {
-            OPEN_FILES.fetch_sub(1, Ordering::AcqRel);
+            self.pools.release_file();
             return Err(err);
         }
         Ok(())
     }
     fn release(&self) {
-        OPEN_FILES.fetch_sub(1, Ordering::AcqRel);
+        self.pools.release_file();
         if let Some(control) = &self.control {
             control.release_file();
         }
@@ -580,14 +592,24 @@ impl HandleRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&handle)
         {
-            cleanup_handle(Arc::clone(&self.vfs), handle, self.control.clone());
+            cleanup_handle(
+                Arc::clone(&self.vfs),
+                handle,
+                Arc::clone(&self.pools),
+                self.control.clone(),
+            );
         }
     }
 }
 impl Drop for HandleRegistry {
     fn drop(&mut self) {
         for handle in std::mem::take(self.files.get_mut().unwrap_or_else(|e| e.into_inner())) {
-            cleanup_handle(Arc::clone(&self.vfs), handle, self.control.clone());
+            cleanup_handle(
+                Arc::clone(&self.vfs),
+                handle,
+                Arc::clone(&self.pools),
+                self.control.clone(),
+            );
         }
     }
 }
@@ -610,43 +632,26 @@ impl Drop for FileAdmission<'_> {
         self.0.release();
     }
 }
-type Cleanup = (Arc<dyn Vfs>, FileHandle, Option<Arc<ExecutionControl>>);
-fn cleanup_handle(vfs: Arc<dyn Vfs>, handle: FileHandle, control: Option<Arc<ExecutionControl>>) {
-    fn run((vfs, handle, control): Cleanup) {
+fn cleanup_handle(
+    vfs: Arc<dyn Vfs>,
+    handle: FileHandle,
+    pools: Arc<Pools>,
+    control: Option<Arc<ExecutionControl>>,
+) {
+    let fast = vfs.is_fast_handle(handle);
+    let spawner = Arc::clone(&pools);
+    let release = move || {
         let _ = vfs.abort(handle);
-        OPEN_FILES.fetch_sub(1, Ordering::AcqRel);
+        pools.release_file();
         if let Some(control) = control {
             control.release_file();
         }
-    }
-    if vfs.is_fast_handle(handle) {
-        run((vfs, handle, control));
+    };
+    if fast {
+        release();
         return;
     }
-    static CLEANUP: OnceLock<std::sync::mpsc::Sender<Cleanup>> = OnceLock::new();
-    let sender = CLEANUP.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Cleanup>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        for _ in 0..4 {
-            let receiver = Arc::clone(&receiver);
-            std::thread::Builder::new()
-                .name("tinysandbox-fs-cleanup".into())
-                .spawn(move || {
-                    loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        match next {
-                            Ok(item) => run(item),
-                            Err(_) => break,
-                        }
-                    }
-                })
-                .expect("start filesystem cleanup worker");
-        }
-        sender
-    });
-    if let Err(err) = sender.send((vfs, handle, control)) {
-        run(err.0);
-    }
+    spawner.spawn_cleanup(Box::new(release));
 }
 
 type ReadAtFuture = Pin<Box<dyn Future<Output = VfsResult<(Vec<u8>, usize)>> + Send>>;

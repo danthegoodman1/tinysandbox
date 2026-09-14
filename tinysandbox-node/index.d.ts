@@ -50,8 +50,36 @@ export declare class Sandbox {
   jsGlobalNames(): Array<string>
 }
 
+/**
+ * Resources shared by every sandbox constructed with the same instance:
+ * guest worker threads, open handles, and blocking filesystem dispatch.
+ *
+ * `LimitsOptions` bounds one execution; this bounds what executions contend
+ * for across sandboxes. Sandboxes built without a `Pools` share one
+ * process-wide default, so a host isolating tenants from each other should
+ * give each tenant its own instance.
+ */
+export declare class Pools {
+  constructor(capacity?: PoolCapacityOptions | null)
+}
+
+export interface PoolCapacityOptions {
+  /** Concurrent `jq` guests. Each holds an OS thread while it evaluates. */
+  jqWorkers?: number
+  /** Concurrent `js` guests. Each holds an OS thread while it evaluates. */
+  jsWorkers?: number
+  /** Concurrent blocking VFS operations dispatched to the blocking pool. */
+  blockingVfsWorkers?: number
+  /** Open file handles held at once across every sharing sandbox. */
+  openFiles?: number
+  /** Threads that release handles a cancelled execution abandoned. */
+  cleanupThreads?: number
+}
+
 export interface SandboxOptions {
   limits?: LimitsOptions
+  /** Resources shared with every other sandbox built from the same instance. */
+  pools?: Pools
   env?: Record<string, string>
   cwd?: string
   persistSession?: boolean

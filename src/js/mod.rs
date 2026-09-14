@@ -31,7 +31,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use wasmtime::{
     Caller, Engine, Extern, Linker, Memory, MemoryType, Module, ResourceLimiter, Store, Trap,
 };
@@ -53,7 +53,6 @@ const QUICKJS_INITIAL_MEMORY_PAGES: u32 = 19;
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
-const MAX_CONCURRENT_JS: usize = 16;
 
 /// Registers the `js` command in a sandbox command registry.
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
@@ -81,12 +80,11 @@ fn js_command(ctx: CommandContext) -> CommandFuture {
         // Admission is bounded independently of Tokio's blocking pool. The
         // worker owns the permit until it has actually exited, even when the
         // command future is cancelled while a host callback is still running.
-        static WORKERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-        let workers = WORKERS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_JS)));
+        let workers = fs.pools().js_workers();
         let remaining = fs
             .remaining_wall_time()
             .unwrap_or_else(|| limits.wall_time.saturating_sub(started.elapsed()));
-        let permit = match tokio::time::timeout(remaining, workers.clone().acquire_owned()).await {
+        let permit = match tokio::time::timeout(remaining, workers.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             _ => return CommandResult::new(124),
         };

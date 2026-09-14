@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Sandbox, prompts, runConformance } from '../index.js'
+import { Pools, Sandbox, prompts, runConformance } from '../index.js'
 import { createMemoryVfs } from './helpers.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -704,4 +704,26 @@ test('host descriptors survive distinct fs facade calls and large reads fail bef
   await assert.rejects(() => sandbox.fs.readAt(fd, 0, 1024 ** 3), { code: 'EFBIG' })
   await sandbox.fs.close(fd)
   assert.throws(() => new Sandbox({ limits: { wallTimeMs: Number.MAX_VALUE } }), /wallTimeMs/)
+})
+
+test('shared pools bound sandboxes together and separate pools keep them apart', async () => {
+  const shared = new Pools({ openFiles: 1 })
+  const first = new Sandbox({ pools: shared })
+  const second = new Sandbox({ pools: shared })
+  await first.fs.writeFile('/workspace/a', Buffer.from('a'))
+  await second.fs.writeFile('/workspace/b', Buffer.from('b'))
+
+  const held = await first.fs.open('/workspace/a', { read: true })
+  await assert.rejects(() => second.fs.open('/workspace/b', { read: true }), { code: 'ENOSPC' })
+
+  // The same shape against its own pools is unaffected by the neighbour.
+  const isolated = new Sandbox({ pools: new Pools({ openFiles: 1 }) })
+  await isolated.fs.writeFile('/workspace/c', Buffer.from('c'))
+  const own = await isolated.fs.open('/workspace/c', { read: true })
+
+  await first.fs.close(held)
+  await second.fs.open('/workspace/b', { read: true })
+  await isolated.fs.close(own)
+
+  assert.throws(() => new Sandbox({ pools: {} }), /Pools instance/)
 })

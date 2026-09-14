@@ -1217,24 +1217,35 @@ operations use the default whole-file and per-I/O caps; stream large files with
 handles. Raw reads/writes allow at least one 64 KiB stream chunk even under a
 smaller whole-file cap.
 
-JS workers are admitted through 16 process-wide slots; synchronous filesystem
-work through 128 slots; isolated jq evaluation through 16 slots. Slots remain
-occupied until running work finishes. Jq input buffers are separately capped
-per command and collected before worker admission to let downstream pipes drain.
-Fallback handle cleanup uses four workers and shares a process-wide 16,384-open-
-file ceiling. Trusted host callbacks and VFS implementations must bound their
-own work. VFS quotas are
-backend-configured (memory quotas are unlimited unless set). JS memory, jq
-memory, and fetch-response limits are independently configurable:
+`Limits` bounds one execution. Guest worker threads, open handles, and blocking
+filesystem dispatch are bounded by `Pools`, because what they protect belongs to
+the process rather than to any one sandbox. A `Pools` admits 16 JS workers, 16
+isolated jq evaluations, 128 concurrent blocking filesystem operations, 16,384
+open handles, and four handle-cleanup threads. Slots stay occupied until running
+work finishes; jq input buffers are capped per command and collected before
+worker admission so downstream pipes can drain.
+
+Sandboxes built without explicit pools share one process-wide default, so a
+single embedding needs no configuration. A host that isolates tenants from each
+other should build a `Pools` per tenant: sandboxes sharing one contend for the
+same slots, and a tenant that saturates its own pools cannot delay another's
+work. Trusted host callbacks and VFS implementations must still bound their own
+work. VFS quotas are backend-configured (memory quotas are unlimited unless
+set). JS memory, jq memory, and fetch-response limits are independently
+configurable:
 
 #### Rust
 
 ```rust no_run
+use std::sync::Arc;
 use std::time::Duration;
-use tinysandbox::sandbox::{Limits, Sandbox};
+use tinysandbox::sandbox::{Limits, PoolCapacity, Pools, Sandbox};
 
 fn main() {
+    // One per tenant, shared by every sandbox that tenant runs.
+    let pools = Pools::new(PoolCapacity::default().with_jq_workers(4));
     let sandbox = Sandbox::builder()
+        .pools(Arc::clone(&pools))
         .limits(
             Limits::default()
                 .with_wall_time(Duration::from_secs(5))
@@ -1249,9 +1260,13 @@ fn main() {
 #### TypeScript
 
 ```ts
-import { Sandbox } from '@tinysandbox/tinysandbox'
+import { Pools, Sandbox } from '@tinysandbox/tinysandbox'
+
+// One per tenant, shared by every sandbox that tenant runs.
+const pools = new Pools({ jqWorkers: 4 })
 
 const sandbox = new Sandbox({
+  pools,
   limits: {
     wallTimeMs: 5000,
     wasmMemoryBytes: 32 * 1024 * 1024,
