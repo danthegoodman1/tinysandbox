@@ -156,21 +156,32 @@ test("release versioning preserves unpublished optional packages and uses OIDC p
   assert.doesNotMatch(workflow, /NPM_TOKEN|NODE_AUTH_TOKEN/)
 })
 
-test("release preparation repairs versioned files after rebasing onto main", () => {
-  const retry = workflow.match(
-    /git fetch origin main\n(?<body>[\s\S]*?)\n\s+done/
-  )?.groups?.body
+test("the release commit lands after publishing and repairs itself on rebase", () => {
+  // Committing last is what keeps main consistent: a failure anywhere earlier
+  // leaves it untouched rather than carrying a version whose packages were
+  // never published.
+  const publish = workflow.match(/\n  publish:\n(?<body>[\s\S]*)$/)?.groups?.body
+  assert.ok(publish, "release workflow must define the publish job")
+  const order = ["Apply lockstep version", "Resolve the native lockfile entries", "Publish crate", "Publish native and facade npm packages", "Commit and push the release version"]
+  const positions = order.map((name) => publish.indexOf(`- name: ${name}`))
+  assert.ok(positions.every((at) => at >= 0), `publish must define ${order.join(", ")}`)
+  assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "publish steps are out of order")
+
+  const retry = publish.match(/git fetch origin main\n(?<body>[\s\S]*?)\n\s+done/)?.groups?.body
   assert.ok(retry, "release workflow must define a push retry after fetching main")
   assert.match(retry, /git rebase origin\/main/)
-  assert.match(
-    retry,
-    /node scripts\/release-version\.mjs apply "\$\{\{ steps\.version\.outputs\.version \}\}"/
-  )
-  assert.match(
-    retry,
-    /node scripts\/release-version\.mjs check "\$\{\{ steps\.version\.outputs\.version \}\}"/
-  )
+  assert.match(retry, /node scripts\/release-version\.mjs apply "\$\{VERSION\}"/)
+  assert.match(retry, /node scripts\/write-native-lockfile\.mjs "\$\{VERSION\}"/)
+  assert.match(retry, /node scripts\/release-version\.mjs check "\$\{VERSION\}"/)
   assert.match(retry, /git commit --amend --no-edit/)
+})
+
+test("the lockfile is resolved from local tarballs, never from the registry", () => {
+  const publish = workflow.match(/\n  publish:\n(?<body>[\s\S]*)$/)?.groups?.body
+  const step = publish.match(/- name: Resolve the native lockfile entries\n(?<body>[\s\S]*?)\n      - name:/)?.groups?.body
+  assert.ok(step, "publish must resolve the native lockfile entries")
+  assert.match(step, /node scripts\/write-native-lockfile\.mjs/)
+  assert.doesNotMatch(step, /npm (view|install)/, "resolving must not wait on registry propagation")
 })
 
 test("portable JS runtime publishes independently after successful main CI", () => {

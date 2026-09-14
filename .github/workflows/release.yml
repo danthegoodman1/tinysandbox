@@ -85,12 +85,6 @@ jobs:
         with:
           node-version: 24
 
-      - name: Configure Git author
-        if: steps.eligibility.outputs.release == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
       - name: Determine release version
         if: steps.eligibility.outputs.release == 'true'
         id: version
@@ -101,43 +95,6 @@ jobs:
           version="$(node scripts/release-version.mjs next --bump "$RELEASE_BUMP" --message "$RELEASE_MESSAGE")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Releasing $version"
-
-      - name: Apply lockstep version
-        if: steps.eligibility.outputs.release == 'true'
-        run: |
-          node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
-          cargo update -w
-          node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
-
-      - name: Commit and push release version
-        if: steps.eligibility.outputs.release == 'true'
-        run: |
-          set -euo pipefail
-          git diff --check
-          if git diff --quiet; then
-            echo "No release version changes to commit"
-            exit 0
-          fi
-          git add Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json tinysandbox-node/native.cjs tinysandbox-node/npm/*/package.json
-          git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip release]"
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "main advanced before the release commit could be pushed; rebasing release commit (attempt ${attempt})"
-            git fetch origin main
-            git rebase origin/main
-            # A preceding release can refresh its optional native-package
-            # lockfile entries while this release is preparing. Reapplying the
-            # version after the rebase replaces those now-stale resolved entries
-            # with placeholders for the version that has not been published yet.
-            node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
-            cargo update -w
-            node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
-            git add Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json tinysandbox-node/native.cjs tinysandbox-node/npm/*/package.json
-            git commit --amend --no-edit
-          done
-          git push origin HEAD:main
 
       - name: Record release source
         if: steps.eligibility.outputs.release == 'true'
@@ -380,6 +337,16 @@ jobs:
         run: npm run build
         working-directory: tinysandbox-node
 
+      - name: Apply lockstep version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node scripts/release-version.mjs apply "${VERSION}"
+          cargo update -w
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: native-*
@@ -422,6 +389,17 @@ jobs:
             exit 1
           fi
           node scripts/verify-native-packages.mjs --require-binaries
+
+      - name: Resolve the native lockfile entries
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The entries come from the tarballs assembled above, so the lockfile
+          # is complete before anything is published and nothing here waits on
+          # registry propagation.
+          node scripts/write-native-lockfile.mjs "${VERSION}"
+          node scripts/release-version.mjs check "${VERSION}"
 
       - name: Publish crate
         env:
@@ -466,33 +444,37 @@ jobs:
             npm publish --access public
           fi
 
-      - name: Refresh lockfile with published native packages
+      - name: Commit and push the release version
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          # `release-version.mjs apply` can only leave placeholder entries for
-          # the native packages, because the version does not exist on npm when
-          # the release commit is built. They resolve now that publishing is
-          # done, and `npm ci` rejects the placeholders until they do. The
-          # refresh retries while the registry catches up with the packages this
-          # run just published, and fails the release rather than committing a
-          # lockfile that would break `npm ci` on main.
-          node scripts/refresh-native-lockfile.mjs "${VERSION}"
-          if git diff --quiet -- tinysandbox-node/package-lock.json; then
-            echo "lockfile already resolves ${VERSION}"
+          # Last, so a failure anywhere above leaves main untouched instead of
+          # carrying a version whose packages were never published, or a
+          # lockfile only a later release could repair. Everything this commits
+          # was already verified against the artifacts that just shipped.
+          git diff --check
+          if git diff --quiet; then
+            echo "no release version changes to commit"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tinysandbox-node/package-lock.json
-          git commit -m "chore(release): resolve ${VERSION} lockfile entries [skip release]"
+          release_paths=(Cargo.toml Cargo.lock tinysandbox-node/Cargo.toml tinysandbox-node/package.json tinysandbox-node/package-lock.json tinysandbox-node/native.cjs tinysandbox-node/npm/*/package.json)
+          git add "${release_paths[@]}"
+          git commit -m "chore(release): ${VERSION} [skip release]"
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
               exit 0
             fi
-            echo "main advanced before the lockfile refresh could be pushed; rebasing (attempt ${attempt})"
+            echo "main advanced before the release commit could be pushed; rebasing (attempt ${attempt})"
             git fetch origin main
             git rebase origin/main
+            # Reapply onto the newer main: another release may have moved the
+            # versions this commit resolves.
+            node scripts/release-version.mjs apply "${VERSION}"
+            cargo update -w
+            node scripts/write-native-lockfile.mjs "${VERSION}"
+            node scripts/release-version.mjs check "${VERSION}"
+            git add "${release_paths[@]}"
+            git commit --amend --no-edit
           done
           git push origin HEAD:main
