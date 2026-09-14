@@ -17,13 +17,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use regex::{Captures, Regex, RegexBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 use super::jq_protocol::{JqInputSource, parse_jq_args};
 use super::jq_runtime::{self, JqStreamMessage};
@@ -39,9 +39,6 @@ const MAX_JQ_JSON_NESTING: usize = 1024;
 // Independent from JS admission: each isolated evaluator retains its slot
 // until its worker exits. Collect bounded stdin before
 // admission so a queued downstream jq can drain an admitted producer's pipe.
-const MAX_JQ_WORKERS: usize = 16;
-static JQ_WORKERS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_JQ_WORKERS)));
 
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
     insert(commands, "cat", cat);
@@ -407,7 +404,9 @@ fn jq_cmd(ctx: CommandContext) -> CommandFuture {
             }
         };
 
-        let permit = Arc::clone(&JQ_WORKERS)
+        let permit = fs
+            .pools()
+            .jq_workers()
             .acquire_owned()
             .await
             .expect("jq admission semaphore remains open");
@@ -2594,15 +2593,14 @@ mod tests {
 
     #[tokio::test]
     async fn jq_waiting_for_worker_admission_obeys_exec_deadline() {
-        use crate::sandbox::{Limits, Sandbox};
+        use crate::sandbox::{Limits, PoolCapacity, Pools, Sandbox};
         use std::sync::Arc;
         use std::time::Duration;
 
-        let occupied = Arc::clone(&super::JQ_WORKERS)
-            .acquire_many_owned(super::MAX_JQ_WORKERS as u32)
-            .await
-            .unwrap();
+        let pools = Pools::new(PoolCapacity::default().with_jq_workers(2));
+        let occupied = pools.jq_workers().acquire_many_owned(2).await.unwrap();
         let sandbox = Sandbox::builder()
+            .pools(Arc::clone(&pools))
             .limits(Limits {
                 wall_time: Duration::from_millis(20),
                 ..Limits::default()
@@ -2614,18 +2612,20 @@ mod tests {
             "a full worker pool must defer evaluation"
         );
         drop(occupied);
-        let result = Sandbox::builder().build().exec("jq -n '1'").await;
+        let result = Sandbox::builder()
+            .pools(Arc::clone(&pools))
+            .build()
+            .exec("jq -n '1'")
+            .await;
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
         assert_eq!(result.stdout, "1\n");
 
         // Leave one worker slot for a two-jq pipeline whose output exceeds
         // both the pipe and message-channel buffers. The downstream reader
         // must drain input before waiting for its own evaluator slot.
-        let occupied = Arc::clone(&super::JQ_WORKERS)
-            .acquire_many_owned((super::MAX_JQ_WORKERS - 1) as u32)
-            .await
-            .unwrap();
+        let occupied = pools.jq_workers().acquire_many_owned(1).await.unwrap();
         let sandbox = Sandbox::builder()
+            .pools(Arc::clone(&pools))
             .limits(Limits {
                 wall_time: Duration::from_secs(2),
                 ..Limits::default()
@@ -2640,6 +2640,40 @@ mod tests {
             result.stderr
         );
         assert_eq!(result.stdout.trim(), "1000003");
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn one_domain_cannot_starve_another_of_jq_workers() {
+        use crate::sandbox::{Limits, PoolCapacity, Pools, Sandbox};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let busy = Pools::new(PoolCapacity::default().with_jq_workers(1));
+        let quiet = Pools::new(PoolCapacity::default().with_jq_workers(1));
+        let occupied = busy.jq_workers().acquire_many_owned(1).await.unwrap();
+
+        let starved = Sandbox::builder()
+            .pools(Arc::clone(&busy))
+            .limits(Limits {
+                wall_time: Duration::from_millis(20),
+                ..Limits::default()
+            })
+            .build();
+        assert_eq!(
+            starved.exec("jq -n '1'").await.exit_code,
+            124,
+            "its own domain is saturated"
+        );
+
+        let neighbour = Sandbox::builder().pools(Arc::clone(&quiet)).build();
+        let result = neighbour.exec("jq -n '1'").await;
+        assert_eq!(
+            result.exit_code, 0,
+            "a separate domain is unaffected: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout, "1\n");
         drop(occupied);
     }
 

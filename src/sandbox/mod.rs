@@ -27,6 +27,7 @@ pub mod fs;
 pub mod host;
 mod jq_protocol;
 mod jq_runtime;
+mod pools;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -43,6 +44,7 @@ use std::time::{Duration, Instant};
 pub use control::HostContext;
 use control::{ExecutionControl, ExecutionGuard};
 use fs::{Fs, STREAM_CHUNK_BYTES, errno_message, normalize_absolute};
+pub use pools::{PoolCapacity, Pools};
 use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::{task, time};
 
@@ -153,6 +155,7 @@ pub struct Sandbox {
     #[cfg(feature = "js")]
     js_prelude: Arc<str>,
     limits: Limits,
+    pools: Arc<Pools>,
     session: Mutex<Session>,
     persist_session: bool,
     commands_run: AtomicU64,
@@ -169,6 +172,7 @@ pub struct SandboxBuilder {
     #[cfg(feature = "js")]
     js_prelude: Option<String>,
     limits: Limits,
+    pools: Option<Arc<Pools>>,
     cwd: String,
     env: BTreeMap<String, String>,
     persist_session: bool,
@@ -536,6 +540,7 @@ impl Sandbox {
             Arc::clone(&self.command_names),
             session.cwd.clone(),
             Arc::clone(&exec.control),
+            Arc::clone(&self.pools),
         );
         let mut redirects = match prepare_redirects(simple, &fs, &session.env, exec.last_status)
             .await
@@ -734,6 +739,7 @@ impl Sandbox {
             Arc::clone(&self.command_names),
             session.cwd.clone(),
             Arc::clone(&exec.control),
+            Arc::clone(&self.pools),
         );
         let mut env = session.env.clone();
         for (name, value) in assignment_values {
@@ -1008,6 +1014,7 @@ impl SandboxBuilder {
             #[cfg(feature = "js")]
             js_prelude: None,
             limits: Limits::default(),
+            pools: None,
             cwd: "/workspace".to_owned(),
             env,
             persist_session: false,
@@ -1153,6 +1160,26 @@ impl SandboxBuilder {
         self
     }
 
+    /// Sets the pools this sandbox draws its shared resources from.
+    ///
+    /// [`Limits`] bounds one execution; [`Pools`] bounds worker threads, open
+    /// handles, and blocking dispatch across every sandbox that shares them.
+    /// Without this, sandboxes share one process-wide default, so a host that
+    /// isolates tenants from each other should give each tenant its own.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use tinysandbox::sandbox::{PoolCapacity, Pools, Sandbox};
+    ///
+    /// let tenant = Pools::new(PoolCapacity::default().with_jq_workers(2));
+    /// let first = Sandbox::builder().pools(Arc::clone(&tenant)).build();
+    /// let second = Sandbox::builder().pools(Arc::clone(&tenant)).build();
+    /// ```
+    pub fn pools(mut self, pools: Arc<Pools>) -> Self {
+        self.pools = Some(pools);
+        self
+    }
+
     /// Sets an initial session environment variable.
     pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(name.into(), value.into());
@@ -1186,14 +1213,17 @@ impl SandboxBuilder {
         let vfs: Arc<dyn Vfs> = Arc::new(
             MountedVfs::new(self.mounts).expect("SandboxBuilder validates mount names eagerly"),
         );
+        let pools = self.pools.unwrap_or_else(Pools::shared);
         let host_fs = Fs::new(
             Arc::clone(&vfs),
             Arc::clone(&command_names),
             self.cwd.clone(),
             self.limits,
+            Arc::clone(&pools),
         );
         Sandbox {
             host_fs,
+            pools,
             vfs,
             commands: Arc::new(self.commands),
             command_names,

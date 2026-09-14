@@ -390,3 +390,50 @@ async fn shutting_down_one_pipe_descriptor_preserves_its_duplicate() {
     assert_eq!(result.metrics.commands[0].exit_code, 0);
     assert_eq!(result.metrics.pipe_bytes, vec![2]);
 }
+
+#[tokio::test]
+async fn the_open_handle_ceiling_is_scoped_to_its_pools() {
+    use tinysandbox::sandbox::{PoolCapacity, Pools};
+    use tinysandbox::vfs::Errno;
+
+    let write = || OpenMode::write_only().create();
+    let shared = Pools::new(PoolCapacity::default().with_open_files(1));
+    let first = Sandbox::builder().pools(Arc::clone(&shared)).build();
+    let second = Sandbox::builder().pools(Arc::clone(&shared)).build();
+
+    let held = first
+        .fs()
+        .open("/workspace/held.txt", write())
+        .await
+        .expect("the first handle fits the ceiling");
+    assert_eq!(shared.open_files(), 1);
+    assert_eq!(
+        second
+            .fs()
+            .open("/workspace/other.txt", write())
+            .await
+            .expect_err("sandboxes sharing pools share the ceiling")
+            .errno(),
+        Errno::ENOSPC
+    );
+
+    // The same sandbox shape against its own pools is unaffected by the
+    // neighbour that exhausted the shared budget.
+    let isolated = Sandbox::builder()
+        .pools(Pools::new(PoolCapacity::default().with_open_files(1)))
+        .build();
+    let own = isolated
+        .fs()
+        .open("/workspace/own.txt", write())
+        .await
+        .expect("a separate domain keeps its own budget");
+
+    first.fs().close(held).await.expect("release the handle");
+    assert_eq!(shared.open_files(), 0);
+    second
+        .fs()
+        .open("/workspace/other.txt", write())
+        .await
+        .expect("the freed slot is reusable across the domain");
+    isolated.fs().close(own).await.expect("release the handle");
+}
