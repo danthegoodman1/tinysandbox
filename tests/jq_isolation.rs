@@ -6,11 +6,11 @@ use tinysandbox::sandbox::{Limits, Sandbox};
 async fn intermediate_allocations_fail_inside_the_guest_and_the_sandbox_recovers() {
     let memory_limit = 32 * 1024 * 1024;
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            jq_memory_bytes: memory_limit,
-            wall_time: Duration::from_secs(3),
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_jq_memory_bytes(memory_limit)
+                .with_wall_time(Duration::from_secs(3)),
+        )
         .build();
     // Output would be just a number. The intermediate string used to allocate
     // in the host despite the input/output byte caps; now even its allocation
@@ -33,10 +33,7 @@ async fn intermediate_allocations_fail_inside_the_guest_and_the_sandbox_recovers
 #[tokio::test]
 async fn guest_initial_memory_is_also_subject_to_the_cap() {
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            jq_memory_bytes: 1,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_jq_memory_bytes(1))
         .build();
     let result = sandbox.exec("jq -n '1'").await;
     assert_eq!(result.exit_code, 5, "{}", result.stderr);

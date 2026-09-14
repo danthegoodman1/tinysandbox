@@ -239,10 +239,7 @@ async fn js_global_handlers_use_embedder_runtime_and_wall_timeout() {
     assert_eq!(timed.stdout, "done\n");
 
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_millis(500),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(500)))
         .js_global("hang", |_args| async {
             std::future::pending::<Result<Value, HostError>>().await
         })
@@ -437,10 +434,7 @@ async fn js_fetch_hanging_handler_rejects_before_command_timeout() {
     // A stuck handler should use the remaining wall-time budget to produce a
     // catchable fetch rejection before the outer command timeout wins.
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_millis(500),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(500)))
         .fetch(|_request| async {
             std::future::pending::<Result<FetchResponse, HostError>>().await
         })
@@ -594,10 +588,7 @@ async fn js_fetch_response_size_cap_rejects_with_custom_limit() {
     // The host enforces the configured response cap before base64 response
     // bytes are returned to the guest.
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            fetch_response_bytes: 3,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_fetch_response_bytes(3))
         .fetch(|_request| async {
             Ok(FetchResponse {
                 status: 200,
@@ -1778,10 +1769,7 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
     // Epoch interruption should stop tight loops promptly with the same 124
     // timeout status used by the sandbox wall-clock guard.
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_millis(30),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(30)))
         .build();
     let start = Instant::now();
     let result = sandbox.exec("js -e 'while (true) {}'").await;
@@ -1789,10 +1777,7 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
     assert!(start.elapsed() < Duration::from_secs(2));
 
     let oom = Sandbox::builder()
-        .limits(Limits {
-            wasm_memory_bytes: OOM_LIMIT_BYTES,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wasm_memory_bytes(OOM_LIMIT_BYTES))
         .build()
         .exec("js -e 'const chunks = []; while (true) chunks.push(new ArrayBuffer(1024 * 1024))'")
         .await;
@@ -1807,10 +1792,7 @@ async fn js_cpu_and_memory_limits_fail_cleanly() {
     assert!(peak <= OOM_LIMIT_BYTES);
 
     let natural_ceiling = Sandbox::builder()
-        .limits(Limits {
-            wasm_memory_bytes: usize::MAX,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wasm_memory_bytes(usize::MAX))
         .build()
         .exec("js -e 'console.log(\"large cap\")'")
         .await;
@@ -1871,11 +1853,11 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
 
     let oversized_source = format!("js -e '{}'", "x".repeat(INITIAL_BYTES + 1));
     let source = Sandbox::builder()
-        .limits(Limits {
-            wasm_memory_bytes: INITIAL_BYTES,
-            shell_input_bytes: 2 * INITIAL_BYTES,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_wasm_memory_bytes(INITIAL_BYTES)
+                .with_shell_input_bytes(2 * INITIAL_BYTES),
+        )
         .build()
         .exec(&oversized_source)
         .await;
@@ -1884,10 +1866,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
 
     const RESPONSE_CAP: usize = 4 * 1024 * 1024;
     let over = Sandbox::builder()
-        .limits(Limits {
-            wasm_memory_bytes: RESPONSE_CAP,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wasm_memory_bytes(RESPONSE_CAP))
         .js_global("exact", |_args| async {
             Ok(json!("x".repeat(RESPONSE_CAP)))
         })
@@ -1898,10 +1877,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
     assert_eq!(over.stdout, "E2BIG\n");
 
     let independent_fetch_cap = Sandbox::builder()
-        .limits(Limits {
-            fetch_response_bytes: 0,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_fetch_response_bytes(0))
         .js_global("small", |_args| async { Ok(Value::Null) })
         .build()
         .exec("echo file > /workspace/a; js -e 'console.log(small(null), require(\"fs\").readFileSync(\"/workspace/a\", \"utf8\").trim())'")
@@ -1914,11 +1890,11 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
     assert_eq!(independent_fetch_cap.stdout, "null file\n");
 
     let output = Sandbox::builder()
-        .limits(Limits {
-            stdout_bytes: 64,
-            stderr_bytes: 64,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_stdout_bytes(64)
+                .with_stderr_bytes(64),
+        )
         .build()
         .exec("js -e 'console.log(\"a\".repeat(1000)); console.error(\"b\".repeat(1000))'")
         .await;
@@ -1931,10 +1907,7 @@ async fn js_wasmtime_bounds_source_global_responses_and_output_before_copy() {
     assert!(output.stderr.contains("[tinysandbox: output truncated]"));
 
     let short_budget = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_millis(40),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(40)))
         .js_global("fast", |_args| async { Ok(json!("ok")) })
         .build()
         .exec("js -e 'console.log(fast(null))'")
@@ -2171,11 +2144,11 @@ async fn js_output_preserves_bytes_through_pipes_and_redirects() {
     let vfs = Arc::new(InMemoryVfs::default());
     let sandbox = Sandbox::builder()
         .mount_arc("workspace", vfs.clone())
-        .limits(Limits {
-            stdout_bytes: 128,
-            stderr_bytes: 128,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_stdout_bytes(128)
+                .with_stderr_bytes(128),
+        )
         .build();
     let piped = sandbox
         .exec("js -e 'console.log(\"x\".repeat(4096))' | wc -c")
@@ -2196,10 +2169,7 @@ async fn js_output_preserves_bytes_through_pipes_and_redirects() {
 async fn js_output_stops_when_the_downstream_reader_exits() {
     warm_js_runtime().await;
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_secs(3),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_secs(3)))
         .build();
     let started = Instant::now();
     let result = sandbox
@@ -2258,10 +2228,7 @@ async fn js_releases_unclosed_files_on_success_errors_and_timeout() {
         write_vfs_file(vfs.as_ref(), "/file", b"data");
         let sandbox = Sandbox::builder()
             .mount_arc("workspace", vfs.clone())
-            .limits(Limits {
-                wall_time: Duration::from_millis(300),
-                ..Limits::default()
-            })
+            .limits(Limits::default().with_wall_time(Duration::from_millis(300)))
             .build();
         let script = format!(
             "const fs = require('fs'); fs.openSync('/workspace/file', 'r'); fs.unlinkSync('/workspace/file'); {ending}"
@@ -2290,11 +2257,11 @@ async fn js_host_file_reads_and_open_files_have_explicit_budgets() {
     write_vfs_file(vfs.as_ref(), "/over", &[b'x'; 513]);
     let sandbox = Sandbox::builder()
         .mount_arc("workspace", vfs)
-        .limits(Limits {
-            host_input_bytes: 512,
-            max_open_files: 2,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_host_input_bytes(512)
+                .with_max_open_files(2),
+        )
         .build();
     let reads = sandbox.exec(r#"js -e 'const fs = require("fs"); console.log(fs.readFileSync("/workspace/exact").length); try { fs.readFileSync("/workspace/over") } catch (e) { console.log(e.code) }'"#).await;
     assert_eq!(reads.exit_code, 0, "{}", reads.stderr);
@@ -2320,10 +2287,7 @@ async fn js_does_not_start_a_filesystem_mutation_after_the_exec_deadline() {
     let vfs = Arc::new(InMemoryVfs::default());
     let sandbox = Sandbox::builder()
         .mount_arc("workspace", vfs.clone())
-        .limits(Limits {
-            wall_time: Duration::from_millis(300),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(300)))
         .command("pause", |_| async {
             tokio::time::sleep(Duration::from_millis(150)).await;
             CommandResult::success()
