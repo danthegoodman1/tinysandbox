@@ -24,7 +24,9 @@ const CARRIED_FIELDS = ["cpu", "libc", "license", "os", "engines"]
 export function packIntegrity(packageDir, options = {}) {
   const pack = options.pack ?? ((dir) => execFileSync("npm", ["pack", "--json", "--dry-run", dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }))
   const reported = JSON.parse(pack(packageDir))
-  const integrity = reported?.[0]?.integrity
+  // npm 12 keys pack results by package name; earlier versions return an array.
+  const [packed] = Array.isArray(reported) ? reported : Object.values(reported ?? {})
+  const integrity = packed?.integrity
   if (typeof integrity !== "string" || !integrity.startsWith("sha512-")) {
     throw new Error(`npm pack reported no sha512 integrity for ${packageDir}`)
   }

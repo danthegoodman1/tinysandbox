@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { fileURLToPath } from "node:url"
 
 import { nativeTargets, packIntegrity, writeNativeLockfile } from "./write-native-lockfile.mjs"
 
@@ -60,5 +61,19 @@ test("refuses to invent a lockfile entry that does not exist", () => {
 
 test("rejects a pack result without a sha512 integrity", () => {
   assert.throws(() => packIntegrity("/repo/npm/linux-x64-gnu", { pack: () => JSON.stringify([{ shasum: "abc" }]) }), /no sha512 integrity/)
+  assert.throws(() => packIntegrity("/repo/npm/linux-x64-gnu", { pack: () => JSON.stringify({ "@scope/pkg": { shasum: "abc" } }) }), /no sha512 integrity/)
+})
+
+test("reads the integrity from either pack output shape", () => {
   assert.equal(packIntegrity("/repo/npm/linux-x64-gnu", { pack: () => JSON.stringify([{ integrity: INTEGRITY }]) }), INTEGRITY)
+  assert.equal(packIntegrity("/repo/npm/linux-x64-gnu", { pack: () => JSON.stringify({ "@scope/pkg": { integrity: INTEGRITY } }) }), INTEGRITY)
+})
+
+
+// The other tests inject a fake pack result, so they pass against any npm.
+// This one runs the npm the release will run, which is the only way a change
+// to its output shape shows up before a release depends on it.
+test("reads the integrity the installed npm actually reports", () => {
+  const packageDir = fileURLToPath(new URL("../tinysandbox-node/npm/linux-x64-gnu", import.meta.url))
+  assert.match(packIntegrity(packageDir), /^sha512-.{20,}/)
 })
