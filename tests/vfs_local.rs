@@ -456,3 +456,36 @@ fn quota_scan_counts_regular_files_with_non_utf8_names() {
     );
     let _ = std::fs::remove_dir_all(&parent);
 }
+
+#[test]
+fn renaming_a_subtree_deeper_cannot_strand_entries_past_the_depth_limit() {
+    let (parent, root) = scratch_dirs("rename-depth");
+    let vfs = LocalVfs::new(&root).expect("open local vfs");
+
+    // Two chains that are individually legal. Nesting one inside the other
+    // would put its leaf at depth 400, which no later traversal can reach.
+    let mut source = String::new();
+    let mut destination = String::new();
+    for index in 0..200 {
+        source.push_str(&format!("/a{index}"));
+        destination.push_str(&format!("/b{index}"));
+        vfs.mkdir(&source).expect("build source chain");
+        vfs.mkdir(&destination).expect("build destination chain");
+    }
+
+    assert_errno(
+        vfs.rename("/a0", &format!("{destination}/a0")),
+        Errno::EINVAL,
+    );
+    // A move that keeps the tree within the limit still works, as does one
+    // that makes it shallower.
+    vfs.mkdir("/shallow").expect("create shallow directory");
+    vfs.rename("/shallow", "/b0/shallow")
+        .expect("a bounded descent is permitted");
+    vfs.rename("/b0/shallow", "/shallow")
+        .expect("ascending never adds depth");
+
+    drop(vfs);
+    LocalVfs::new(&root).expect("root remains reopenable after a rejected rename");
+    let _ = std::fs::remove_dir_all(&parent);
+}
