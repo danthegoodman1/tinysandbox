@@ -267,3 +267,55 @@ test("runFile deadline includes source loading", () => {
   assert.ok(!vfs.nodes.has('/late'));
   assert.equal(vfs.handles.size, 0);
 });
+
+test("a failing close releases the handle instead of stranding it", () => {
+  class FailingCloseVfs extends TestVfs {
+    constructor(files) {
+      super(files);
+      this.aborted = [];
+    }
+    close(handle) {
+      this.record("close", handle);
+      throw new VfsError("EIO");
+    }
+    abort(handle) {
+      this.aborted.push(handle);
+      if (!this.handles.delete(handle)) throw new VfsError("EBADF");
+    }
+  }
+
+  const vfs = new FailingCloseVfs({ "/work/note.txt": "hi" });
+  const result = engine.runCode(
+    `const fs = require('fs');
+     const fd = fs.openSync('/work/note.txt', 'r');
+     try { fs.closeSync(fd); } catch (err) { console.log('close:' + err.code); }
+     try { fs.closeSync(fd); } catch (err) { console.log('again:' + err.code); }`,
+    { vfs }
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  // The guest sees the backend failure, the descriptor is gone, and the
+  // handle was discarded rather than left open past the run.
+  assert.equal(result.stdout, "close:EIO\nagain:EBADF\n");
+  assert.equal(vfs.aborted.length, 1);
+  assert.equal(vfs.handles.size, 0);
+});
+
+test("a host global returning a rejected promise cannot escape as an unhandled rejection", async () => {
+  let unhandled;
+  const capture = (reason) => { unhandled = reason; };
+  process.on("unhandledRejection", capture);
+  try {
+    const result = engine.runCode("console.log(typeof rejects === 'function' ? rejects() : 'missing')", {
+      globals: { rejects: () => Promise.reject(new Error("boom")) }
+    });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /must be synchronous/);
+    // Node reports an unhandled rejection only once the microtask queue has
+    // drained, so the check has to outlive the synchronous run.
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", capture);
+  }
+  assert.equal(unhandled, undefined);
+});

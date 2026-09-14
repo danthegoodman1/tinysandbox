@@ -601,8 +601,24 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
                 const file = files.get(fd);
                 if (!file)
                     throw vfsFailure(new VfsError("EBADF"), "close");
-                files.delete(fd);
-                callVfs(vfs, "close", [file.handle], "close");
+                try {
+                    callVfs(vfs, "close", [file.handle], "close");
+                }
+                catch (error) {
+                    // close() consumes the descriptor even when it reports an error, so
+                    // dropping the entry first would strand the handle beyond the reach
+                    // of closeAll. Discard whatever the failed close staged instead.
+                    if (vfs.abort) {
+                        try {
+                            callVfs(vfs, "abort", [file.handle], "close");
+                        }
+                        catch { }
+                    }
+                    throw error;
+                }
+                finally {
+                    files.delete(fd);
+                }
                 return null;
             }
             case "copyFile": {
@@ -823,6 +839,13 @@ export async function createEngine(wasm) {
                         const value = handler(payload, host.context);
                         checkpoint();
                         if (thenable(value)) {
+                            // Host globals are unsupported asynchronously, but attach a
+                            // rejection handler so a mistaken async implementation cannot
+                            // take the embedding process down with an unhandled rejection.
+                            try {
+                                value.then(() => { }, () => { });
+                            }
+                            catch { }
                             throw new TypeError(`global '${name}' returned a Promise; host globals must be synchronous`);
                         }
                         assertJsonValue(value, `global '${name}' response`);
