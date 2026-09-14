@@ -412,3 +412,41 @@ async fn null_redirect_admission_uses_assigned_variable_values() {
     assert!(result.stderr.contains("expansion limit"));
     assert!(sandbox.fs().readdir("/workspace").await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn the_host_filesystem_facade_enforces_the_configured_limits() {
+    // `sandbox.fs()` carries no execution deadline, which used to mean it
+    // carried no configured limits either: every host read and write was
+    // measured against `Limits::default()` regardless of the builder.
+    let raised = Sandbox::builder()
+        .limits(Limits::default().with_host_input_bytes(16 * 1024 * 1024))
+        .build();
+    let payload = vec![b'x'; 12 * 1024 * 1024];
+    raised
+        .fs()
+        .write_file("/workspace/big.bin", &payload, false)
+        .await
+        .expect("a raised host-input limit admits a larger file");
+    assert_eq!(
+        raised
+            .fs()
+            .read_file_bounded("/workspace/big.bin", 16 * 1024 * 1024)
+            .await
+            .expect("the same limit applies when reading back")
+            .len(),
+        payload.len()
+    );
+
+    let lowered = Sandbox::builder()
+        .limits(Limits::default().with_host_input_bytes(1024))
+        .build();
+    assert_eq!(
+        lowered
+            .fs()
+            .write_file("/workspace/big.bin", &payload, false)
+            .await
+            .expect_err("a lowered limit still rejects")
+            .errno(),
+        Errno::EFBIG
+    );
+}

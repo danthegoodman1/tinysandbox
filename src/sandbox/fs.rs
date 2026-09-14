@@ -28,18 +28,38 @@ pub struct Fs {
     vfs: Arc<dyn Vfs>,
     bin_commands: Arc<BTreeSet<String>>,
     cwd: String,
+    limits: Limits,
     handles: Arc<HandleRegistry>,
 }
 
 impl Fs {
-    pub(crate) fn new(vfs: Arc<dyn Vfs>, bin_commands: Arc<BTreeSet<String>>, cwd: String) -> Self {
-        Self::scoped(vfs, bin_commands, cwd, None)
+    /// Builds the sandbox's host facade: configured limits, no execution deadline.
+    pub(crate) fn new(
+        vfs: Arc<dyn Vfs>,
+        bin_commands: Arc<BTreeSet<String>>,
+        cwd: String,
+        limits: Limits,
+    ) -> Self {
+        Self::build(vfs, bin_commands, cwd, limits, None)
     }
 
+    /// Builds a command's filesystem, taking its limits from the execution it
+    /// belongs to so the two can never disagree.
     pub(crate) fn scoped(
         vfs: Arc<dyn Vfs>,
         bin_commands: Arc<BTreeSet<String>>,
         cwd: String,
+        control: Arc<ExecutionControl>,
+    ) -> Self {
+        let limits = control.limits;
+        Self::build(vfs, bin_commands, cwd, limits, Some(control))
+    }
+
+    fn build(
+        vfs: Arc<dyn Vfs>,
+        bin_commands: Arc<BTreeSet<String>>,
+        cwd: String,
+        limits: Limits,
         control: Option<Arc<ExecutionControl>>,
     ) -> Self {
         let handles = Arc::new(HandleRegistry {
@@ -54,6 +74,7 @@ impl Fs {
             vfs,
             bin_commands,
             cwd,
+            limits,
             handles,
         }
     }
@@ -100,10 +121,7 @@ impl Fs {
     }
 
     fn limits(&self) -> Limits {
-        self.handles
-            .control
-            .as_ref()
-            .map_or_else(Limits::default, |c| c.limits)
+        self.limits
     }
     fn check(&self) -> VfsResult<()> {
         self.handles.control.as_ref().map_or(Ok(()), |c| c.check())
