@@ -9,10 +9,7 @@ async fn dropping_exec_wakes_retained_custom_command_context() {
     let (sent, received) = tokio::sync::oneshot::channel();
     let sender = Arc::new(Mutex::new(Some(sent)));
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_secs(10),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_secs(10)))
         .command("hold", move |ctx| {
             let sender = Arc::clone(&sender);
             async move {
@@ -116,10 +113,7 @@ async fn host_callback_timeout_is_visible_through_its_context() {
     let saved = Arc::new(Mutex::new(None));
     let observed = Arc::clone(&saved);
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_millis(500),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(500)))
         .js_global_with_context("hang", move |_, context| {
             *observed.lock().unwrap() = Some(context);
             std::future::pending::<Result<Value, tinysandbox::sandbox::HostError>>()
@@ -145,10 +139,7 @@ async fn dropping_exec_wakes_a_running_global_context_before_its_deadline() {
     let (sent, received) = tokio::sync::oneshot::channel();
     let sender = Arc::new(Mutex::new(Some(sent)));
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_secs(10),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_secs(10)))
         .js_global_with_context("hold", move |_, context| {
             sender
                 .lock()

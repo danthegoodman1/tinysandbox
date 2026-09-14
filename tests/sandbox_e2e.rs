@@ -259,10 +259,7 @@ async fn jq_builtin_reports_status_errors_and_limits() {
     assert!(parse_error.stderr.contains("parse error"));
 
     let limited = Sandbox::builder()
-        .limits(Limits {
-            jq_input_bytes: 3,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_jq_input_bytes(3))
         .build();
     let over_limit = limited.exec("echo 1234 | jq '.'").await;
     assert_eq!(over_limit.exit_code, 2);
@@ -430,10 +427,7 @@ async fn file_basenames_are_used_for_ls_cp_and_mv_directory_targets() {
 async fn limits_truncate_output_and_surface_vfs_quota_errors() {
     // Verifies sandbox-level output capping and that ENOSPC from the VFS
     // reaches stderr as an errno-shaped command failure.
-    let limits = Limits {
-        stdout_bytes: 24,
-        ..Limits::default()
-    };
+    let limits = Limits::default().with_stdout_bytes(24);
     let sandbox = Sandbox::builder().limits(limits).build();
     let result = sandbox.exec("echo 123456789012345678901234567890").await;
     assert!(result.metrics.stdout_truncated);
@@ -457,10 +451,7 @@ async fn limits_truncate_output_and_surface_vfs_quota_errors() {
 #[tokio::test]
 async fn limits_stats_and_metrics_are_reported() {
     let limited = Sandbox::builder()
-        .limits(Limits {
-            max_commands: 1,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_max_commands(1))
         .build();
     let limit = limited.exec("true; true").await;
     assert_eq!(limit.exit_code, 125);
@@ -675,10 +666,7 @@ async fn persist_session_opt_in_keeps_cwd_env_and_status() {
 #[tokio::test]
 async fn wall_clock_timeout_exits_124() {
     // Custom commands participate in the exec-wide timeout budget.
-    let limits = Limits {
-        wall_time: Duration::from_millis(25),
-        ..Limits::default()
-    };
+    let limits = Limits::default().with_wall_time(Duration::from_millis(25));
     let sandbox = Sandbox::builder()
         .limits(limits)
         .command("nap", |_ctx| async move {

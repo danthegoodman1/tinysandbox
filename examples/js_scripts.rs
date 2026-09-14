@@ -10,10 +10,7 @@ use tinysandbox::sandbox::{Limits, Sandbox};
 async fn main() {
     let sandbox = Sandbox::builder()
         .persist_session(true)
-        .limits(Limits {
-            wasm_memory_bytes: 32 * 1024 * 1024,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wasm_memory_bytes(32 * 1024 * 1024))
         .build();
 
     // Persistent cwd lets the example build a small multi-file program across
@@ -65,10 +62,7 @@ fs.writeFileSync("/workspace/app/stats.json", JSON.stringify(result))' > main.js
     // module itself is compiled once per process and cached, so this sandbox
     // doesn't pay that cost again).
     let impatient = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_secs(2),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_secs(2)))
         .build();
     let result = impatient.exec("js -e 'while (true) {}'").await;
     println!("runaway script exit code: {}", result.exit_code);

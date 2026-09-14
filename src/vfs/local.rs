@@ -268,6 +268,21 @@ impl Vfs for LocalVfs {
             return Err(VfsError::new(Errno::EINVAL));
         }
 
+        // Every path operation is bounded at MAX_PATH_DEPTH, but a rename moves
+        // a whole subtree at once: only the two endpoint paths are normalized,
+        // so a legal-looking descent can strand entries below the depth any
+        // later traversal — including the quota scan that reopens this root —
+        // is willing to walk. Only a descent can add depth.
+        if source_kind == EntryKind::Directory
+            && to_resolved.components.len() > from_resolved.components.len()
+        {
+            let allowance = MAX_PATH_DEPTH.saturating_sub(to_resolved.components.len());
+            let source = open_directory(&from_resolved.parent, &from_resolved.name)?;
+            if subtree_deeper_than(&source, allowance).map_err(|err| io_error(&err))? {
+                return Err(VfsError::new(Errno::EINVAL));
+            }
+        }
+
         let target = to_resolved.lookup()?;
         renameat(
             &from_resolved.parent,
@@ -665,6 +680,50 @@ fn release_entry(state: &mut State, key: FileKey, len: u64) {
         state.used_bytes = state.used_bytes.saturating_sub(len);
         state.file_count = state.file_count.saturating_sub(1);
     }
+}
+
+/// Reports whether any entry under `root` sits more than `allowance` levels
+/// below it. Descent stops at the allowance, so the walk costs nothing beyond
+/// the depth actually in question.
+fn subtree_deeper_than(root: &File, allowance: usize) -> io::Result<bool> {
+    let mut stack = vec![Dir::read_from(root)?];
+    loop {
+        let depth = stack.len();
+        let Some(entries) = stack.last_mut() else {
+            break;
+        };
+        let Some(entry) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let dir = entries.fd()?;
+        let Some(meta) = lookup_io(dir, name)? else {
+            continue;
+        };
+        if meta.kind == EntryKind::Other {
+            continue;
+        }
+        if depth > allowance {
+            return Ok(true);
+        }
+        if meta.kind == EntryKind::Directory {
+            let child = match openat(dir, name, directory_flags(), Mode::empty()) {
+                Ok(fd) => fd,
+                // A concurrent unlink/symlink replacement is invisible.
+                Err(
+                    rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP,
+                ) => continue,
+                Err(err) => return Err(err.into()),
+            };
+            stack.push(Dir::new(child)?);
+        }
+    }
+    Ok(false)
 }
 
 fn scan_tree(root: &File, used_bytes: &mut u64, file_count: &mut u64) -> io::Result<()> {

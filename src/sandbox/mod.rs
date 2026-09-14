@@ -535,7 +535,7 @@ impl Sandbox {
             Arc::clone(&self.vfs),
             Arc::clone(&self.command_names),
             session.cwd.clone(),
-            Some(Arc::clone(&exec.control)),
+            Arc::clone(&exec.control),
         );
         let mut redirects = match prepare_redirects(simple, &fs, &session.env, exec.last_status)
             .await
@@ -733,7 +733,7 @@ impl Sandbox {
             Arc::clone(&self.vfs),
             Arc::clone(&self.command_names),
             session.cwd.clone(),
-            Some(Arc::clone(&exec.control)),
+            Arc::clone(&exec.control),
         );
         let mut env = session.env.clone();
         for (name, value) in assignment_values {
@@ -1190,6 +1190,7 @@ impl SandboxBuilder {
             Arc::clone(&vfs),
             Arc::clone(&command_names),
             self.cwd.clone(),
+            self.limits,
         );
         Sandbox {
             host_fs,

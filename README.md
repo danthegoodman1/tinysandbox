@@ -1235,13 +1235,13 @@ use tinysandbox::sandbox::{Limits, Sandbox};
 
 fn main() {
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_secs(5),
-            wasm_memory_bytes: 32 * 1024 * 1024,
-            jq_memory_bytes: 32 * 1024 * 1024,
-            fetch_response_bytes: 1024 * 1024,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_wall_time(Duration::from_secs(5))
+                .with_wasm_memory_bytes(32 * 1024 * 1024)
+                .with_jq_memory_bytes(32 * 1024 * 1024)
+                .with_fetch_response_bytes(1024 * 1024),
+        )
         .build();
 }
 ```

@@ -273,10 +273,7 @@ async fn redirect_flush_waits_for_accepted_backend_writes() {
     let sandbox = Sandbox::builder()
         .clear_mounts()
         .mount_arc("disk", Arc::clone(&vfs) as Arc<dyn Vfs>)
-        .limits(Limits {
-            wall_time: Duration::from_millis(500),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(500)))
         .command("flushgate", move |mut ctx| {
             let write_gate = Arc::clone(&write_gate);
             async move {
@@ -316,10 +313,7 @@ fn concurrent_pipe_writer(completed: Arc<AtomicUsize>) -> Sandbox {
     use tokio::io::AsyncWriteExt;
 
     Sandbox::builder()
-        .limits(Limits {
-            wall_time: Duration::from_secs(1),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_secs(1)))
         .command("both", move |mut ctx| {
             let first_done = Arc::clone(&completed);
             let second_done = Arc::clone(&completed);

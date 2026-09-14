@@ -140,10 +140,7 @@ async fn deadlock_regressions_complete_under_timeout() {
 
     let limited = Sandbox::builder()
         .mount_arc("workspace", vfs)
-        .limits(Limits {
-            max_commands: 1,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_max_commands(1))
         .build();
     let limit = tokio::time::timeout(
         Duration::from_secs(2),
@@ -162,10 +159,7 @@ async fn output_cap_truncates_while_draining_stream() {
     let vfs = Arc::new(GeneratingVfs::new(size));
     let sandbox = Sandbox::builder()
         .mount_arc("workspace", vfs.clone())
-        .limits(Limits {
-            stdout_bytes: 1024,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_stdout_bytes(1024))
         .build();
 
     let result = tokio::time::timeout(Duration::from_secs(5), sandbox.exec("cat /workspace/huge"))
@@ -270,10 +264,7 @@ async fn timeout_aborts_spawned_pipeline_tasks() {
     let vfs = Arc::new(InMemoryVfs::default());
     let sandbox = Sandbox::builder()
         .mount_arc("workspace", vfs.clone())
-        .limits(Limits {
-            wall_time: Duration::from_millis(50),
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_wall_time(Duration::from_millis(50)))
         .command("latewrite", |ctx| async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             ctx.fs
@@ -398,10 +389,7 @@ fn jq_timeout_cancels_no_output_range_reduction() {
         // public timeout result must preserve subsequent command health. The
         // jq_runtime unit test separately proves an entered guest worker exits.
         let timed_out_sandbox = Sandbox::builder()
-            .limits(Limits {
-                wall_time: Duration::from_millis(25),
-                ..Limits::default()
-            })
+            .limits(Limits::default().with_wall_time(Duration::from_millis(25)))
             .build();
 
         let timed_out = timed_out_sandbox

@@ -102,7 +102,21 @@ impl CommandResult {
 }
 
 /// Resource limits enforced for sandbox execution.
+///
+/// Start from [`Limits::default`] and override what you need with the `with_*`
+/// methods. The struct is `#[non_exhaustive]` so that adding a limit stays a
+/// compatible change:
+///
+/// ```
+/// use std::time::Duration;
+/// use tinysandbox::sandbox::Limits;
+///
+/// let limits = Limits::default()
+///     .with_wall_time(Duration::from_secs(5))
+///     .with_wasm_memory_bytes(32 * 1024 * 1024);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Limits {
     /// Maximum wall-clock time for one `exec`.
     pub wall_time: Duration,
@@ -132,6 +146,106 @@ pub struct Limits {
     pub wasm_memory_bytes: usize,
     /// Maximum bytes accepted from a JavaScript fetch response body.
     pub fetch_response_bytes: usize,
+}
+
+impl Limits {
+    /// Sets the maximum wall-clock time for one `exec`.
+    #[must_use]
+    pub const fn with_wall_time(mut self, wall_time: Duration) -> Self {
+        self.wall_time = wall_time;
+        self
+    }
+
+    /// Sets the maximum captured stdout bytes before truncation.
+    #[must_use]
+    pub const fn with_stdout_bytes(mut self, stdout_bytes: usize) -> Self {
+        self.stdout_bytes = stdout_bytes;
+        self
+    }
+
+    /// Sets the maximum captured stderr bytes before truncation.
+    #[must_use]
+    pub const fn with_stderr_bytes(mut self, stderr_bytes: usize) -> Self {
+        self.stderr_bytes = stderr_bytes;
+        self
+    }
+
+    /// Sets the maximum simple commands that one parsed program may execute.
+    #[must_use]
+    pub const fn with_max_commands(mut self, max_commands: usize) -> Self {
+        self.max_commands = max_commands;
+        self
+    }
+
+    /// Sets the maximum shell source bytes admitted before parsing.
+    #[must_use]
+    pub const fn with_shell_input_bytes(mut self, shell_input_bytes: usize) -> Self {
+        self.shell_input_bytes = shell_input_bytes;
+        self
+    }
+
+    /// Sets the maximum bytes materialized by a whole-file or host-input operation.
+    #[must_use]
+    pub const fn with_host_input_bytes(mut self, host_input_bytes: usize) -> Self {
+        self.host_input_bytes = host_input_bytes;
+        self
+    }
+
+    /// Sets the maximum simultaneously open files in one execution.
+    #[must_use]
+    pub const fn with_max_open_files(mut self, max_open_files: usize) -> Self {
+        self.max_open_files = max_open_files;
+        self
+    }
+
+    /// Sets the maximum normalized path depth (also bounded by the VFS hard limit of 256).
+    #[must_use]
+    pub const fn with_max_path_depth(mut self, max_path_depth: usize) -> Self {
+        self.max_path_depth = max_path_depth;
+        self
+    }
+
+    /// Sets the maximum bytes retained by the `tail` window.
+    #[must_use]
+    pub const fn with_tail_input_bytes(mut self, tail_input_bytes: usize) -> Self {
+        self.tail_input_bytes = tail_input_bytes;
+        self
+    }
+
+    /// Sets the maximum bytes accepted by `sort` before it fails.
+    #[must_use]
+    pub const fn with_sort_input_bytes(mut self, sort_input_bytes: usize) -> Self {
+        self.sort_input_bytes = sort_input_bytes;
+        self
+    }
+
+    /// Sets the maximum bytes accepted by `jq` before it fails.
+    #[must_use]
+    pub const fn with_jq_input_bytes(mut self, jq_input_bytes: usize) -> Self {
+        self.jq_input_bytes = jq_input_bytes;
+        self
+    }
+
+    /// Sets the maximum jq guest linear memory, including its stack and intermediate values.
+    #[must_use]
+    pub const fn with_jq_memory_bytes(mut self, jq_memory_bytes: usize) -> Self {
+        self.jq_memory_bytes = jq_memory_bytes;
+        self
+    }
+
+    /// Sets the maximum WebAssembly memory for JS commands.
+    #[must_use]
+    pub const fn with_wasm_memory_bytes(mut self, wasm_memory_bytes: usize) -> Self {
+        self.wasm_memory_bytes = wasm_memory_bytes;
+        self
+    }
+
+    /// Sets the maximum bytes accepted from a JavaScript fetch response body.
+    #[must_use]
+    pub const fn with_fetch_response_bytes(mut self, fetch_response_bytes: usize) -> Self {
+        self.fetch_response_bytes = fetch_response_bytes;
+        self
+    }
 }
 
 impl Default for Limits {

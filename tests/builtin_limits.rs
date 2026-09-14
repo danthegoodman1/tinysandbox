@@ -17,10 +17,7 @@ async fn sort_rejects_during_input_consumption() {
         let vfs = Arc::new(ProbeVfs::new(4 * 1024 * 1024));
         let sandbox = Sandbox::builder()
             .mount_arc("workspace", vfs.clone())
-            .limits(Limits {
-                sort_input_bytes: 1024,
-                ..Limits::default()
-            })
+            .limits(Limits::default().with_sort_input_bytes(1024))
             .build();
         let result = tokio::time::timeout(Duration::from_secs(2), sandbox.exec(command))
             .await
@@ -38,10 +35,7 @@ async fn sort_rejects_during_input_consumption() {
 #[tokio::test]
 async fn sort_shares_one_budget_across_files_and_stdin() {
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            sort_input_bytes: 8,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_sort_input_bytes(8))
         .build();
     assert_eq!(
         sandbox
@@ -61,10 +55,7 @@ async fn sort_shares_one_budget_across_files_and_stdin() {
 #[tokio::test]
 async fn tail_caps_retained_bytes_and_evicts_before_admission() {
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            tail_input_bytes: 4,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_tail_input_bytes(4))
         .build();
     assert_eq!(sandbox.exec("echo 'aa\nbb\ncc' > lines").await.exit_code, 0);
     let one = sandbox.exec("tail -n 1 lines").await;
@@ -115,10 +106,7 @@ async fn copy_streams_large_files_handles_short_writes_and_closes_both_handles()
     let vfs = Arc::new(ProbeVfs::new(size));
     let sandbox = Sandbox::builder()
         .mount_arc("workspace", vfs.clone())
-        .limits(Limits {
-            host_input_bytes: 1024,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_host_input_bytes(1024))
         .build();
     let result = sandbox.exec("cp huge copied").await;
     assert_eq!(result.exit_code, 0, "{}", result.stderr);

@@ -79,10 +79,7 @@ async fn assignment_pipeline_budget_rejects_before_creating_pipes_or_dispatching
     let invoked = Arc::new(AtomicBool::new(false));
     let command_flag = invoked.clone();
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            max_commands: 1,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_max_commands(1))
         .command("observe", move |_| {
             let flag = command_flag.clone();
             async move {
@@ -217,10 +214,7 @@ fn memory_depth_ceiling_survives_snapshot_clone_branch_restore_and_drop() {
 #[tokio::test]
 async fn execution_path_depth_can_be_stricter_than_backend_ceiling() {
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            max_path_depth: 3,
-            ..Limits::default()
-        })
+        .limits(Limits::default().with_max_path_depth(3))
         .build();
     assert_eq!(sandbox.exec("mkdir -p a/b").await.exit_code, 0);
     let result = sandbox.exec("touch a/b/rejected").await;
@@ -332,11 +326,11 @@ impl Drop for Scratch {
 #[tokio::test]
 async fn shell_expansion_rejects_amplification_before_redirect_mutation() {
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            shell_input_bytes: 1024,
-            host_input_bytes: 1024,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_shell_input_bytes(1024)
+                .with_host_input_bytes(1024),
+        )
         .build();
     let program = format!(
         "X=x; {}; echo unreachable > /workspace/created",
@@ -348,11 +342,11 @@ async fn shell_expansion_rejects_amplification_before_redirect_mutation() {
     assert!(sandbox.fs().stat("/workspace/created").await.is_err());
     let sandbox = Sandbox::builder()
         .env("FIELDS", "x ".repeat(400))
-        .limits(Limits {
-            shell_input_bytes: 1024,
-            host_input_bytes: 1024,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_shell_input_bytes(1024)
+                .with_host_input_bytes(1024),
+        )
         .build();
     let result = sandbox.exec("echo $FIELDS > /workspace/created").await;
     assert_eq!(result.exit_code, 125);
@@ -364,11 +358,11 @@ async fn pipeline_expansion_budget_covers_all_retained_stages_before_redirects()
     let invoked = Arc::new(AtomicBool::new(false));
     let command_flag = invoked.clone();
     let sandbox = Sandbox::builder()
-        .limits(Limits {
-            shell_input_bytes: 1024,
-            host_input_bytes: 1024,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_shell_input_bytes(1024)
+                .with_host_input_bytes(1024),
+        )
         .command("observe", move |_| {
             let flag = command_flag.clone();
             async move {
@@ -406,15 +400,53 @@ async fn pipeline_expansion_budget_covers_all_retained_stages_before_redirects()
 async fn null_redirect_admission_uses_assigned_variable_values() {
     let sandbox = Sandbox::builder()
         .env("X", "x".repeat(128))
-        .limits(Limits {
-            shell_input_bytes: 1024,
-            host_input_bytes: 1024,
-            ..Limits::default()
-        })
+        .limits(
+            Limits::default()
+                .with_shell_input_bytes(1024)
+                .with_host_input_bytes(1024),
+        )
         .build();
     let program = format!("Y=$X > \"{}\"", "$Y".repeat(64));
     let result = sandbox.exec(&program).await;
     assert_eq!(result.exit_code, 125);
     assert!(result.stderr.contains("expansion limit"));
     assert!(sandbox.fs().readdir("/workspace").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_host_filesystem_facade_enforces_the_configured_limits() {
+    // `sandbox.fs()` carries no execution deadline, which used to mean it
+    // carried no configured limits either: every host read and write was
+    // measured against `Limits::default()` regardless of the builder.
+    let raised = Sandbox::builder()
+        .limits(Limits::default().with_host_input_bytes(16 * 1024 * 1024))
+        .build();
+    let payload = vec![b'x'; 12 * 1024 * 1024];
+    raised
+        .fs()
+        .write_file("/workspace/big.bin", &payload, false)
+        .await
+        .expect("a raised host-input limit admits a larger file");
+    assert_eq!(
+        raised
+            .fs()
+            .read_file_bounded("/workspace/big.bin", 16 * 1024 * 1024)
+            .await
+            .expect("the same limit applies when reading back")
+            .len(),
+        payload.len()
+    );
+
+    let lowered = Sandbox::builder()
+        .limits(Limits::default().with_host_input_bytes(1024))
+        .build();
+    assert_eq!(
+        lowered
+            .fs()
+            .write_file("/workspace/big.bin", &payload, false)
+            .await
+            .expect_err("a lowered limit still rejects")
+            .errno(),
+        Errno::EFBIG
+    );
 }
