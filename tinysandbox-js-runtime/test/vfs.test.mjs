@@ -12,18 +12,18 @@ const bytes = await readFile(new URL("../quickjs.wasm", import.meta.url));
 const engine = await createEngine(bytes);
 const portableVfsCorpus = JSON.parse(await readFile(new URL("../../tests/fixtures/js_vfs_portable_corpus.json", import.meta.url), "utf8"));
 
-test("runs the shared Rust/V8 VFS and CommonJS corpus", () => {
+test("runs the shared Rust/V8 VFS and CommonJS corpus", async () => {
   for (const item of portableVfsCorpus) {
     const vfs = new TestVfs(Object.fromEntries(item.files.map(file => [file.path, file.text])));
-    const result = engine.runFile(item.entry, { vfs, argv: item.argv });
+    const result = await engine.runFile(item.entry, { vfs, argv: item.argv });
     assert.equal(result.exitCode, item.exitCode, item.name);
     assert.equal(result.stdout, item.stdout, item.name);
     assert.ok(result.stderr.startsWith(item.stderrPrefix), `${item.name}: ${result.stderr}`);
   }
 });
 
-test("omitting VFS exposes no filesystem or Buffer capability", () => {
-  const result = engine.runCode(`
+test("omitting VFS exposes no filesystem or Buffer capability", async () => {
+  const result = await engine.runCode(`
 console.log(typeof Buffer)
 for (const request of ['fs', './module']) {
   try { require(request) } catch (error) { console.log(request, error.code, error.message) }
@@ -36,24 +36,24 @@ for (const request of ['fs', './module']) {
     "./module ERR_CAPABILITY_UNAVAILABLE filesystem capability is not available in this runtime\n");
 });
 
-test("supplying VFS does not grant fetch or route it into storage", () => {
+test("supplying VFS does not grant fetch or route it into storage", async () => {
   const code = "fetch('https://example.invalid').catch(error => console.log(error.message, error.cause.code, error.cause.message))";
-  const withoutVfs = engine.runCode(code);
+  const withoutVfs = await engine.runCode(code);
   const vfs = new TestVfs();
-  const withVfs = engine.runCode(code, { vfs });
+  const withVfs = await engine.runCode(code, { vfs });
   const expected = "fetch failed ENOSYS host capability 'fetch' is not available\n";
   assert.equal(withoutVfs.stdout, expected);
   assert.equal(withVfs.stdout, expected);
   assert.deepEqual(vfs.calls, []);
 });
 
-test("guest fs preserves binary, positional fd, directory, and errno behavior", () => {
+test("guest fs preserves binary, positional fd, directory, and errno behavior", async () => {
   const vfs = new TestVfs({
     "/data/utf8": "hello λ",
     "/data/binary": Uint8Array.of(0, 127, 128, 255),
     "/data/io": "abcdef",
   });
-  const result = engine.runCode(`
+  const result = await engine.runCode(`
 const fs = require('fs')
 fs.statSync('/data/utf8')
 console.log(fs.readFileSync('/data/utf8', 'utf8'))
@@ -92,7 +92,7 @@ try { fs.rmdirSync('/nonempty') } catch (error) { console.log(error.code, error.
   assert.equal(vfs.handles.size, 0);
 });
 
-test("runFile sets entry paths and preserves CommonJS cache, cycles, and JSON", () => {
+test("runFile sets entry paths and preserves CommonJS cache, cycles, and JSON", async () => {
   const vfs = new TestVfs({
     "/app/main.js": `
 const first = require('./counter')
@@ -108,7 +108,7 @@ console.log(first.count, second.count, first === second, cycle.fromB, data.answe
     "/app/b.js": "const a=require('./a'); exports.sawA=a.name",
     "/app/data.json": "{\"answer\":42}",
   });
-  const result = engine.runFile("main.js", { vfs, cwd: "/app", argv: ["js", "main.js", "one"] });
+  const result = await engine.runFile("main.js", { vfs, cwd: "/app", argv: ["js", "main.js", "one"] });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout,
     "js|main.js|one\n/app/main.js /app true .\n1 1 true a 42\n");
@@ -117,43 +117,43 @@ console.log(first.count, second.count, first === second, cycle.fromB, data.answe
   assert.equal(vfs.handles.size, 0);
 });
 
-test("runFile preserves the original default argv path while resolving its filename", () => {
+test("runFile preserves the original default argv path while resolving its filename", async () => {
   const vfs = new TestVfs({
     "/app/main.js": "console.log(JSON.stringify(process.argv), __filename, __dirname)",
   });
-  const result = engine.runFile("./nested/../main.js", { vfs, cwd: "/app" });
+  const result = await engine.runFile("./nested/../main.js", { vfs, cwd: "/app" });
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, '["js","./nested/../main.js"] /app/main.js /app\n');
 });
 
-test("runFile missing, source-limit, invalid UTF-8, and stack failures are deterministic", () => {
+test("runFile missing, source-limit, invalid UTF-8, and stack failures are deterministic", async () => {
   const vfs = new TestVfs({
     "/app/bad.js": Uint8Array.of(0xff, 0xfe),
     "/app/large.js": "12345",
     "/app/throws.js": "function boom(){ throw new Error('broken') } boom()",
   });
-  assert.throws(
+  await assert.rejects(
     () => engine.runFile("missing.js", { vfs, cwd: "/app" }),
     error => error.code === "ENOENT" && error.path === "/app/missing.js" && /open/.test(error.message),
   );
-  assert.throws(() => engine.runFile("bad.js", { vfs, cwd: "/app" }), /not valid UTF-8/);
-  assert.throws(() => engine.runFile("large.js", { vfs, cwd: "/app", sourceBytes: 4 }), /source exceeded limit of 4 bytes/);
-  const result = engine.runFile("throws.js", { vfs, cwd: "/app" });
+  await assert.rejects(() => engine.runFile("bad.js", { vfs, cwd: "/app" }), /not valid UTF-8/);
+  await assert.rejects(() => engine.runFile("large.js", { vfs, cwd: "/app", sourceBytes: 4 }), /source exceeded limit of 4 bytes/);
+  const result = await engine.runFile("throws.js", { vfs, cwd: "/app" });
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /broken/);
   assert.match(result.stderr, /\/app\/throws\.js/);
   assert.equal(vfs.handles.size, 0);
 });
 
-test("CommonJS depth remains bounded and leaked guest fds close at run teardown", () => {
+test("CommonJS depth remains bounded and leaked guest fds close at run teardown", async () => {
   const files = { "/deep/leak.js": "require('fs').openSync('/deep/value', 'r'); console.log('open')", "/deep/value": "x" };
   for (let index = 0; index < 258; index++) files[`/deep/m${index}.js`] = `module.exports = require('./m${index + 1}')`;
   files["/deep/m258.js"] = "module.exports = 1";
   const vfs = new TestVfs(files);
-  const depth = engine.runCode("try { require('/deep/m0') } catch (error) { console.log(error.code, /256/.test(error.message)) }", { vfs });
+  const depth = await engine.runCode("try { require('/deep/m0') } catch (error) { console.log(error.code, /256/.test(error.message)) }", { vfs });
   assert.equal(depth.exitCode, 0, depth.stderr);
   assert.equal(depth.stdout, "ERR_REQUIRE_DEPTH true\n");
-  const leak = engine.runFile("/deep/leak.js", { vfs });
+  const leak = await engine.runFile("/deep/leak.js", { vfs });
   assert.equal(leak.stdout, "open\n");
   assert.equal(vfs.handles.size, 0);
 });
@@ -161,17 +161,17 @@ test("CommonJS depth remains bounded and leaked guest fds close at run teardown"
 test("VFS failures use stable errno mapping and rejecting async implementations are contained", async () => {
   const denied = new TestVfs();
   denied.stat = () => { throw new VfsError("EACCES"); };
-  const deniedResult = engine.runCode("const fs=require('fs'); try { fs.statSync('/x') } catch (e) { console.log(e.code, e.errno, e.message) }", { vfs: denied });
+  const deniedResult = await engine.runCode("const fs=require('fs'); try { fs.statSync('/x') } catch (e) { console.log(e.code, e.errno, e.message) }", { vfs: denied });
   assert.equal(deniedResult.stdout, "EACCES -13 EACCES: permission denied, stat '/x'\n");
 
   const failedRead = new TestVfs({ "/x": "x" });
   failedRead.readAt = () => { throw new VfsError("EIO"); };
-  const readResult = engine.runCode("const fs=require('fs'); try { fs.readFileSync('/x') } catch (e) { console.log(e.code, e.syscall, e.path) }", { vfs: failedRead });
+  const readResult = await engine.runCode("const fs=require('fs'); try { fs.readFileSync('/x') } catch (e) { console.log(e.code, e.syscall, e.path) }", { vfs: failedRead });
   assert.equal(readResult.stdout, "EIO open /x\n");
 
   const asynchronous = new TestVfs({ "/x": "x" });
   asynchronous.stat = async () => { throw new VfsError("EACCES"); };
-  const asyncResult = engine.runCode("const fs=require('fs'); try { fs.statSync('/x') } catch (e) { console.log(e.code, e.errno) }", { vfs: asynchronous });
+  const asyncResult = await engine.runCode("const fs=require('fs'); try { fs.statSync('/x') } catch (e) { console.log(e.code, e.errno) }", { vfs: asynchronous });
   assert.equal(asyncResult.stdout, "EIO -5\n");
   await new Promise(resolve => setImmediate(resolve));
 });
@@ -196,7 +196,7 @@ fs.closeSync(fd);
       assert.equal(oracle.status, 0, oracle.stderr);
       assert.equal(oracle.stdout, "6 abcdef\n");
       const vfs = new TestVfs();
-      const result = engine.runCode(code, { vfs });
+      const result = await engine.runCode(code, { vfs });
       assert.equal(result.exitCode, 0, result.stderr);
       assert.equal(result.stdout, oracle.stdout);
       assert.equal(vfs.handles.size, 0);
@@ -204,14 +204,14 @@ fs.closeSync(fd);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("teardown finishes success and aborts failed or timed out staged handles", () => {
+test("teardown finishes success and aborts failed or timed out staged handles", async () => {
   for (const [ending, expected] of [["", 0], ["process.exit(7)", 7], ["throw new Error('stop')", 1], ["while (true) {}", 124]]) {
     const vfs = new TestVfs({ "/file": "data" });
     let finished = 0, aborted = 0;
     const close = vfs.close.bind(vfs);
     vfs.close = handle => { finished++; close(handle); };
     vfs.abort = handle => { aborted++; close(handle); };
-    const result = engine.runCode(`require('fs').openSync('/file', 'r'); ${ending}`, { vfs, timeoutMs: 100 });
+    const result = await engine.runCode(`require('fs').openSync('/file', 'r'); ${ending}`, { vfs, timeoutMs: 100 });
     assert.equal(result.exitCode, expected, result.stderr);
     assert.equal(vfs.handles.size, 0);
     assert.equal(finished, expected === 0 ? 1 : 0);
@@ -219,19 +219,19 @@ test("teardown finishes success and aborts failed or timed out staged handles", 
   }
 });
 
-test("teardown reports close failures and still releases every descriptor", () => {
+test("teardown reports close failures and still releases every descriptor", async () => {
   const vfs = new TestVfs({ "/file": "data" });
   const close = vfs.close.bind(vfs);
   vfs.close = handle => { close(handle); throw new VfsError("EIO"); };
-  const result = engine.runCode("const fs = require('fs'); fs.openSync('/file', 'r'); fs.openSync('/file', 'r')", { vfs });
+  const result = await engine.runCode("const fs = require('fs'); fs.openSync('/file', 'r'); fs.openSync('/file', 'r')", { vfs });
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /i\/o error/);
   assert.equal(vfs.handles.size, 0);
 });
 
-test("whole-file reads, descriptor reads and opens enforce explicit host budgets", () => {
+test("whole-file reads, descriptor reads and opens enforce explicit host budgets", async () => {
   const vfs = new TestVfs({ "/exact": "x".repeat(512), "/over": "x".repeat(513) });
-  const result = engine.runCode(`
+  const result = await engine.runCode(`
 const fs = require('fs');
 console.log(fs.readFileSync('/exact').length);
 try { fs.readFileSync('/over') } catch (e) { console.log(e.code); }
@@ -247,9 +247,9 @@ console.log(fs.readSync(a, buffer, 0, 4096, 0));
   assert.equal(vfs.handles.size, 0);
 });
 
-test("a slow host callback cannot authorize a filesystem mutation after deadline", () => {
+test("a slow host callback cannot authorize a filesystem mutation after deadline", async () => {
   const vfs = new TestVfs();
-  const result = engine.runCode("slow(); require('fs').writeFileSync('/late', 'bad')", {
+  const result = await engine.runCode("slow(); require('fs').writeFileSync('/late', 'bad')", {
     vfs, timeoutMs: 30,
     globals: { slow: () => { const end = performance.now() + 50; while (performance.now() < end) {} return null; } },
   });
@@ -258,17 +258,17 @@ test("a slow host callback cannot authorize a filesystem mutation after deadline
   assert.equal(vfs.handles.size, 0);
 });
 
-test("runFile deadline includes source loading", () => {
+test("runFile deadline includes source loading", async () => {
   const vfs = new TestVfs({ "/script.js": "require('fs').writeFileSync('/late', 'bad')" });
   const read = vfs.readAt.bind(vfs);
   vfs.readAt = (...args) => { const end = performance.now() + 40; while (performance.now() < end) {} return read(...args); };
-  const result = engine.runFile('/script.js', { vfs, timeoutMs: 20 });
+  const result = await engine.runFile('/script.js', { vfs, timeoutMs: 20 });
   assert.equal(result.exitCode, 124, result.stderr);
   assert.ok(!vfs.nodes.has('/late'));
   assert.equal(vfs.handles.size, 0);
 });
 
-test("a failing close releases the handle instead of stranding it", () => {
+test("a failing close releases the handle instead of stranding it", async () => {
   class FailingCloseVfs extends TestVfs {
     constructor(files) {
       super(files);
@@ -285,7 +285,7 @@ test("a failing close releases the handle instead of stranding it", () => {
   }
 
   const vfs = new FailingCloseVfs({ "/work/note.txt": "hi" });
-  const result = engine.runCode(
+  const result = await engine.runCode(
     `const fs = require('fs');
      const fd = fs.openSync('/work/note.txt', 'r');
      try { fs.closeSync(fd); } catch (err) { console.log('close:' + err.code); }
@@ -301,18 +301,18 @@ test("a failing close releases the handle instead of stranding it", () => {
   assert.equal(vfs.handles.size, 0);
 });
 
-test("a host global returning a rejected promise cannot escape as an unhandled rejection", async () => {
+test("a rejected host global surfaces in the guest without an unhandled rejection", async () => {
   let unhandled;
   const capture = (reason) => { unhandled = reason; };
   process.on("unhandledRejection", capture);
   try {
-    const result = engine.runCode("console.log(typeof rejects === 'function' ? rejects() : 'missing')", {
-      globals: { rejects: () => Promise.reject(new Error("boom")) }
-    });
-    assert.equal(result.exitCode, 1);
-    assert.match(result.stderr, /must be synchronous/);
-    // Node reports an unhandled rejection only once the microtask queue has
-    // drained, so the check has to outlive the synchronous run.
+    const result = await engine.runCode(
+      "(async () => { try { await boom({}) } catch (e) { console.log('caught: ' + e.message) } })()",
+      { globals: { boom: async () => { throw new Error("upstream exploded"); } } },
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "caught: upstream exploded\n");
+    // Node reports an unhandled rejection only after the microtask queue drains.
     await new Promise((resolve) => setImmediate(resolve));
   } finally {
     process.off("unhandledRejection", capture);

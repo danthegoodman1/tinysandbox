@@ -21,8 +21,8 @@ function replaceSequence(input, before, after) {
 test("loads bytes and a precompiled module", async () => {
   const fromBytes = await createEngine(bytes);
   const fromModule = await createEngine(await WebAssembly.compile(bytes));
-  assert.equal(fromBytes.runCode("console.log('bytes')").stdout, "bytes\n");
-  assert.equal(fromModule.runCode("console.log('module')").stdout, "module\n");
+  assert.equal((await fromBytes.runCode("console.log('bytes')")).stdout, "bytes\n");
+  assert.equal((await fromModule.runCode("console.log('module')")).stdout, "module\n");
 });
 
 test("rejects incompatible memory and interrupt ABI at engine creation", async () => {
@@ -37,8 +37,8 @@ test("rejects incompatible memory and interrupt ABI at engine creation", async (
 
 test("creates fresh physical state for every run", async () => {
   const engine = await createEngine(bytes);
-  assert.equal(engine.runCode("globalThis.leak = 42; console.log('set')").exitCode, 0);
-  const isolated = engine.runCode("console.log(typeof leak)");
+  assert.equal((await engine.runCode("globalThis.leak = 42; console.log('set')")).exitCode, 0);
+  const isolated = await engine.runCode("console.log(typeof leak)");
   assert.equal(isolated.stdout, "undefined\n");
   assert.equal(isolated.initialWasmMemoryBytes, QUICKJS_INITIAL_MEMORY_BYTES);
   assert.ok(isolated.peakWasmMemoryBytes >= QUICKJS_INITIAL_MEMORY_BYTES);
@@ -47,34 +47,38 @@ test("creates fresh physical state for every run", async () => {
 test("runs the shared Rust/V8 corpus", async () => {
   const engine = await createEngine(bytes);
   for (const item of corpus) {
-    const result = engine.runCode(item.code, { argv: item.argv, env: item.env, cwd: item.cwd });
+    const result = await engine.runCode(item.code, { argv: item.argv, env: item.env, cwd: item.cwd });
     assert.equal(result.exitCode, item.exitCode, item.name);
     assert.equal(result.stdout, item.stdout, item.name);
     assert.ok(result.stderr.startsWith(item.stderrPrefix), `${item.name}: ${result.stderr}`);
   }
 });
 
-test("supports synchronous dotted globals and JSON-safe values", async () => {
+test("supports dotted globals, JSON-safe values, and awaited async globals", async () => {
   const engine = await createEngine(bytes);
-  const result = engine.runCode("console.log(JSON.stringify(tools.echo({ text: 'λ', list: [1, true, null] })))", {
+  const result = await engine.runCode("(async () => console.log(JSON.stringify(await tools.echo({ text: 'λ', list: [1, true, null] }))))()", {
     globals: { "tools.echo": (argument) => ({ argument, answer: 42 }) },
   });
   assert.equal(result.exitCode, 0);
   assert.deepEqual(JSON.parse(result.stdout), { argument: { text: "λ", list: [1, true, null] }, answer: 42 });
 
-  const caught = engine.runCode("try { tools.fail(null) } catch (error) { console.log(error.message, error.code) }", {
-    globals: { "tools.fail": () => Object.assign(Promise.resolve(), { code: "ASYNC" }) },
-  });
-  assert.match(caught.stdout, /host globals must be synchronous/);
-  assert.throws(() => engine.runCode("", { globals: { "tools": () => null, "tools.search": () => null } }), /conflicts/);
-  assert.throws(() => engine.runCode("", { globals: { "console.log": () => null } }), /reserved/);
-  assert.throws(() => engine.runCode("", { globals: { "bad-name": () => null } }), /invalid name/);
+  // A global that returns a promise suspends the guest and resumes it with the
+  // settled value; a synchronous one still returns without suspending.
+  const awaited = await engine.runCode(
+    "(async () => { console.log(JSON.stringify(await tools.slow({ n: 2 }))) })()",
+    { globals: { "tools.slow": async ({ n }) => { await new Promise((r) => setTimeout(r, 10)); return n * 21; } } },
+  );
+  assert.equal(awaited.exitCode, 0, awaited.stderr);
+  assert.equal(awaited.stdout, "42\n");
+  await assert.rejects(() => engine.runCode("", { globals: { "tools": () => null, "tools.search": () => null } }), /conflicts/);
+  await assert.rejects(() => engine.runCode("", { globals: { "console.log": () => null } }), /reserved/);
+  await assert.rejects(() => engine.runCode("", { globals: { "bad-name": () => null } }), /invalid name/);
 });
 
 test("host globals can poll the shared monotonic deadline and abort signal", async () => {
   const engine = await createEngine(bytes);
   let observed = false;
-  const result = engine.runCode("work(null)", {
+  const result = await engine.runCode("(async () => await work(null))()", {
     timeoutMs: 50,
     globals: { work: (argument, context) => {
       assert.equal(argument, null);
@@ -92,7 +96,7 @@ test("host globals can poll the shared monotonic deadline and abort signal", asy
   });
   assert.equal(result.exitCode, 124);
   assert.equal(observed, true);
-  assert.equal(engine.runCode("console.log(legacy(7))", { globals: { legacy: (value) => value } }).stdout, "7\n");
+  assert.equal((await engine.runCode("(async () => console.log(await legacy(7)))()", { globals: { legacy: (value) => value } })).stdout, "7\n");
 });
 
 test("external aborts propagate synchronously to host context and stop later operations", async () => {
@@ -111,18 +115,18 @@ test("external aborts propagate synchronously to host context and stop later ope
       later: () => { laterCalls += 1; return null; },
     },
   };
-  assert.equal(engine.runCode("stop(null); later(null)", options).exitCode, 124);
+  assert.equal((await engine.runCode("stop(null); later(null)", options)).exitCode, 124);
   assert.equal(laterCalls, 0);
-  assert.equal(engine.runCode("later(null)", options).exitCode, 124, "already-aborted signal rejects entry");
+  assert.equal((await engine.runCode("later(null)", options)).exitCode, 124, "already-aborted signal rejects entry");
   assert.equal(laterCalls, 0);
-  assert.equal(engine.runCode("console.log('healthy')").stdout, "healthy\n");
+  assert.equal((await engine.runCode("console.log('healthy')")).stdout, "healthy\n");
 });
 
 test("successful and failed callbacks release their signals before the next invocation", async () => {
   const engine = await createEngine(bytes);
   let previous;
   let aborts = 0;
-  const result = engine.runCode("inspect(false); try { inspect(true) } catch {} inspect(false)", {
+  const result = await engine.runCode("(async () => { await inspect(false); try { await inspect(true) } catch {} await inspect(false) })()", {
     globals: { inspect: (fail, context) => {
       if (previous) assert.equal(previous.signal.aborted, true);
       assert.equal(context.signal.aborted, false);
@@ -153,7 +157,7 @@ test("rejects every non-JSON host-global shape deterministically", async () => {
     cycle,
   ];
   for (const value of invalid) {
-    const result = engine.runCode("try { invalid(null) } catch (error) { console.log(error.name, error.message) }", { globals: { invalid: () => value } });
+    const result = await engine.runCode("(async () => { try { await invalid(null) } catch (error) { console.log(error.name, error.message) } })()", { globals: { invalid: () => value } });
     assert.equal(result.exitCode, 0);
     assert.match(result.stdout, /JSON|finite|plain objects|cycles/);
   }
@@ -161,26 +165,26 @@ test("rejects every non-JSON host-global shape deterministically", async () => {
 
 test("enforces exact source and output byte boundaries before copying", async () => {
   const engine = await createEngine(bytes);
-  assert.equal(engine.runCode("", { sourceBytes: 0 }).exitCode, 0);
-  assert.equal(engine.runCode("λ", { sourceBytes: 2 }).exitCode, 1);
-  assert.throws(() => engine.runCode("λ", { sourceBytes: 1 }), /source exceeded/);
-  assert.equal(engine.runCode("console.log('abc')", { stdoutBytes: 4 }).stdout, "abc\n");
-  const stdout = engine.runCode("console.log('abc')", { stdoutBytes: 3 });
+  assert.equal((await engine.runCode("", { sourceBytes: 0 })).exitCode, 0);
+  assert.equal((await engine.runCode("λ", { sourceBytes: 2 })).exitCode, 1);
+  await assert.rejects(() => engine.runCode("λ", { sourceBytes: 1 }), /source exceeded/);
+  assert.equal((await engine.runCode("console.log('abc')", { stdoutBytes: 4 })).stdout, "abc\n");
+  const stdout = await engine.runCode("console.log('abc')", { stdoutBytes: 3 });
   assert.equal(stdout.exitCode, 1);
   assert.equal(stdout.stderr, "js: stdout exceeded limit of 3 bytes\n");
-  assert.equal(engine.runCode("console.error('abc')", { stderrBytes: 4 }).stderr, "abc\n");
-  const stderr = engine.runCode("console.error('abc')", { stderrBytes: 3 });
+  assert.equal((await engine.runCode("console.error('abc')", { stderrBytes: 4 })).stderr, "abc\n");
+  const stderr = await engine.runCode("console.error('abc')", { stderrBytes: 3 });
   assert.equal(stderr.exitCode, 1);
   assert.equal(stderr.stderr, "js: stderr exceeded limit of 3 bytes\n");
 });
 
 test("bounds host responses before copying into wasm", async () => {
   const engine = await createEngine(bytes);
-  const exact = engine.runCode("console.log(exact(null).length)", { globals: { exact: () => "x".repeat(100) }, hostResponseBytes: 112 });
+  const exact = await engine.runCode("(async () => console.log((await exact(null)).length))()", { globals: { exact: () => "x".repeat(100) }, hostResponseBytes: 112 });
   assert.equal(exact.stdout, "100\n");
-  const oneOver = engine.runCode("try { exact(null) } catch (error) { console.log(error.code) }", { globals: { exact: () => "x".repeat(100) }, hostResponseBytes: 111 });
+  const oneOver = await engine.runCode("(async () => { try { await exact(null) } catch (error) { console.log(error.code) } })()", { globals: { exact: () => "x".repeat(100) }, hostResponseBytes: 111 });
   assert.equal(oneOver.stdout, "E2BIG\n");
-  const caught = engine.runCode("try { huge(null) } catch (error) { console.log(error.code, error.message) }", {
+  const caught = await engine.runCode("(async () => { try { await huge(null) } catch (error) { console.log(error.code, error.message) } })()", {
     globals: { huge: () => "x".repeat(100) },
     hostResponseBytes: 100,
   });
@@ -190,13 +194,13 @@ test("bounds host responses before copying into wasm", async () => {
 
 test("rejects a wasm cap below the artifact minimum before instantiation", async () => {
   const engine = await createEngine(bytes);
-  assert.throws(() => engine.runCode("", { wasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES - 1 }), /must be at least/);
-  assert.equal(engine.runCode("console.log('large')", { wasmMemoryBytes: Number.MAX_SAFE_INTEGER }).stdout, "large\n");
+  await assert.rejects(() => engine.runCode("", { wasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES - 1 }), /must be at least/);
+  assert.equal((await engine.runCode("console.log('large')", { wasmMemoryBytes: Number.MAX_SAFE_INTEGER })).stdout, "large\n");
 });
 
 test("enforces wasm maximum, QuickJS heap, and monotonic deadline", async () => {
   const engine = await createEngine(bytes);
-  const wasmOom = engine.runCode("const x=[]; while(true) x.push(new ArrayBuffer(256*1024))", {
+  const wasmOom = await engine.runCode("const x=[]; while(true) x.push(new ArrayBuffer(256*1024))", {
     wasmMemoryBytes: 2 * 1024 * 1024,
     quickjsHeapBytes: 32 * 1024 * 1024,
     timeoutMs: 2_000,
@@ -205,7 +209,7 @@ test("enforces wasm maximum, QuickJS heap, and monotonic deadline", async () => 
   assert.match(wasmOom.stderr, /memory limit exceeded|out of memory/i);
   assert.ok(wasmOom.peakWasmMemoryBytes <= 2 * 1024 * 1024);
 
-  const heapOom = engine.runCode("const x=[]; while(true) x.push(new ArrayBuffer(64*1024))", {
+  const heapOom = await engine.runCode("const x=[]; while(true) x.push(new ArrayBuffer(64*1024))", {
     quickjsHeapBytes: 512 * 1024,
     timeoutMs: 2_000,
   });
@@ -213,7 +217,7 @@ test("enforces wasm maximum, QuickJS heap, and monotonic deadline", async () => 
   assert.match(heapOom.stderr, /out of memory|failed to create context/i);
 
   const started = performance.now();
-  const timeout = engine.runCode("while (true) {}", { timeoutMs: 20 });
+  const timeout = await engine.runCode("while (true) {}", { timeoutMs: 20 });
   assert.equal(timeout.exitCode, 124);
   assert.equal(timeout.stdout, "");
   assert.equal(timeout.stderr, "js: command timed out\n");
@@ -225,11 +229,60 @@ test("bounded JSON retains exact UTF-8 and escape semantics", async () => {
   const engine = await createEngine(bytes);
   for (const value of ["a".repeat(100), "λ🙂".repeat(30), "\u0000\b\t\n\f\r\\\"".repeat(20), "\ud800".repeat(20), { "λ🙂": [false, 1.5, null, "hello"] }]) {
     const cap = new TextEncoder().encode(JSON.stringify({ value })).byteLength;
-    const exact = engine.runCode("console.log(JSON.stringify(value()))", { globals: { value: () => value }, hostResponseBytes: cap });
+    const exact = await engine.runCode("(async () => console.log(JSON.stringify(await value())))()", { globals: { value: () => value }, hostResponseBytes: cap });
     assert.equal(exact.exitCode, 0, exact.stderr);
     assert.equal(exact.stdout, `${JSON.stringify(value)}\n`);
-    const over = engine.runCode("try { value() } catch (e) { console.log(e.code) }", { globals: { value: () => value }, hostResponseBytes: cap - 1 });
+    const over = await engine.runCode("(async () => { try { await value() } catch (e) { console.log(e.code) } })()", { globals: { value: () => value }, hostResponseBytes: cap - 1 });
     if (cap >= 100) assert.equal(over.stdout, "E2BIG\n");
     else assert.equal(over.exitCode, 1);
   }
+});
+
+test("a host global that never settles cannot outlive the deadline", async () => {
+  const engine = await createEngine(bytes);
+  const started = Date.now();
+  // Suspension is the one point with no guest checkpoint to observe the clock,
+  // so the wait itself has to be bounded.
+  const result = await engine.runCode("(async () => { await hang({}); console.log('never') })()", {
+    globals: { hang: () => new Promise(() => {}) },
+    timeoutMs: 200,
+  });
+  assert.equal(result.exitCode, 124);
+  assert.match(result.stderr, /command timed out/);
+  assert.equal(result.stdout, "");
+  assert.ok(Date.now() - started < 3000, "must not wait past the deadline");
+});
+
+test("concurrent awaited globals settle in completion order", async () => {
+  const engine = await createEngine(bytes);
+  const result = await engine.runCode(
+    "(async () => { console.log((await Promise.all([slow({}), fast({})])).join(',')) })()",
+    {
+      globals: {
+        slow: async () => { await new Promise((r) => setTimeout(r, 60)); return "slow"; },
+        fast: async () => { await new Promise((r) => setTimeout(r, 5)); return "fast"; },
+      },
+    },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "slow,fast\n");
+});
+
+test("exceeding the concurrent host call limit fails the call, not the run", async () => {
+  const engine = await createEngine(bytes);
+  // 64 slots: 65 simultaneous awaits must report a bounded failure rather than
+  // corrupting the registry or hanging.
+  const result = await engine.runCode(
+    `(async () => {
+       const calls = Array.from({ length: 65 }, (_, i) => hold({ i }))
+       const settled = await Promise.allSettled(calls)
+       console.log(settled.filter(s => s.status === 'rejected').length > 0)
+     })()`,
+    {
+      globals: { hold: async ({ i }) => { await new Promise((r) => setTimeout(r, 5)); return i; } },
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "true\n");
 });

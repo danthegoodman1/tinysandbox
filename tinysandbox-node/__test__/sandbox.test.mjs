@@ -84,12 +84,12 @@ test('host globals receive correlated deadlines and preserve one-argument callba
       }
     }
   })
-  const result = await sandbox.exec(`delay; js -e 'console.log(legacy({value:"old"}), inspect({value:"new"}))'`)
+  const result = await sandbox.exec(`delay; js -e '(async () => console.log(await legacy({value:"old"}), await inspect({value:"new"})))()'`)
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, 'old new\n')
   assert.ok(observed)
   assert.equal(observed.signal.aborted, true, 'callback completion aborts retained signals without polling')
-  assert.equal((await sandbox.exec(`js -e 'console.log(legacy({value:"healthy"}))'`)).stdout, 'healthy\n')
+  assert.equal((await sandbox.exec(`js -e '(async () => console.log(await legacy({value:"healthy"})))()'`)).stdout, 'healthy\n')
 })
 
 test('global, fetch, and custom-command callbacks receive abort on their actual deadline', async () => {
@@ -110,7 +110,7 @@ test('global, fetch, and custom-command callbacks receive abort on their actual 
     let script
     if (kind === 'global') {
       options.globals = { wait: (_args, context) => wait(context, null) }
-      script = `js -e 'wait(null)'`
+      script = `js -e '(async () => await wait(null))()'`
     } else if (kind === 'fetch') {
       options.fetch = (_request, context) => wait(context, { status: 499 })
       script = `js -e 'fetch("https://example.test/wait")'`
@@ -147,7 +147,7 @@ test('callback completion aborts retained signals before the next invocation', a
       return null
     }
   } })
-  const result = await sandbox.exec(`js -e 'inspect(false); try { inspect(true) } catch {} inspect(false)'`)
+  const result = await sandbox.exec(`js -e '(async () => { await inspect(false); try { await inspect(true) } catch {} await inspect(false) })()'`)
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(previous.signal.aborted, true)
   assert.equal(aborts, 3)
@@ -160,7 +160,7 @@ test('callbacks queued behind a blocked Node event loop never start after expira
     let script
     if (kind === 'global') {
       options.globals = { effect: () => { calls += 1; return null } }
-      script = `js -e 'effect(null)'`
+      script = `js -e '(async () => await effect(null))()'`
     } else if (kind === 'fetch') {
       options.fetch = () => { calls += 1; return { status: 200 } }
       script = `js -e 'fetch("https://example.test/effect")'`
@@ -343,7 +343,7 @@ test('JS globals round-trip JSON values through Node handlers', async () => {
       }
     }
   })
-  const result = await sandbox.exec("js -e 'const out = inspect({ value: 7 }); console.log(JSON.stringify(out))'")
+  const result = await sandbox.exec("js -e '(async () => { const out = await inspect({ value: 7 }); console.log(JSON.stringify(out)) })()'")
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, '{"doubled":14,"nested":[true,null,"ok"]}\n')
 })
@@ -361,7 +361,7 @@ test('host callback arguments preserve arrays and objects with numeric keys', as
       }
     }
   })
-  const result = await sandbox.exec(`js -e 'console.log(JSON.stringify(${JSON.stringify(values)}.map(value => roundTrip(value))))'`)
+  const result = await sandbox.exec(`js -e '(async () => console.log(JSON.stringify(await Promise.all(${JSON.stringify(values)}.map(value => roundTrip(value))))))()'`)
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, `${JSON.stringify(values)}\n`)
   assert.deepEqual(received, values)
@@ -379,12 +379,14 @@ test('JS global handler errors preserve string code fields', async () => {
     }
   })
   const script = `
+(async () => {
 try {
-  deny({ id: 1 })
+  await deny({ id: 1 })
 } catch (err) {
   console.log(err.message)
   console.log(err.code)
 }
+})()
 `
   const result = await sandbox.exec(`js -e ${singleQuote(script)}`)
   assert.equal(result.exitCode, 0, result.stderr)
@@ -397,9 +399,9 @@ test('jsPrelude can wrap a Node-backed global', async () => {
     globals: {
       kvGet: ({ key }) => ({ value: key === 'answer' ? 42 : null })
     },
-    jsPrelude: 'const bound = globalThis.kvGet; globalThis.getAnswer = () => bound({ key: "answer" }).value; delete globalThis.kvGet'
+    jsPrelude: 'const bound = globalThis.kvGet; globalThis.getAnswer = async () => (await bound({ key: "answer" })).value; delete globalThis.kvGet'
   })
-  const result = await sandbox.exec("js -e 'console.log(getAnswer(), typeof kvGet)'")
+  const result = await sandbox.exec("js -e '(async () => console.log(await getAnswer(), typeof kvGet))()'")
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, '42 undefined\n')
 })
@@ -414,7 +416,7 @@ test('dotted global names build a namespace object', async () => {
     }
   })
   const result = await sandbox.exec(
-    "js -e 'console.log(search(), tools.a(), tools.b(), Object.keys(tools).join(\",\"))'"
+    "js -e '(async () => console.log(await search(), await tools.a(), await tools.b(), Object.keys(tools).join(\",\")))()'"
   )
   assert.equal(result.exitCode, 0, result.stderr)
   assert.equal(result.stdout, 'top-level a b a,b\n')
@@ -500,18 +502,18 @@ test('globals can change between commands on a live sandbox', async () => {
   sandbox.extendJsGlobals({ 'tools.a': () => 'a', 'tools.b': () => 'b' })
   assert.deepEqual(sandbox.jsGlobalNames(), ['tools.a', 'tools.b', 'whoami'])
 
-  const granted = await sandbox.exec("js -e 'console.log(whoami(), tools.a(), tools.b())'")
+  const granted = await sandbox.exec("js -e '(async () => console.log(await whoami(), await tools.a(), await tools.b()))()'")
   assert.equal(granted.exitCode, 0, granted.stderr)
   assert.equal(granted.stdout, 'agent-1 a b\n')
 
   // replace drops what it does not name, including constructor globals.
   sandbox.replaceJsGlobals({ 'tools.c': () => 'c' })
   assert.deepEqual(sandbox.jsGlobalNames(), ['tools.c'])
-  const revoked = await sandbox.exec("js -e 'console.log(typeof whoami, tools.c())'")
+  const revoked = await sandbox.exec("js -e '(async () => console.log(typeof whoami, await tools.c()))()'")
   assert.equal(revoked.stdout, 'undefined c\n')
 
   sandbox.setJsGlobal('search', () => 'hit')
-  assert.equal((await sandbox.exec("js -e 'console.log(search())'")).stdout, 'hit\n')
+  assert.equal((await sandbox.exec("js -e '(async () => console.log(await search()))()'")).stdout, 'hit\n')
   assert.equal(sandbox.removeJsGlobal('search'), true)
   assert.equal(sandbox.removeJsGlobal('search'), false)
 

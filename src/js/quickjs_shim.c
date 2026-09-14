@@ -5,10 +5,18 @@
 #include "quickjs.h"
 
 #define TINYSANDBOX_QUICKJS_STACK_SIZE (768 * 1024)
-#define TINYSANDBOX_ABI_VERSION 12
+#define TINYSANDBOX_ABI_VERSION 13
+
+/* Host answer to a call: the response is staged, or it will arrive later. */
+#define TB_HOST_INLINE 0
+#define TB_HOST_DEFERRED 1
+/* tinysandbox_run/tinysandbox_resolve returned with the guest still alive. */
+#define TB_SUSPENDED INT32_MIN
+#define TB_MAX_PENDING 64
 
 __attribute__((import_module("tinysandbox"), import_name("host_call")))
-int32_t tb_host_call(const uint8_t *op, int32_t op_len, const uint8_t *json, int32_t json_len);
+int32_t tb_host_call(const uint8_t *op, int32_t op_len, const uint8_t *json, int32_t json_len,
+                     int32_t call_id);
 
 __attribute__((import_module("tinysandbox"), import_name("host_response_len")))
 int32_t tb_host_response_len(void);
@@ -30,6 +38,51 @@ static int quickjs_should_interrupt(JSRuntime *rt, void *opaque)
     (void)rt;
     (void)opaque;
     return tb_should_interrupt() != 0;
+}
+
+typedef struct UnhandledRejection {
+    JSValue promise;
+    JSValue reason;
+    struct UnhandledRejection *next;
+} UnhandledRejection;
+
+typedef struct {
+    UnhandledRejection *head;
+    UnhandledRejection *tail;
+} UnhandledRejectionState;
+
+/* One guest program, alive across suspensions.
+ *
+ * A guest `await` on a host call parks its coroutine on the JS heap, so the
+ * runtime outlives the call that started it and the wasm stack unwinds
+ * normally. That only works if nothing the runtime needs lives on this
+ * module's C stack: QuickJS keeps the address of `rejections`, so a stack
+ * local would dangle the moment tinysandbox_run returned. */
+typedef struct {
+    JSValue resolve;
+    JSValue reject;
+    int in_use;
+} PendingCall;
+
+typedef struct {
+    JSRuntime *rt;
+    JSContext *ctx;
+    UnhandledRejectionState rejections;
+    PendingCall pending[TB_MAX_PENDING];
+    int pending_count;
+    int active;
+} Session;
+
+static Session tb_session;
+
+static int32_t session_reserve_slot(void)
+{
+    for (int32_t i = 0; i < TB_MAX_PENDING; i++) {
+        if (!tb_session.pending[i].in_use) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static const char TINYSANDBOX_GLUE[] =
@@ -72,10 +125,16 @@ static const char TINYSANDBOX_GLUE[] =
 "    if (e && e.code !== undefined) err.code = e.code\n"
 "    return err\n"
 "  }\n"
-"  function callGlobal(name, args) {\n"
-"    const response = hostCall('global', JSON.stringify({ name, args: args === undefined ? null : args }))\n"
+"  function unwrapGlobal(response) {\n"
 "    if (response && response.error) throw globalError(response.error)\n"
 "    return response ? response.value : undefined\n"
+"  }\n"
+"  function callGlobal(name, args) {\n"
+"    const response = hostCall('global', JSON.stringify({ name, args: args === undefined ? null : args }))\n"
+"    // Always a promise, so one guest script works on every host. A host that\n"
+"    // answered inline settles it immediately: a microtask, not a suspension.\n"
+"    if (response instanceof Promise) return response.then(unwrapGlobal)\n"
+"    try { return Promise.resolve(unwrapGlobal(response)) } catch (error) { return Promise.reject(error) }\n"
 "  }\n"
 "  function installGlobals(paths) {\n"
 "    // Namespace nodes use a null prototype so names like __proto__ stay\n"
@@ -727,9 +786,30 @@ static JSValue js_host_call(JSContext *ctx, JSValueConst this_val, int argc, JSV
         return JS_EXCEPTION;
     }
 
-    tb_host_call((const uint8_t *)op, (int32_t)op_len, (const uint8_t *)json, (int32_t)json_len);
+    int32_t call_id = session_reserve_slot();
+    int32_t answer = tb_host_call((const uint8_t *)op, (int32_t)op_len, (const uint8_t *)json,
+                                  (int32_t)json_len, call_id);
     JS_FreeCString(ctx, op);
     JS_FreeCString(ctx, json);
+
+    if (answer == TB_HOST_DEFERRED) {
+        if (call_id < 0) {
+            return JS_ThrowInternalError(ctx, "tinysandbox host call limit exceeded");
+        }
+        /* The host settles this later. Hand the guest a promise so its await
+         * parks on the JS heap and this call returns, letting the wasm stack
+         * unwind back to the host's event loop. */
+        JSValue resolving[2];
+        JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+        if (JS_IsException(promise)) {
+            return promise;
+        }
+        tb_session.pending[call_id].resolve = resolving[0];
+        tb_session.pending[call_id].reject = resolving[1];
+        tb_session.pending[call_id].in_use = 1;
+        tb_session.pending_count++;
+        return promise;
+    }
 
     int32_t response_len = tb_host_response_len();
     if (response_len < 0) {
@@ -830,16 +910,6 @@ static void set_function(JSContext *ctx, const char *name, JSCFunction *func, in
     JS_FreeValue(ctx, global);
 }
 
-typedef struct UnhandledRejection {
-    JSValue promise;
-    JSValue reason;
-    struct UnhandledRejection *next;
-} UnhandledRejection;
-
-typedef struct {
-    UnhandledRejection *head;
-    UnhandledRejection *tail;
-} UnhandledRejectionState;
 
 static void free_unhandled_rejection(JSContext *ctx, UnhandledRejection *entry)
 {
@@ -1011,9 +1081,104 @@ static int32_t drain_pending_jobs(JSRuntime *rt, JSContext *ctx, UnhandledReject
     return 0;
 }
 
+/* Frees the guest. Every exit path funnels here so the runtime, context and
+ * rejection list are released exactly once regardless of where it ended. */
+static int32_t session_finish(int32_t code)
+{
+    JSContext *ctx = tb_session.ctx;
+    for (int32_t i = 0; i < TB_MAX_PENDING; i++) {
+        if (tb_session.pending[i].in_use) {
+            JS_FreeValue(ctx, tb_session.pending[i].resolve);
+            JS_FreeValue(ctx, tb_session.pending[i].reject);
+            tb_session.pending[i].in_use = 0;
+        }
+    }
+    tb_session.pending_count = 0;
+    clear_unhandled_rejections(ctx, &tb_session.rejections);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(tb_session.rt);
+    tb_session.ctx = NULL;
+    tb_session.rt = NULL;
+    tb_session.active = 0;
+    return code;
+}
+
+/* Drains the job queue, then either parks the guest awaiting the host or ends
+ * it. Outstanding host calls are the only thing that can advance a drained
+ * queue, so their presence is exactly the suspend condition. */
+static int32_t session_settle(int32_t code)
+{
+    if (code == 0) {
+        code = drain_pending_jobs(tb_session.rt, tb_session.ctx, &tb_session.rejections);
+    }
+    if (code == 0 && tb_session.pending_count > 0) {
+        return TB_SUSPENDED;
+    }
+    return session_finish(code);
+}
+
+/* Settles one deferred host call with the staged response and resumes. */
+__attribute__((export_name("tinysandbox_resolve")))
+int32_t tinysandbox_resolve(int32_t call_id)
+{
+    if (!tb_session.active || call_id < 0 || call_id >= TB_MAX_PENDING ||
+        !tb_session.pending[call_id].in_use) {
+        return 1;
+    }
+    JSContext *ctx = tb_session.ctx;
+
+    JSValue response = JS_UNDEFINED;
+    int32_t response_len = tb_host_response_len();
+    if (response_len >= 0) {
+        char *bytes = js_malloc(ctx, (size_t)response_len + 1);
+        if (!bytes) {
+            return session_finish(1);
+        }
+        if (tb_host_response_read((uint8_t *)bytes, response_len) != response_len) {
+            js_free(ctx, bytes);
+            return session_finish(1);
+        }
+        bytes[response_len] = '\0';
+        response = JS_ParseJSON(ctx, bytes, (size_t)response_len, "<tinysandbox-response>");
+        js_free(ctx, bytes);
+    }
+
+    /* The glue unwraps {value}/{error} identically for both paths, so an error
+     * response resolves here and throws there rather than being rebuilt in C. */
+    JSValue resolve = tb_session.pending[call_id].resolve;
+    JSValue reject = tb_session.pending[call_id].reject;
+    tb_session.pending[call_id].in_use = 0;
+    tb_session.pending_count--;
+
+    int32_t code = 0;
+    if (JS_IsException(response)) {
+        JSValue exception = JS_GetException(ctx);
+        JSValue thrown = JS_Call(ctx, reject, JS_UNDEFINED, 1, (JSValueConst *)&exception);
+        JS_FreeValue(ctx, thrown);
+        JS_FreeValue(ctx, exception);
+    } else {
+        JSValue settled = JS_Call(ctx, resolve, JS_UNDEFINED, 1, (JSValueConst *)&response);
+        if (JS_IsException(settled)) {
+            code = handle_eval_result(ctx, JS_DupValue(ctx, settled));
+        }
+        JS_FreeValue(ctx, settled);
+        JS_FreeValue(ctx, response);
+    }
+    JS_FreeValue(ctx, resolve);
+    JS_FreeValue(ctx, reject);
+
+    return session_settle(code);
+}
+
 __attribute__((export_name("tinysandbox_run")))
 int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_limit)
 {
+    if (tb_session.active) {
+        tb_write_stderr((const uint8_t *)"quickjs: a guest is already running\n", 36);
+        return 1;
+    }
+    memset(&tb_session, 0, sizeof(tb_session));
+
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) {
         tb_write_stderr((const uint8_t *)"quickjs: failed to create runtime\n", 34);
@@ -1025,15 +1190,20 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     JS_SetMaxStackSize(rt, TINYSANDBOX_QUICKJS_STACK_SIZE);
     JS_SetInterruptHandler(rt, quickjs_should_interrupt, NULL);
     JS_UpdateStackTop(rt);
-    UnhandledRejectionState rejections = { NULL, NULL };
-    JS_SetHostPromiseRejectionTracker(rt, promise_rejection_tracker, &rejections);
+    tb_session.rt = rt;
+    /* Session-owned, not a stack local: the runtime keeps this address and now
+     * outlives the call that installed it. */
+    JS_SetHostPromiseRejectionTracker(rt, promise_rejection_tracker, &tb_session.rejections);
 
     JSContext *ctx = JS_NewContext(rt);
     if (!ctx) {
         JS_FreeRuntime(rt);
+        tb_session.rt = NULL;
         tb_write_stderr((const uint8_t *)"quickjs: failed to create context\n", 34);
         return 1;
     }
+    tb_session.ctx = ctx;
+    tb_session.active = 1;
 
     set_function(ctx, "__tinysandbox_host_call", js_host_call, 2);
     set_function(ctx, "__tinysandbox_stdout", js_write_stdout, 1);
@@ -1044,10 +1214,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     JSValue config = JS_ParseJSON(ctx, (const char *)input, (size_t)input_len, "<tinysandbox-config>");
     if (JS_IsException(config)) {
         int32_t code = handle_eval_result(ctx, config);
-        clear_unhandled_rejections(ctx, &rejections);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return code;
+        return session_finish(code);
     }
 
     JSValue global = JS_GetGlobalObject(ctx);
@@ -1057,11 +1224,8 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     JSValue run_main = JS_Eval(ctx, TINYSANDBOX_GLUE, strlen(TINYSANDBOX_GLUE), "<tinysandbox>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(run_main)) {
         int32_t code = handle_eval_result(ctx, run_main);
-        clear_unhandled_rejections(ctx, &rejections);
         JS_FreeValue(ctx, config);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return code;
+        return session_finish(code);
     }
 
     JSValue prelude_value = JS_GetPropertyStr(ctx, config, "prelude");
@@ -1071,26 +1235,20 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
         JS_FreeValue(ctx, prelude_value);
         JS_FreeValue(ctx, run_main);
         JS_FreeValue(ctx, config);
-        clear_unhandled_rejections(ctx, &rejections);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
         tb_write_stderr((const uint8_t *)"quickjs: invalid prelude config\n", 32);
-        return 1;
+        return session_finish(1);
     }
     if (prelude_len > 0) {
         int32_t code = handle_eval_result(ctx, JS_Eval(ctx, prelude, prelude_len, "<prelude>", JS_EVAL_TYPE_GLOBAL));
         if (code == 0) {
-            code = drain_pending_jobs(rt, ctx, &rejections);
+            code = drain_pending_jobs(rt, ctx, &tb_session.rejections);
         }
         if (code != 0) {
             JS_FreeCString(ctx, prelude);
             JS_FreeValue(ctx, prelude_value);
             JS_FreeValue(ctx, run_main);
             JS_FreeValue(ctx, config);
-            clear_unhandled_rejections(ctx, &rejections);
-            JS_FreeContext(ctx);
-            JS_FreeRuntime(rt);
-            return code;
+            return session_finish(code);
         }
     }
     JS_FreeCString(ctx, prelude);
@@ -1112,11 +1270,8 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
         JS_FreeValue(ctx, path_value);
         JS_FreeValue(ctx, run_main);
         JS_FreeValue(ctx, config);
-        clear_unhandled_rejections(ctx, &rejections);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
         tb_write_stderr((const uint8_t *)"quickjs: invalid script config\n", 31);
-        return 1;
+        return session_finish(1);
     }
 
     JSValue run_args[2] = {
@@ -1124,9 +1279,8 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
         JS_NewString(ctx, script_path),
     };
     int32_t code = handle_eval_result(ctx, JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args));
-    if (code == 0) {
-        code = drain_pending_jobs(rt, ctx, &rejections);
-    }
+    /* Released before settling: suspending returns from this frame, so nothing
+     * owned by it may still be live. */
     JS_FreeValue(ctx, run_args[0]);
     JS_FreeValue(ctx, run_args[1]);
     JS_FreeValue(ctx, run_main);
@@ -1135,8 +1289,5 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     JS_FreeValue(ctx, source_value);
     JS_FreeValue(ctx, path_value);
     JS_FreeValue(ctx, config);
-    clear_unhandled_rejections(ctx, &rejections);
-    JS_FreeContext(ctx);
-    JS_FreeRuntime(rt);
-    return code;
+    return session_settle(code);
 }

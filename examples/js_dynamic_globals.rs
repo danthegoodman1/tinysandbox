@@ -32,7 +32,7 @@ async fn main() {
         .expect("grant turn-one tools");
     println!("turn 1:  {:?}", sandbox.js_global_names());
     let result = sandbox
-        .exec(r#"js -e 'console.log(whoami(), tools.search({ q: "vfs" }).hits[0])'"#)
+        .exec(r#"js -e '(async () => console.log(await whoami(), (await tools.search({ q: "vfs" })).hits[0]))()'"#)
         .await;
     print!("call:    {}", result.stdout);
 

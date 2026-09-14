@@ -329,9 +329,11 @@ package runs the
 same artifact and guest glue through standard WebAssembly APIs in Node/V8,
 Chrome, and Convex-compatible V8 hosts. It accepts wasm bytes or a precompiled
 `WebAssembly.Module` explicitly, then creates fresh physical wasm and QuickJS
-state for every synchronous `runCode()` call. The host supplies bounded memory,
+state for every `runCode()` call. The host supplies bounded memory,
 a monotonic deadline, separate QuickJS heap and stack limits, output/response
-caps, and optional synchronous JSON-safe dotted globals. Supplying a
+caps, and optional JSON-safe dotted globals. A global may be `async`: the guest
+suspends while the promise settles, which is why its `runCode()` and
+`runFile()` are awaited. Supplying a
 synchronous VFS additionally enables `runFile()`, the supported `fs` subset,
 `Buffer`, and CommonJS file loading; omitting it leaves the runtime without
 filesystem capability. The package does not include the shell, coreutils,
@@ -462,8 +464,18 @@ optionally wrap it with a JavaScript prelude.
 ### Host globals
 
 Host globals are async host functions bound into the guest global scope by
-name. The guest calls them synchronously, JSON round-tripping one value in and
-one value out.
+name, JSON round-tripping one value in and one value out. A global returns a
+promise, so guest code awaits it:
+
+```js
+const hits = await tools.search({ q: 'kittens' })
+```
+
+That holds on every host. Rust and Node settle the call on the dedicated
+QuickJS thread, so the promise is already resolved when the guest sees it; the
+portable V8 runtime suspends the guest and resumes it once the promise settles,
+which is why its `runCode()`/`runFile()` are awaited. One script shape works
+everywhere.
 
 The name is a dotted path. A bare `search` becomes `globalThis.search`;
 `tools.search` becomes `globalThis.tools.search` with the `tools` namespace
@@ -485,9 +497,9 @@ use tinysandbox::sandbox::{HostError, Sandbox};
 #[tokio::main]
 async fn main() {
     let sandbox = Sandbox::builder()
-        // Bare name: scripts call `whoami()`.
+        // Bare name: scripts call `await whoami()`.
         .js_global("whoami", |_args| async { Ok(json!({ "name": "agent-1" })) })
-        // Dotted name: scripts call `kv.get({ key })`.
+        // Dotted name: scripts call `await kv.get({ key })`.
         .js_global("kv.get", |args| async move {
             let key = args["key"].as_str().ok_or_else(|| {
                 HostError::new("key is required").with_code("E_KEY")
@@ -497,7 +509,7 @@ async fn main() {
         .build();
 
     let result = sandbox
-        .exec("js -e 'console.log(whoami().name); console.log(kv.get({ key: \"a\" }).value)'")
+        .exec("js -e '(async () => { console.log((await whoami()).name); console.log((await kv.get({ key: \"a\" })).value) })()'")
         .await;
     assert_eq!(result.stdout, "agent-1\nvalue-for-a\n");
 }
@@ -518,7 +530,7 @@ const sandbox = new Sandbox({
 })
 
 const result = await sandbox.exec(
-  `js -e 'console.log(whoami().name); console.log(kv.get({ key: "a" }).value)'`
+  `js -e '(async () => { console.log((await whoami()).name); console.log((await kv.get({ key: "a" })).value) })()'`
 )
 console.assert(result.stdout === 'agent-1\nvalue-for-a\n')
 ```

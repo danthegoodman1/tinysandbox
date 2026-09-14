@@ -24,7 +24,12 @@ const RESERVED_GLOBALS = new Set([
     "Buffer", "Headers", "Response", "__dirname", "__filename", "console",
     "exports", "fetch", "globalThis", "module", "process", "require",
 ]);
-const ABI_VERSION = 12;
+const ABI_VERSION = 13;
+/* Host answer to a guest call: response staged now, or settled later. */
+const HOST_INLINE = 0;
+const HOST_DEFERRED = 1;
+/* tinysandbox_run/tinysandbox_resolve returned with the guest still alive. */
+const SUSPENDED = -2147483648;
 const REQUIRED_IMPORTS = [
     "env.memory:memory",
     "tinysandbox.host_call:function",
@@ -46,6 +51,7 @@ const REQUIRED_EXPORTS = [
     "tinysandbox_alloc:function",
     "tinysandbox_free:function",
     "tinysandbox_run:function",
+    "tinysandbox_resolve:function",
 ].sort();
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -143,7 +149,7 @@ function probeArtifactAbi(module) {
     }
     if (instance.exports.memory !== memory)
         throw new TypeError("incompatible QuickJS wasm: env.memory is not re-exported");
-    for (const [name, arity] of [["tinysandbox_abi_version", 0], ["tinysandbox_alloc", 1], ["tinysandbox_free", 1], ["tinysandbox_run", 3]]) {
+    for (const [name, arity] of [["tinysandbox_abi_version", 0], ["tinysandbox_alloc", 1], ["tinysandbox_free", 1], ["tinysandbox_run", 3], ["tinysandbox_resolve", 1]]) {
         if (instance.exports[name].length !== arity)
             throw new TypeError(`incompatible QuickJS wasm export signature '${name}'`);
     }
@@ -680,7 +686,7 @@ export async function createEngine(wasm) {
     requireArtifactAbi(module);
     probeArtifactAbi(module);
     const engine = {
-        runCode(code, options = {}) {
+        async runCode(code, options = {}) {
             if (typeof code !== "string")
                 throw new TypeError("code must be a string");
             if (options === null || typeof options !== "object")
@@ -719,6 +725,8 @@ export async function createEngine(wasm) {
             let stdoutLength = 0;
             let stderrLength = 0;
             let response = new Uint8Array();
+            // Host calls the guest is awaiting, keyed by the slot the guest reserved.
+            const deferred = new Map();
             let timedOut = false;
             let finished = false;
             let limitFailure;
@@ -756,6 +764,26 @@ export async function createEngine(wasm) {
             };
             const onAbort = () => { isCancelled(); };
             const cancellationMessage = () => signal?.aborted ? "command cancelled" : "command timed out";
+            // One timer for the whole run, created on first suspension and released
+            // when it ends, so a guest making many host calls does not accumulate
+            // timers or keep the event loop alive after it finishes.
+            let expiry;
+            let releaseExpiry = () => { };
+            const deadlineExpiry = () => {
+                if (expiry === undefined) {
+                    expiry = new Promise((resolve) => {
+                        const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - monotonicNow()));
+                        const onAborted = () => resolve(undefined);
+                        signal?.addEventListener("abort", onAborted, { once: true });
+                        releaseExpiry = () => {
+                            clearTimeout(timer);
+                            signal?.removeEventListener("abort", onAborted);
+                            resolve(undefined);
+                        };
+                    });
+                }
+                return expiry;
+            };
             const checkpoint = () => {
                 if (isCancelled())
                     throw new RunLimitError("timeout", cancellationMessage());
@@ -800,7 +828,7 @@ export async function createEngine(wasm) {
                 should_interrupt() {
                     return isCancelled() ? 1 : 0;
                 },
-                host_call(opPointer, opLength, jsonPointer, jsonLength) {
+                host_call(opPointer, opLength, jsonPointer, jsonLength, callId) {
                     checkpoint();
                     const op = decoder.decode(read(opPointer, opLength));
                     let argument;
@@ -833,22 +861,35 @@ export async function createEngine(wasm) {
                         return 0;
                     }
                     const host = callbackContext();
+                    let value;
                     try {
                         const payload = argument.args ?? null;
                         assertJsonValue(payload);
-                        const value = handler(payload, host.context);
+                        value = handler(payload, host.context);
                         checkpoint();
-                        if (thenable(value)) {
-                            // Host globals are unsupported asynchronously, but attach a
-                            // rejection handler so a mistaken async implementation cannot
-                            // take the embedding process down with an unhandled rejection.
-                            try {
-                                value.then(() => { }, () => { });
-                            }
-                            catch { }
-                            throw new TypeError(`global '${name}' returned a Promise; host globals must be synchronous`);
+                    }
+                    catch (error) {
+                        host.dispose();
+                        setResponse({ error: jsonError(error) });
+                        return HOST_INLINE;
+                    }
+                    if (thenable(value)) {
+                        if (callId < 0) {
+                            host.dispose();
+                            setResponse({ error: { message: `global '${String(name)}' exceeded the concurrent host call limit` } });
+                            return HOST_INLINE;
                         }
-                        assertJsonValue(value, `global '${name}' response`);
+                        // Defer: the guest gets a promise and parks, this call returns, and
+                        // the wasm stack unwinds so the driver can reach the event loop.
+                        deferred.set(callId, Promise.resolve(value).then((resolved) => {
+                            assertJsonValue(resolved, `global '${String(name)}' response`);
+                            return { callId, response: { value: resolved } };
+                        }).catch((error) => ({ callId, response: { error: jsonError(error) } }))
+                            .then((settled) => { host.dispose(); return settled; }));
+                        return HOST_DEFERRED;
+                    }
+                    try {
+                        assertJsonValue(value, `global '${String(name)}' response`);
                         setResponse({ value });
                     }
                     catch (error) {
@@ -857,7 +898,7 @@ export async function createEngine(wasm) {
                     finally {
                         host.dispose();
                     }
-                    return 0;
+                    return HOST_INLINE;
                 },
                 host_response_len() { return response.byteLength; },
                 host_response_read(pointer, length) {
@@ -919,6 +960,27 @@ export async function createEngine(wasm) {
                     throw new WebAssembly.RuntimeError("QuickJS input allocation failed");
                 read(pointer, configBytes.byteLength).set(configBytes);
                 exitCode = instance.exports.tinysandbox_run(pointer, configBytes.byteLength, quickjsHeapBytes);
+                while (exitCode === SUSPENDED) {
+                    isCancelled();
+                    if (timedOut)
+                        break;
+                    if (deferred.size === 0)
+                        throw new Error("guest suspended with no host call outstanding");
+                    // Settle whichever finishes first so concurrent awaits in the guest
+                    // progress in completion order rather than call order. A host promise
+                    // that never settles must not outlive the deadline, so the wait races
+                    // a timer: suspension is the one point where no guest checkpoint can
+                    // observe the clock.
+                    const settled = await Promise.race([...deferred.values(), deadlineExpiry()]);
+                    if (settled === undefined) {
+                        timedOut = true;
+                        break;
+                    }
+                    deferred.delete(settled.callId);
+                    checkpoint();
+                    setResponse(settled.response);
+                    exitCode = instance.exports.tinysandbox_resolve(settled.callId);
+                }
                 isCancelled();
                 if (timedOut) {
                     return { exitCode: 124, stdout: "", stderr: `js: ${cancellationMessage()}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
@@ -936,6 +998,7 @@ export async function createEngine(wasm) {
             }
             finally {
                 finished = true;
+                releaseExpiry();
                 signal?.removeEventListener("abort", onAbort);
                 isCancelled();
                 cleanupFailure = vfsDispatcher?.closeAll(completed && exitCode === 0 && !timedOut && limitFailure === undefined);
@@ -953,7 +1016,7 @@ export async function createEngine(wasm) {
                 peakWasmMemoryBytes: memory.buffer.byteLength,
             };
         },
-        runFile(path, options) {
+        async runFile(path, options) {
             if (typeof path !== "string")
                 throw new TypeError("path must be a string");
             if (options === null || typeof options !== "object")
@@ -989,7 +1052,7 @@ export async function createEngine(wasm) {
             }
             if (monotonicNow() >= deadline)
                 return { exitCode: 124, stdout: "", stderr: "js: command timed out\n", initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: 0 };
-            return engine.runCode(code, {
+            return await engine.runCode(code, {
                 ...options,
                 timeoutMs: Math.max(1, Math.floor(deadline - monotonicNow())),
                 vfs,

@@ -9,7 +9,8 @@ export interface HostContext {
     remainingTimeMs(): number;
     isCancelled(): boolean;
 }
-export type HostGlobal = (argument: JsonValue, context: HostContext) => JsonValue;
+/** A global may answer immediately or return a promise the guest awaits. */
+export type HostGlobal = (argument: JsonValue, context: HostContext) => JsonValue | Promise<JsonValue>;
 export type VfsErrno = "EBADF" | "EBUSY" | "EXDEV" | "EACCES" | "EEXIST" | "EFBIG" | "EIO" | "EINVAL" | "EISDIR" | "ENOENT" | "ENOSPC" | "ENOTDIR" | "ENOTEMPTY";
 export interface VfsMetadata {
     fileType: "file" | "directory";
@@ -73,6 +74,6 @@ export interface RunResult {
     peakWasmMemoryBytes: number;
 }
 export interface JsEngine {
-    runCode(code: string, options?: RunCodeOptions): RunResult;
-    runFile(path: string, options: RunFileOptions): RunResult;
+    runCode(code: string, options?: RunCodeOptions): Promise<RunResult>;
+    runFile(path: string, options: RunFileOptions): Promise<RunResult>;
 }

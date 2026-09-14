@@ -18,7 +18,7 @@ async function main() {
   })
   console.log('turn 1: ', sandbox.jsGlobalNames())
   const result = await sandbox.exec(
-    `js -e 'console.log(whoami(), tools.search({ q: "vfs" }).hits[0])'`
+    `js -e '(async () => console.log(await whoami(), (await tools.search({ q: "vfs" })).hits[0]))()'`
   )
   process.stdout.write(`call:    ${result.stdout}`)
 
