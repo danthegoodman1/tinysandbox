@@ -16,7 +16,7 @@ use serde_json::Value;
 use tinysandbox::sandbox::{
     Command, CommandContext, CommandFuture, CommandResult, ExecResult as CoreExecResult,
     FetchRequest as CoreFetchRequest, FetchResponse as CoreFetchResponse, HostContext, HostError,
-    JsGlobalError, JsGlobals, Limits, Sandbox as CoreSandbox,
+    JsGlobalError, JsGlobals, Limits, PoolCapacity, Pools, Sandbox as CoreSandbox,
 };
 use tinysandbox::vfs::{
     DirEntry, Errno, FileHandle, FileType, InMemoryVfs, Metadata, OpenMode, Vfs, VfsError,
@@ -181,6 +181,10 @@ impl Sandbox {
             }
             if let Some(limits) = get_optional_object(&options, "limits")? {
                 builder = builder.limits(parse_limits(limits)?);
+            }
+            if has_non_nullish_named_property(&options, "pools")? {
+                let pools: JsExternal = options.get_named_property("pools")?;
+                builder = builder.pools(Arc::clone(&pools.get_value::<PoolsExternal>()?.inner));
             }
             if let Some(env) = get_optional_object(&options, "env")? {
                 for key in Object::keys(&env)? {
@@ -1014,6 +1018,37 @@ impl Vfs for JsVfsHandle {
     fn stats(&self) -> Option<VfsResult<VfsStats>> {
         self.inner.stats()
     }
+}
+
+pub struct PoolsExternal {
+    inner: Arc<Pools>,
+}
+
+/// Builds resources shared by every sandbox constructed with the returned
+/// handle. Omitted fields keep their defaults.
+#[napi(ts_return_type = "ExternalObject<unknown>")]
+pub fn create_pools(capacity: Option<Object<'_>>) -> Result<External<PoolsExternal>> {
+    let mut parsed = PoolCapacity::default();
+    if let Some(capacity) = capacity {
+        if let Some(value) = get_optional::<f64>(&capacity, "jqWorkers")? {
+            parsed = parsed.with_jq_workers(usize_from_number(value)?);
+        }
+        if let Some(value) = get_optional::<f64>(&capacity, "jsWorkers")? {
+            parsed = parsed.with_js_workers(usize_from_number(value)?);
+        }
+        if let Some(value) = get_optional::<f64>(&capacity, "blockingVfsWorkers")? {
+            parsed = parsed.with_blocking_vfs_workers(usize_from_number(value)?);
+        }
+        if let Some(value) = get_optional::<f64>(&capacity, "openFiles")? {
+            parsed = parsed.with_open_files(usize_from_number(value)?);
+        }
+        if let Some(value) = get_optional::<f64>(&capacity, "cleanupThreads")? {
+            parsed = parsed.with_cleanup_threads(usize_from_number(value)?);
+        }
+    }
+    Ok(External::new(PoolsExternal {
+        inner: Pools::new(parsed),
+    }))
 }
 
 #[napi(ts_return_type = "ExternalObject<unknown>")]

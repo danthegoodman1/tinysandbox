@@ -1,5 +1,17 @@
 const native = require('./native.cjs')
 
+const handle = Symbol('tinysandbox.pools')
+
+/// Resources shared by every sandbox constructed with the same instance.
+class Pools {
+  constructor(capacity = undefined) {
+    if (capacity !== undefined && (capacity === null || typeof capacity !== 'object')) {
+      throw new TypeError('pool capacity must be an object')
+    }
+    this[handle] = native.createPools(capacity)
+  }
+}
+
 class Sandbox extends native.NativeSandbox {
   constructor(options = undefined) {
     super(normalizeOptions(options))
@@ -39,7 +51,15 @@ function normalizeOptions(options) {
   else delete normalized.fetch
   if (options.mounts) normalized.mounts = wrapMounts(options.mounts)
   else delete normalized.mounts
+  if (options.pools) normalized.pools = poolsHandle(options.pools)
+  else delete normalized.pools
   return normalized
+}
+
+function poolsHandle(pools) {
+  const external = pools?.[handle]
+  if (!external) throw new TypeError('pools must be a Pools instance')
+  return external
 }
 
 function wrapMounts(mounts) {
@@ -401,5 +421,6 @@ const prompts = Object.freeze({
 })
 
 exports.Sandbox = Sandbox
+exports.Pools = Pools
 exports.runConformance = runConformance
 exports.prompts = prompts

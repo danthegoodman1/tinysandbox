@@ -97,6 +97,12 @@ export interface ConformanceResult {
 
 export declare function createJsVfs(vfs: object): ExternalObject<unknown>
 
+/**
+ * Builds resources shared by every sandbox constructed with the returned
+ * handle. Omitted fields keep their defaults.
+ */
+export declare function createPools(capacity?: object | undefined | null): ExternalObject<unknown>
+
 export interface DirEntryJs {
   name: string
   fileType: string

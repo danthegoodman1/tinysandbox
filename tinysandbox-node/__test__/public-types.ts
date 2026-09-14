@@ -1,4 +1,4 @@
-import { Sandbox, type HostContext, type JsFetch, type JsGlobal, type SandboxFs } from '../index.js'
+import { Pools, Sandbox, type HostContext, type JsFetch, type JsGlobal, type SandboxFs } from '../index.js'
 
 const legacyGlobal: JsGlobal = (value) => ({ value: String(value) })
 const legacyFetch: JsFetch = (request) => ({ status: 200, body: request.url })
@@ -9,8 +9,11 @@ const contextualGlobal: JsGlobal = (_value, context: HostContext) => {
   return { aborted: signal.aborted, cancelled: context.isCancelled(), deadline, remaining }
 }
 
+const tenant = new Pools({ jqWorkers: 2, openFiles: 64 })
+
 const sandbox = new Sandbox({
   limits: { jqMemoryBytes: 64 * 1024 * 1024 },
+  pools: tenant,
   globals: { legacyGlobal, contextualGlobal },
   fetch: legacyFetch,
   commands: {
