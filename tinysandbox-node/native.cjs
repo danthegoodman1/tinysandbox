@@ -2,7 +2,7 @@
 
 const { readFileSync } = require('node:fs')
 
-const packageVersion = '0.7.0'
+const packageVersion = '0.7.1'
 const loadErrors = []
 
 function isMusl() {
