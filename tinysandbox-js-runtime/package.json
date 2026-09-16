@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/js-runtime",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Stateless QuickJS runtime for standard WebAssembly hosts",
   "type": "module",
   "exports": {
