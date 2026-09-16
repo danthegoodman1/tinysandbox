@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::path::normalize_path;
+use super::path::{MAX_PATH_DEPTH, normalize_path};
 use super::{DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsResult};
 
 /// Default ceiling on bytes staged in memory to modify an existing object.
@@ -194,7 +194,7 @@ impl S3Vfs {
     fn validate_parents(&self, components: &[String]) -> VfsResult<()> {
         for end in 1..components.len() {
             match self.kind_at(&components[..end])? {
-                Some(Kind::Directory(_)) => {}
+                Some(Kind::Directory { .. }) => {}
                 Some(Kind::File(_)) => return Err(vfs_error(Errno::ENOTDIR)),
                 None => return Err(vfs_error(Errno::ENOENT)),
             }
@@ -204,12 +204,14 @@ impl S3Vfs {
 
     fn kind_at(&self, components: &[String]) -> VfsResult<Option<Kind>> {
         if components.is_empty() {
-            return Ok(Some(Kind::Directory(Vec::new())));
+            return Ok(Some(Kind::Directory { nonempty: false }));
         }
 
-        let listing = self.list_directory(components)?;
+        let listing = self.scan_directory(components, true)?;
         if listing.exists {
-            return Ok(Some(Kind::Directory(listing.entries)));
+            return Ok(Some(Kind::Directory {
+                nonempty: !listing.entries.is_empty(),
+            }));
         }
 
         match self.ops.head(HeadRequest {
@@ -223,6 +225,12 @@ impl S3Vfs {
     }
 
     fn list_directory(&self, components: &[String]) -> VfsResult<DirectoryListing> {
+        self.scan_directory(components, false)
+    }
+
+    // Classification needs only a marker and one visible child. Share response
+    // validation with enumeration, but stop before retaining a full directory.
+    fn scan_directory(&self, components: &[String], probe: bool) -> VfsResult<DirectoryListing> {
         let prefix = self.directory_prefix(components);
         let mut continuation = None;
         let mut seen_tokens = BTreeSet::new();
@@ -237,7 +245,7 @@ impl S3Vfs {
                     prefix: prefix.clone(),
                     delimiter: "/".to_owned(),
                     continuation: continuation.clone(),
-                    max_keys: None,
+                    max_keys: probe.then_some(2),
                 })
                 .map_err(RemoteError::into_vfs)?;
 
@@ -288,6 +296,9 @@ impl S3Vfs {
             };
             if !seen_tokens.insert(next.clone()) {
                 return Err(vfs_error(Errno::EIO));
+            }
+            if probe && !entries.is_empty() {
+                break;
             }
             continuation = Some(next);
         }
@@ -563,6 +574,7 @@ impl S3Vfs {
     /// failed write leaves no billable parts behind.
     fn commit(&self, state: &mut HandleState) -> VfsResult<()> {
         match &mut state.staging {
+            Staging::Failed(err) => Err(*err),
             Staging::Remote(_) => Ok(()),
             Staging::Buffer(buffer) => {
                 if !buffer.dirty {
@@ -645,6 +657,17 @@ impl S3Vfs {
         let from_prefix = self.directory_prefix(from);
         let to_prefix = self.directory_prefix(to);
         let keys = self.list_recursive(&from_prefix)?;
+        // Check every destination before the first copy/delete, including keys
+        // that appeared after the initial directory probe.
+        for key in &keys {
+            let suffix = key
+                .strip_prefix(&from_prefix)
+                .ok_or(vfs_error(Errno::EIO))?;
+            if to.len() + suffix.split('/').filter(|part| !part.is_empty()).count() > MAX_PATH_DEPTH
+            {
+                return Err(vfs_error(Errno::EINVAL));
+            }
+        }
 
         for key in &keys {
             let Some(suffix) = key.strip_prefix(&from_prefix) else {
@@ -692,7 +715,7 @@ impl Vfs for S3Vfs {
         let components = self.components(path)?;
         self.validate_parents(&components)?;
         match self.kind_at(&components)? {
-            Some(Kind::Directory(_)) => Ok(Metadata {
+            Some(Kind::Directory { .. }) => Ok(Metadata {
                 file_type: FileType::Directory,
                 len: 0,
             }),
@@ -707,13 +730,17 @@ impl Vfs for S3Vfs {
     fn readdir(&self, path: &str) -> VfsResult<Vec<DirEntry>> {
         let components = self.components(path)?;
         self.validate_parents(&components)?;
-        if components.is_empty() {
-            return Ok(self.list_directory(&components)?.entries);
+        let listing = self.list_directory(&components)?;
+        if listing.exists {
+            return Ok(listing.entries);
         }
-        match self.kind_at(&components)? {
-            Some(Kind::Directory(entries)) => Ok(entries),
-            Some(Kind::File(_)) => Err(vfs_error(Errno::ENOTDIR)),
-            None => Err(vfs_error(Errno::ENOENT)),
+        match self.ops.head(HeadRequest {
+            bucket: self.bucket.clone(),
+            key: self.key(&components),
+        }) {
+            Ok(_) => Err(vfs_error(Errno::ENOTDIR)),
+            Err(RemoteError::Missing) => Err(vfs_error(Errno::ENOENT)),
+            Err(err) => Err(err.into_vfs()),
         }
     }
 
@@ -757,15 +784,15 @@ impl Vfs for S3Vfs {
             return Ok(());
         }
 
-        if matches!(source, Kind::Directory(_)) && to_components.starts_with(&from_components) {
+        if matches!(source, Kind::Directory { .. }) && to_components.starts_with(&from_components) {
             return Err(vfs_error(Errno::EINVAL));
         }
 
         self.validate_parents(&to_components)?;
         match (&source, self.kind_at(&to_components)?) {
-            (Kind::File(_), Some(Kind::Directory(_))) => return Err(vfs_error(Errno::EISDIR)),
-            (Kind::Directory(_), Some(Kind::File(_))) => return Err(vfs_error(Errno::ENOTDIR)),
-            (Kind::Directory(_), Some(Kind::Directory(entries))) if !entries.is_empty() => {
+            (Kind::File(_), Some(Kind::Directory { .. })) => return Err(vfs_error(Errno::EISDIR)),
+            (Kind::Directory { .. }, Some(Kind::File(_))) => return Err(vfs_error(Errno::ENOTDIR)),
+            (Kind::Directory { .. }, Some(Kind::Directory { nonempty: true })) => {
                 return Err(vfs_error(Errno::ENOTEMPTY));
             }
             _ => {}
@@ -773,7 +800,7 @@ impl Vfs for S3Vfs {
 
         match &source {
             Kind::File(file) => self.rename_file(&from_components, &to_components, file)?,
-            Kind::Directory(_) => {
+            Kind::Directory { .. } => {
                 if !self.config.directory_rename {
                     return Err(vfs_error(Errno::EXDEV));
                 }
@@ -792,7 +819,7 @@ impl Vfs for S3Vfs {
         }
         self.validate_parents(&components)?;
         let file = match self.kind_at(&components)? {
-            Some(Kind::Directory(_)) => return Err(vfs_error(Errno::EISDIR)),
+            Some(Kind::Directory { .. }) => return Err(vfs_error(Errno::EISDIR)),
             Some(Kind::File(file)) => file,
             None => return Err(vfs_error(Errno::ENOENT)),
         };
@@ -816,10 +843,10 @@ impl Vfs for S3Vfs {
         self.validate_parents(&components)?;
         match self.kind_at(&components)? {
             Some(Kind::File(_)) => return Err(vfs_error(Errno::ENOTDIR)),
-            Some(Kind::Directory(entries)) if !entries.is_empty() => {
+            Some(Kind::Directory { nonempty: true }) => {
                 return Err(vfs_error(Errno::ENOTEMPTY));
             }
-            Some(Kind::Directory(_)) => {}
+            Some(Kind::Directory { .. }) => {}
             None => return Err(vfs_error(Errno::ENOENT)),
         }
 
@@ -848,7 +875,7 @@ impl Vfs for S3Vfs {
         self.validate_parents(&components)?;
 
         let existing = match self.kind_at(&components)? {
-            Some(Kind::Directory(_)) => return Err(vfs_error(Errno::EISDIR)),
+            Some(Kind::Directory { .. }) => return Err(vfs_error(Errno::EISDIR)),
             Some(Kind::File(file)) => Some(file),
             None => None,
         };
@@ -992,7 +1019,7 @@ impl S3Vfs {
         let (key, remote) = match &state.staging {
             Staging::Remote(file) => (state.key.clone(), Some(file.clone())),
             Staging::Buffer(_) => (state.key.clone(), None),
-            Staging::Stream(_) => return Err(vfs_error(Errno::EBADF)),
+            Staging::Stream(_) | Staging::Failed(_) => return Err(vfs_error(Errno::EBADF)),
         };
 
         if let Some(file) = remote {
@@ -1029,6 +1056,9 @@ impl S3Vfs {
         if !state.mode.write {
             return Err(vfs_error(Errno::EBADF));
         }
+        if let Staging::Failed(err) = state.staging {
+            return Err(err);
+        }
         if data.is_empty() {
             return Ok(0);
         }
@@ -1036,6 +1066,7 @@ impl S3Vfs {
         let key = state.key.clone();
         let append = state.mode.append;
         match &mut state.staging {
+            Staging::Failed(err) => Err(*err),
             Staging::Remote(_) => Err(vfs_error(Errno::EBADF)),
             Staging::Buffer(buffer) => {
                 let bytes = self.materialize(&key, buffer)?;
@@ -1061,18 +1092,24 @@ impl S3Vfs {
                     // uploaded part and can no longer be staged in memory.
                     return Err(vfs_error(Errno::EFBIG));
                 }
-                self.fill_gap(&key, stream, target)?;
-                let start = usize::try_from(target - stream.flushed)
-                    .map_err(|_| vfs_error(Errno::EINVAL))?;
-                let end = start
-                    .checked_add(data.len())
-                    .ok_or(vfs_error(Errno::EINVAL))?;
-                if end > stream.buffer.len() {
-                    stream.buffer.resize(end, 0);
+                let result = (|| {
+                    self.fill_gap(&key, stream, target)?;
+                    let start = usize::try_from(target - stream.flushed)
+                        .map_err(|_| vfs_error(Errno::EINVAL))?;
+                    let end = start
+                        .checked_add(data.len())
+                        .ok_or(vfs_error(Errno::EINVAL))?;
+                    if end > stream.buffer.len() {
+                        stream.buffer.resize(end, 0);
+                    }
+                    stream.buffer[start..end].copy_from_slice(data);
+                    self.flush_parts(&key, stream)?;
+                    Ok(data.len())
+                })();
+                if let Err(err) = result {
+                    self.fail_stream(&mut state, err);
                 }
-                stream.buffer[start..end].copy_from_slice(data);
-                self.flush_parts(&key, stream)?;
-                Ok(data.len())
+                result
             }
         }
     }
@@ -1089,6 +1126,7 @@ impl S3Vfs {
 
         let key = state.key.clone();
         match &mut state.staging {
+            Staging::Failed(err) => Err(*err),
             Staging::Remote(_) => Err(vfs_error(Errno::EINVAL)),
             Staging::Buffer(buffer) => {
                 let bytes = self.materialize(&key, buffer)?;
@@ -1102,14 +1140,28 @@ impl S3Vfs {
                     return Err(vfs_error(Errno::EFBIG));
                 }
                 if len > stream.end()? {
-                    self.fill_gap(&key, stream, len)?;
-                    return Ok(());
+                    let result = self.fill_gap(&key, stream, len);
+                    if let Err(err) = result {
+                        self.fail_stream(&mut state, err);
+                    }
+                    return result;
                 }
                 let keep =
                     usize::try_from(len - stream.flushed).map_err(|_| vfs_error(Errno::EINVAL))?;
                 stream.buffer.truncate(keep);
                 Ok(())
             }
+        }
+    }
+
+    fn fail_stream(&self, state: &mut HandleState, error: VfsError) {
+        // Consume all publishable state at the failure boundary, so explicit
+        // close, guest teardown, and subsequent writes cannot commit a prefix.
+        if let Staging::Stream(stream) =
+            std::mem::replace(&mut state.staging, Staging::Failed(error))
+            && let Some(upload) = stream.upload
+        {
+            self.abort_upload(&state.key, &upload);
         }
     }
 
@@ -1182,6 +1234,8 @@ enum Staging {
     Buffer(Buffer),
     /// Forward-only writes flushed through a multipart upload.
     Stream(Stream),
+    /// A failed stream owns no publishable data; close reports the first error.
+    Failed(VfsError),
 }
 
 #[derive(Debug)]
@@ -1235,7 +1289,7 @@ struct UploadedPart {
 
 #[derive(Debug)]
 enum Kind {
-    Directory(Vec<DirEntry>),
+    Directory { nonempty: bool },
     File(RemoteFile),
 }
 
@@ -1949,6 +2003,11 @@ mod tests {
         next_etag: u64,
         next_upload: u64,
         aborted: Vec<String>,
+        fail_part: Option<i32>,
+        mutations: usize,
+        completed: usize,
+        lists: Vec<ListRequest>,
+        listed_entries: usize,
     }
 
     #[derive(Debug, Clone)]
@@ -2052,59 +2111,56 @@ mod tests {
         }
 
         fn list(&self, request: ListRequest) -> Result<ListResult, RemoteError> {
-            let state = self.state();
-            let mut objects = Vec::new();
-            let mut common_prefixes = BTreeSet::new();
+            let mut state = self.state();
+            // A delimiter prefix counts toward MaxKeys just like an object.
+            let mut entries = BTreeMap::new();
             for (key, object) in &state.objects {
                 let Some(relative) = key.strip_prefix(&request.prefix) else {
                     continue;
                 };
-                if let Some(after) = &request.continuation
-                    && key <= after
-                {
-                    continue;
-                }
-                match (!request.delimiter.is_empty())
-                    .then(|| relative.find(&request.delimiter))
-                    .flatten()
-                {
-                    Some(index) => {
-                        common_prefixes.insert(format!(
+                let entry = if request.delimiter.is_empty() {
+                    (key.clone(), Some(object.body.len() as u64))
+                } else if let Some(index) = relative.find(&request.delimiter) {
+                    (
+                        format!(
                             "{}{}{}",
                             request.prefix,
                             &relative[..index],
                             request.delimiter
-                        ));
-                    }
-                    None => objects.push(ListedObject {
-                        key: key.clone(),
-                        size: object.body.len() as u64,
-                    }),
+                        ),
+                        None,
+                    )
+                } else {
+                    (key.clone(), Some(object.body.len() as u64))
+                };
+                if request
+                    .continuation
+                    .as_ref()
+                    .is_none_or(|after| entry.0 > *after)
+                {
+                    entries.insert(entry.0, entry.1);
                 }
             }
-
-            let common_prefixes: Vec<String> = common_prefixes.into_iter().collect();
-            let limit = request
-                .max_keys
-                .and_then(|max| usize::try_from(max).ok())
-                .unwrap_or(usize::MAX);
-            let truncated = objects.len() + common_prefixes.len() > limit;
-            if truncated {
-                objects.truncate(limit);
-            }
-            let next_continuation = truncated
-                .then(|| objects.last().map(|object| object.key.clone()))
-                .flatten();
-            Ok(ListResult {
-                objects,
-                common_prefixes: if truncated {
-                    Vec::new()
-                } else {
-                    common_prefixes
-                },
+            let limit = request.max_keys.map_or(1000, |max| max as usize);
+            let truncated = entries.len() > limit;
+            let mut page = ListResult {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
                 truncated,
-                next_continuation,
-            })
+                next_continuation: None,
+            };
+            for (key, size) in entries.into_iter().take(limit) {
+                if truncated {
+                    page.next_continuation = Some(key.clone());
+                }
+                match size {
+                    Some(size) => page.objects.push(ListedObject { key, size }),
+                    None => page.common_prefixes.push(key),
+                }
+            }
+            state.listed_entries += page.objects.len() + page.common_prefixes.len();
+            state.lists.push(request);
+            Ok(page)
         }
 
         fn get(&self, request: GetRequest) -> Result<GetResult, RemoteError> {
@@ -2138,6 +2194,7 @@ mod tests {
 
         fn put(&self, request: PutRequest) -> Result<(), RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
             state.check(&request.key, &request.precondition)?;
             state.store(request.key, request.body);
             Ok(())
@@ -2145,6 +2202,7 @@ mod tests {
 
         fn delete(&self, request: DeleteRequest) -> Result<(), RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
             state.check(&request.key, &request.precondition)?;
             state
                 .objects
@@ -2155,6 +2213,7 @@ mod tests {
 
         fn copy(&self, request: CopyRequest) -> Result<(), RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
             state.check(&request.source_key, &request.source_if_match)?;
             let source = state
                 .objects
@@ -2168,6 +2227,7 @@ mod tests {
 
         fn create_upload(&self, request: CreateUploadRequest) -> Result<String, RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
             state.next_upload += 1;
             let id = format!("upload-{}", state.next_upload);
             state.uploads.insert(
@@ -2182,6 +2242,10 @@ mod tests {
 
         fn upload_part(&self, request: UploadPartRequest) -> Result<String, RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
+            if state.fail_part == Some(request.part_number) {
+                return Err(RemoteError::Io);
+            }
             let upload = state
                 .uploads
                 .get_mut(&request.upload_id)
@@ -2193,6 +2257,8 @@ mod tests {
 
         fn complete_upload(&self, request: CompleteUploadRequest) -> Result<(), RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
+            state.completed += 1;
             let upload = state
                 .uploads
                 .get(&request.upload_id)
@@ -2219,6 +2285,7 @@ mod tests {
 
         fn abort_upload(&self, request: AbortUploadRequest) -> Result<(), RemoteError> {
             let mut state = self.state();
+            state.mutations += 1;
             state.aborted.push(request.upload_id.clone());
             state
                 .uploads
@@ -2312,6 +2379,13 @@ mod tests {
             delimiter: "/".to_owned(),
             continuation: continuation.map(str::to_owned),
             max_keys: None,
+        }
+    }
+
+    fn metadata_request(prefix: &str) -> ListRequest {
+        ListRequest {
+            max_keys: Some(2),
+            ..list_request(prefix, None)
         }
     }
 
@@ -2557,9 +2631,9 @@ mod tests {
             next_continuation: None,
         };
         let fake = FakeOps::new(vec![
+            Call::List(metadata_request("root/a/"), Ok(dir_page())),
             Call::List(list_request("root/a/", None), Ok(dir_page())),
-            Call::List(list_request("root/a/", None), Ok(dir_page())),
-            Call::List(list_request("root/a/", None), Ok(dir_page())),
+            Call::List(metadata_request("root/a/"), Ok(dir_page())),
         ]);
         let vfs = vfs(Arc::clone(&fake), Some("root"));
         assert!(vfs.stat("/a").expect("directory stat").is_dir());
@@ -2583,9 +2657,9 @@ mod tests {
             next_continuation: None,
         };
         let fake = FakeOps::new(vec![
+            Call::List(metadata_request("root/empty/"), Ok(marker_page())),
             Call::List(list_request("root/empty/", None), Ok(marker_page())),
-            Call::List(list_request("root/empty/", None), Ok(marker_page())),
-            Call::List(list_request("root/empty/", None), Ok(marker_page())),
+            Call::List(metadata_request("root/empty/"), Ok(marker_page())),
         ]);
         let vfs = vfs(Arc::clone(&fake), Some("root"));
         assert!(vfs.stat("/empty").expect("marker directory stat").is_dir());
@@ -2622,9 +2696,9 @@ mod tests {
                     next_continuation: None,
                 }),
             ),
+            Call::List(metadata_request("root/a/"), Ok(child_page())),
             Call::List(list_request("root/a/", None), Ok(child_page())),
-            Call::List(list_request("root/a/", None), Ok(child_page())),
-            Call::List(list_request("root/a/", None), Ok(child_page())),
+            Call::List(metadata_request("root/a/"), Ok(child_page())),
         ]);
         let vfs = vfs(Arc::clone(&fake), Some("root"));
         let entries = vfs.readdir("/").expect("root listing");
@@ -2643,7 +2717,7 @@ mod tests {
     #[test]
     fn bounded_etag_pinned_reads_and_eof_fast_paths() {
         let fake = FakeOps::new(vec![
-            Call::List(list_request("root/file/", None), Ok(empty_list())),
+            Call::List(metadata_request("root/file/"), Ok(empty_list())),
             file_head("root/file", 10, "\"etag\""),
             Call::Get(
                 GetRequest {
@@ -2677,7 +2751,7 @@ mod tests {
     #[test]
     fn partial_tail_read_is_capped_to_object_length() {
         let fake = FakeOps::new(vec![
-            Call::List(list_request("file/", None), Ok(empty_list())),
+            Call::List(metadata_request("file/"), Ok(empty_list())),
             file_head("file", 5, "e"),
             Call::Get(
                 GetRequest {
@@ -2728,7 +2802,7 @@ mod tests {
             }),
         ] {
             let fake = FakeOps::new(vec![
-                Call::List(list_request("file/", None), Ok(empty_list())),
+                Call::List(metadata_request("file/"), Ok(empty_list())),
                 file_head("file", 2, "e"),
                 Call::Get(
                     GetRequest {
@@ -2794,7 +2868,7 @@ mod tests {
     #[test]
     fn read_only_configuration_rejects_every_mutation() {
         let fake = FakeOps::new(vec![
-            Call::List(list_request("file/", None), Ok(empty_list())),
+            Call::List(metadata_request("file/"), Ok(empty_list())),
             file_head("file", 1, "e"),
         ]);
         let vfs = S3Vfs::with_ops(
@@ -2846,9 +2920,9 @@ mod tests {
     #[test]
     fn parent_files_are_enotdir_and_missing_parents_are_enoent() {
         let fake = FakeOps::new(vec![
-            Call::List(list_request("file/", None), Ok(empty_list())),
+            Call::List(metadata_request("file/"), Ok(empty_list())),
             file_head("file", 1, "e"),
-            Call::List(list_request("missing/", None), Ok(empty_list())),
+            Call::List(metadata_request("missing/"), Ok(empty_list())),
             Call::Head(
                 HeadRequest {
                     bucket: "bucket".into(),
@@ -2887,6 +2961,26 @@ mod tests {
                 ));
             }
             assert_errno(vfs(FakeOps::new(calls), None).readdir("/"), Errno::EIO);
+        }
+    }
+
+    #[test]
+    fn metadata_probes_validate_pagination_even_when_a_child_is_found() {
+        for token in [None, Some("")] {
+            let fake = FakeOps::new(vec![Call::List(
+                metadata_request("dir/"),
+                Ok(ListResult {
+                    objects: vec![ListedObject {
+                        key: "dir/child".into(),
+                        size: 1,
+                    }],
+                    common_prefixes: vec![],
+                    truncated: true,
+                    next_continuation: token.map(str::to_owned),
+                }),
+            )]);
+            assert_errno(vfs(Arc::clone(&fake), None).stat("/dir"), Errno::EIO);
+            fake.assert_done();
         }
     }
 
@@ -3035,7 +3129,7 @@ mod tests {
         };
         let fake = FakeOps::new(vec![
             // mkdir writes a zero-byte marker only when nothing is there.
-            Call::List(list_request("root/dir/", None), Ok(empty_list())),
+            Call::List(metadata_request("root/dir/"), Ok(empty_list())),
             Call::Head(
                 HeadRequest {
                     bucket: "bucket".into(),
@@ -3053,8 +3147,8 @@ mod tests {
                 Ok(()),
             ),
             // unlink deletes the pinned revision, then keeps the directory.
-            Call::List(list_request("root/dir/", None), Ok(directory_page())),
-            Call::List(list_request("root/dir/file.txt/", None), Ok(empty_list())),
+            Call::List(metadata_request("root/dir/"), Ok(directory_page())),
+            Call::List(metadata_request("root/dir/file.txt/"), Ok(empty_list())),
             file_head("root/dir/file.txt", 4, "\"live\""),
             Call::Delete(
                 DeleteRequest {
@@ -3075,9 +3169,9 @@ mod tests {
                 Ok(()),
             ),
             // rename copies the pinned revision and deletes the source.
-            Call::List(list_request("root/a.txt/", None), Ok(empty_list())),
+            Call::List(metadata_request("root/a.txt/"), Ok(empty_list())),
             file_head("root/a.txt", 7, "\"src\""),
-            Call::List(list_request("root/b.txt/", None), Ok(empty_list())),
+            Call::List(metadata_request("root/b.txt/"), Ok(empty_list())),
             Call::Head(
                 HeadRequest {
                     bucket: "bucket".into(),
@@ -3160,6 +3254,161 @@ mod tests {
         );
         vfs.close(handle).expect("close lands the object");
         assert_eq!(bucket.body("pending.txt").as_deref(), Some(&b"staged"[..]));
+    }
+
+    #[test]
+    fn failed_multipart_streams_cannot_publish_a_successful_prefix() {
+        for (part, truncate, close_failure) in [
+            (1, false, false),
+            (2, false, false),
+            (2, true, false),
+            (2, false, true),
+        ] {
+            for existing in [false, true] {
+                let bucket = FakeBucket::new();
+                if existing {
+                    bucket.seed("out", b"original");
+                }
+                bucket.state().fail_part = Some(part);
+                let mut vfs = bucket_vfs(&bucket, None);
+                vfs.part_size = 8;
+                let handle = vfs
+                    .open("/out", OpenMode::write_only().create().truncate())
+                    .unwrap();
+                if part == 2 {
+                    vfs.write_at(handle, 0, b"12345678").unwrap();
+                }
+                // Previously accepted tail bytes must not be silently lost and
+                // then replaced with a shorter successful multipart completion.
+                let offset = if part == 2 { 8 } else { 0 };
+                vfs.write_at(handle, offset, b"tail").unwrap();
+                if close_failure {
+                    assert_errno(vfs.close(handle), Errno::EIO);
+                } else {
+                    if truncate {
+                        assert_errno(vfs.truncate(handle, 24), Errno::EIO);
+                    } else {
+                        assert_errno(vfs.write_at(handle, offset + 4, b"FAIL"), Errno::EIO);
+                    }
+                    for bytes in [&b""[..], &b"retry"[..]] {
+                        assert_errno(vfs.write_at(handle, 0, bytes), Errno::EIO);
+                    }
+                    assert_errno(vfs.truncate(handle, 0), Errno::EIO);
+                    assert_errno(vfs.close(handle), Errno::EIO);
+                }
+                assert_errno(vfs.close(handle), Errno::EBADF);
+                assert_errno(vfs.abort(handle), Errno::EBADF);
+                assert_eq!(bucket.body("out"), existing.then(|| b"original".to_vec()));
+                assert_eq!(bucket.open_uploads(), 0);
+                assert_eq!(bucket.aborted().len(), 1);
+                assert_eq!(bucket.state().completed, 0);
+                assert!(vfs.state().handles.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "js")]
+    #[tokio::test]
+    async fn guest_catching_a_write_failure_cannot_commit_it_during_teardown() {
+        use crate::sandbox::{PoolCapacity, Pools, Sandbox};
+        for close in ["", "fs.closeSync(fd);"] {
+            let bucket = FakeBucket::new();
+            bucket.seed("out", b"original");
+            bucket.state().fail_part = Some(2);
+            let mut vfs = bucket_vfs(&bucket, None);
+            vfs.part_size = 8;
+            let pools = Pools::new(PoolCapacity::default());
+            let sandbox = Sandbox::builder()
+                .clear_mounts()
+                .mount("objects", vfs)
+                .cwd("/objects")
+                .pools(Arc::clone(&pools))
+                .build();
+            let result = sandbox.exec(&format!("js -e 'const fs=require(\"fs\"); const fd=fs.openSync(\"out\",\"w\"); fs.writeSync(fd,\"12345678tail\"); try {{ fs.writeSync(fd,\"FAIL\"); }} catch(e) {{ console.log(e.code); }} {close}'")).await;
+            assert_ne!(result.exit_code, 0, "failed close is reported");
+            assert_eq!(result.stdout, "EIO\n");
+            assert_eq!(bucket.body("out"), Some(b"original".to_vec()));
+            assert_eq!(bucket.state().completed, 0);
+            assert_eq!(bucket.aborted().len(), 1);
+            assert_eq!(pools.open_files(), 0);
+        }
+    }
+
+    #[test]
+    fn directory_rename_checks_all_resulting_depths_before_remote_mutation() {
+        let bucket = FakeBucket::new();
+        let prefix = "storage/prefix";
+        bucket.seed(&format!("{prefix}/source/child/leaf"), b"retained");
+        let parent = format!("/{}", vec!["d"; 253].join("/"));
+        let target = format!("{parent}/target");
+        bucket.seed(&format!("{prefix}{target}/"), b"");
+        let vfs = bucket_vfs(&bucket, Some(prefix));
+        let before = bucket.keys();
+        assert_errno(
+            vfs.rename("/source", &format!("{target}/source")),
+            Errno::EINVAL,
+        );
+        assert_eq!(bucket.keys(), before);
+        assert_eq!(
+            bucket.state().mutations,
+            0,
+            "no copy/delete/marker write before admission"
+        );
+        vfs.rename("/source", &target)
+            .expect("resulting leaf at depth 256");
+        assert_eq!(
+            read_file(&vfs, &format!("{target}/child/leaf")).unwrap(),
+            b"retained"
+        );
+        assert!(
+            bucket
+                .body(&format!("{prefix}/source/child/leaf"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn metadata_requests_stay_bounded_as_directories_widen() {
+        for width in [1, 1000, 2501] {
+            let bucket = FakeBucket::new();
+            for index in 0..width {
+                // Exercise both Contents and CommonPrefixes, including pages
+                // consisting entirely of common prefixes.
+                bucket.seed(&format!("root/wide/d{index:04}/file"), b"x");
+            }
+            bucket.seed("root/empty/", b"");
+            let vfs = bucket_vfs(&bucket, Some("root"));
+            let started = std::time::Instant::now();
+            assert!(vfs.stat("/wide").unwrap().is_dir());
+            assert_errno(vfs.open("/wide", OpenMode::read_only()), Errno::EISDIR);
+            assert_errno(vfs.rmdir("/wide"), Errno::ENOTEMPTY);
+            assert_errno(vfs.rename("/empty", "/wide"), Errno::ENOTEMPTY);
+            assert_eq!(vfs.stat("/wide/d0000/file").unwrap().len, 1);
+            let handle = vfs.open("/wide/d0000/file", OpenMode::read_only()).unwrap();
+            vfs.close(handle).unwrap();
+            let state = bucket.state();
+            assert_eq!(state.lists.len(), 11);
+            assert!(
+                state
+                    .lists
+                    .iter()
+                    .all(|request| request.max_keys == Some(2))
+            );
+            assert!(state.listed_entries <= 15);
+            assert_eq!(state.mutations, 0);
+            eprintln!(
+                "metadata width={width}: {} LISTs, {} returned entries, {:?}",
+                state.lists.len(),
+                state.listed_entries,
+                started.elapsed()
+            );
+            drop(state);
+            let entries = vfs.readdir("/wide").unwrap();
+            assert_eq!(entries.len(), width);
+            assert!(entries.windows(2).all(|pair| pair[0].name < pair[1].name));
+            assert!(entries.iter().all(|entry| entry.metadata.is_dir()));
+            assert_eq!(read_file(&vfs, "/wide/d0000/file").unwrap(), b"x");
+        }
     }
 
     #[test]

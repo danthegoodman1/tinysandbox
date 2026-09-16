@@ -31,3 +31,5 @@ const fs: SandboxFs = sandbox.fs
 const read: Promise<Buffer> = fs.readFile('/workspace/hello')
 void execution
 void read
+const abort: Promise<void> = fs.abort(1)
+void abort

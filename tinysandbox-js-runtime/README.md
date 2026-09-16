@@ -107,7 +107,10 @@ runtime and on tinysandbox's Rust and Node hosts. A synchronous host global is
 answered inline and its promise is already settled: a microtask, not a
 suspension, so only the globals that need it pay for suspending. Concurrent
 awaits settle in completion order, and a rejected promise surfaces in the guest
-as a catchable error. At most 64 host calls may be outstanding at once.
+as a catchable error. At most 64 host calls may be outstanding at once. When all
+slots are occupied, another call is rejected before its host callback runs,
+including a synchronous callback. Promises returned by admitted callbacks remain
+observed even when the run is cancelled before consuming their results.
 
 ## Optional filesystem capability
 

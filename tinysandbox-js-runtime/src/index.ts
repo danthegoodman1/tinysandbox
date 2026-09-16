@@ -781,24 +781,24 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
             setResponse({ error: { message: `unknown global '${String(name)}'` } });
             return 0;
           }
+          // Reserve before invoking even a synchronous global: a callback may
+          // start work or return a rejected promise before we can inspect it.
+          if (callId < 0) {
+            setResponse({ error: { message: `global '${String(name)}' exceeded the concurrent host call limit` } });
+            return HOST_INLINE;
+          }
           const host = callbackContext();
           let value: unknown;
           try {
             const payload = argument.args ?? null;
             assertJsonValue(payload);
             value = handler(payload, host.context);
-            checkpoint();
           } catch (error) {
             host.dispose();
             setResponse({ error: jsonError(error) });
             return HOST_INLINE;
           }
           if (thenable(value)) {
-            if (callId < 0) {
-              host.dispose();
-              setResponse({ error: { message: `global '${String(name)}' exceeded the concurrent host call limit` } });
-              return HOST_INLINE;
-            }
             // Defer: the guest gets a promise and parks, this call returns, and
             // the wasm stack unwinds so the driver can reach the event loop.
             deferred.set(callId, Promise.resolve(value).then(
@@ -808,9 +808,13 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
               },
             ).catch((error) => ({ callId, response: { error: jsonError(error) } as HostResponse }))
               .then((settled) => { host.dispose(); return settled; }));
+            // Own the promise before a timeout/abort can throw. Its settlement
+            // remains observed even when the guest never consumes the answer.
+            checkpoint();
             return HOST_DEFERRED;
           }
           try {
+            checkpoint();
             assertJsonValue(value, `global '${String(name)}' response`);
             setResponse({ value });
           } catch (error) {

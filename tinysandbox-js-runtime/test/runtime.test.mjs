@@ -302,3 +302,63 @@ test("sparse arrays serialize the way JSON.stringify does", async () => {
   assert.equal(result.stdout, `${JSON.stringify(argv)}\n`);
   assert.equal(result.stdout, '[null,null,"third"]\n');
 });
+
+test("host-call admission precedes callback side effects and includes synchronous globals", async () => {
+  const engine = await createEngine(bytes);
+  for (const count of [64, 65, 80]) {
+    for (const rejects of [false, true]) {
+      let calls = 0, synchronous = 0;
+      const contexts = [];
+      const result = await engine.runCode(`(async () => {
+        const calls = Array.from({length:${count}}, () => work(null));
+        calls.push(sync(null));
+        const results = await Promise.allSettled(calls);
+        console.log(results.filter(r => r.status === 'rejected').length);
+        console.log(await sync(null));
+      })()`, { globals: {
+        work: async (_value, context) => {
+          calls++;
+          contexts.push(context);
+          if (rejects) throw new Error('expected');
+          return null;
+        },
+        sync: () => { synchronous++; return 'recovered'; },
+      }});
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(calls, 64, "overflow never invokes the host callback");
+      assert.equal(synchronous, 1, "sync calls are admitted again after pending work settles");
+      assert.equal(result.stdout, `${rejects ? count + 1 : count - 64 + 1}\nrecovered\n`);
+      assert.ok(contexts.every(context => context.signal.aborted));
+    }
+  }
+});
+
+test("callback promises remain observed when cancellation happens during invocation", async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const script = `
+    import assert from 'node:assert/strict';
+    import {readFile} from 'node:fs/promises';
+    import {createEngine} from ${JSON.stringify(new URL('../dist/index.js', import.meta.url).href)};
+    const engine = await createEngine(await readFile(new URL(${JSON.stringify(new URL('../quickjs.wasm', import.meta.url).href)})));
+    for (const abort of [false, true]) {
+      const controller = new AbortController();
+      let calls = 0;
+      const result = await engine.runCode('(async()=>{await Promise.allSettled(Array.from({length:80},()=>work(null)))})()', {
+        signal: controller.signal,
+        globals: {work: () => {
+          calls++;
+          if (abort) controller.abort();
+          return Promise.reject(new Error('expected host rejection'));
+        }},
+      });
+      assert.equal(result.exitCode, abort ? 124 : 0, result.stderr);
+      assert.equal(calls, abort ? 1 : 64);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    console.log('contained');
+  `;
+  const child = await promisify(execFile)(process.execPath,
+    ['--unhandled-rejections=strict', '--input-type=module', '-e', script], { timeout: 10000 });
+  assert.equal(child.stdout, 'contained\n');
+});

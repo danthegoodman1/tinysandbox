@@ -413,6 +413,99 @@ async fn null_redirect_admission_uses_assigned_variable_values() {
     assert!(sandbox.fs().readdir("/workspace").await.unwrap().is_empty());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn expansion_fields_and_assignment_order_match_bash() {
+    // Compare argv boundaries, not echo output (which hides empty arguments).
+    let sandbox = Sandbox::builder()
+        .command("args", |mut ctx| async move {
+            for arg in &ctx.args {
+                ctx.stdout
+                    .write_all(format!("<{arg}>\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            CommandResult::success()
+        })
+        .build();
+    let mut scripts = vec![
+        "A=one B=$A C=$B; args \"$A\" \"$B\" \"$C\"".to_owned(),
+        "A=old; A=new B=$A args \"$A\" \"$B\"; args \"$A\" \"$B\"".to_owned(),
+        "A=one A=${A}two B=$A; args \"$B\"".to_owned(),
+        "A=before; A=after B=$A | cat; args \"$A\" \"$B\"".to_owned(),
+    ];
+    for value in [
+        "",
+        " ",
+        "a",
+        "a ",
+        " a",
+        " a b ",
+        "\t\na\t\nb\n",
+        "a\u{a0}b",
+        "a\u{2003}b",
+    ] {
+        for word in [
+            "$A",
+            "$A\"\"",
+            "\"\"$A",
+            "x${A}y",
+            "$A$A",
+            "\"$A\"$A",
+            "$A\"$EMPTY\"",
+            "\"$EMPTY\"$A",
+        ] {
+            scripts.push(format!("A='{value}'; args {word}"));
+        }
+    }
+    for script in scripts {
+        let oracle = format!(
+            "args() {{ for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done; }}; {script}"
+        );
+        let reference = std::process::Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &oracle])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("Bash reference");
+        let result = sandbox.exec(&script).await;
+        assert_eq!(
+            result.exit_code,
+            reference.status.code().unwrap(),
+            "{script}"
+        );
+        assert_eq!(result.stdout.as_bytes(), reference.stdout, "{script}");
+    }
+}
+
+#[tokio::test]
+async fn sequential_assignment_amplification_is_rejected_before_side_effects() {
+    for pipeline in [false, true] {
+        let sandbox = Sandbox::builder()
+            .persist_session(true)
+            .limits(
+                Limits::default()
+                    .with_shell_input_bytes(4096)
+                    .with_host_input_bytes(4096),
+            )
+            .build();
+        let assignments = format!("A=x {}", vec!["A=$A$A"; 40].join(" "));
+        let script = if pipeline {
+            format!("echo first > created | {assignments} > later")
+        } else {
+            format!("{assignments} > created")
+        };
+        let result = sandbox.exec(&script).await;
+        assert_eq!(result.exit_code, 125, "{}", result.stderr);
+        assert!(result.stderr.contains("expansion limit"));
+        assert!(result.metrics.commands.is_empty());
+        assert!(result.metrics.pipe_bytes.is_empty());
+        assert!(sandbox.fs().readdir("/workspace").await.unwrap().is_empty());
+        assert_eq!(sandbox.exec("echo \"[$A]\"").await.stdout, "[]\n");
+    }
+}
+
 #[tokio::test]
 async fn the_host_filesystem_facade_enforces_the_configured_limits() {
     // `sandbox.fs()` carries no execution deadline, which used to mean it

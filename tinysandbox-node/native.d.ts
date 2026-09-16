@@ -68,6 +68,8 @@ export declare class SandboxFs {
   readAt(handle: number, offset: number, len: number): Promise<Buffer>
   writeAt(handle: number, offset: number, data: Buffer): Promise<number>
   truncate(handle: number, len: number): Promise<void>
+  /** Releases a host handle without publishing staged writes. */
+  abort(handle: number): Promise<void>
   close(handle: number): Promise<void>
 }
 

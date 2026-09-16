@@ -596,6 +596,17 @@ impl SandboxFs {
             .map_err(|err| napi_vfs_error(err, None))
     }
 
+    /// Releases a host handle without publishing staged writes.
+    #[napi]
+    pub async fn abort(&self, handle: f64) -> Result<()> {
+        let handle = handle_from_js(handle).map_err(|err| napi_vfs_error(err, None))?;
+        self.sandbox
+            .fs()
+            .abort(handle)
+            .await
+            .map_err(|err| napi_vfs_error(err, None))
+    }
+
     #[napi]
     pub async fn close(&self, handle: f64) -> Result<()> {
         let handle = handle_from_js(handle).map_err(|err| napi_vfs_error(err, None))?;
@@ -810,8 +821,10 @@ impl JsVfs {
         ] {
             callbacks.insert(name, vfs_callback(&vfs, name)?);
         }
-        if vfs.has_named_property("stats")? {
-            callbacks.insert("stats", vfs_callback(&vfs, "stats")?);
+        for name in ["stats", "abort"] {
+            if vfs.has_named_property(name)? {
+                callbacks.insert(name, vfs_callback(&vfs, name)?);
+            }
         }
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -959,6 +972,20 @@ impl Vfs for JsVfs {
         .map(drop)
     }
 
+    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
+        if !self.callbacks.contains_key("abort") {
+            return self.close(handle);
+        }
+        self.call(
+            "abort",
+            VfsRequest {
+                handle: Some(handle.raw() as f64),
+                ..VfsRequest::default()
+            },
+        )
+        .map(drop)
+    }
+
     fn stats(&self) -> Option<VfsResult<VfsStats>> {
         let _ = self.callbacks.get("stats")?;
         Some(
@@ -1031,6 +1058,10 @@ impl Vfs for JsVfsHandle {
 
     fn close(&self, handle: FileHandle) -> VfsResult<()> {
         self.inner.close(handle)
+    }
+
+    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
+        self.inner.abort(handle)
     }
 
     fn stats(&self) -> Option<VfsResult<VfsStats>> {

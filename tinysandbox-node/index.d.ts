@@ -283,6 +283,8 @@ export interface JsVfs {
   writeAt(request: VfsRequest): Promise<number | VfsResponse> | number | VfsResponse
   truncate(request: VfsRequest): Promise<VfsResponse | void> | VfsResponse | void
   close(request: VfsRequest): Promise<VfsResponse | void> | VfsResponse | void
+  /** Discard staged writes and consume the handle; defaults to close when omitted. */
+  abort?(request: VfsRequest): Promise<VfsResponse | void> | VfsResponse | void
   stats?(request: VfsRequest): Promise<VfsResponse> | VfsResponse
 }
 

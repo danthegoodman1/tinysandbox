@@ -192,9 +192,11 @@ impl Pools {
                 let worker = std::thread::Builder::new()
                     .name("tinysandbox-fs-cleanup".into())
                     .spawn(move || {
-                        while let Ok(job) =
-                            receiver.lock().unwrap_or_else(|e| e.into_inner()).recv()
-                        {
+                        loop {
+                            // A while-let scrutinee keeps its temporaries alive
+                            // through the body, serializing even unrelated jobs.
+                            let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(job) = next else { break };
                             job();
                         }
                     });
@@ -249,5 +251,54 @@ mod tests {
         finished
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("queued cleanup runs");
+    }
+
+    #[test]
+    fn cleanup_workers_enter_independently_and_retain_their_own_admission() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for workers in [1, 4] {
+            let pools = Pools::new(PoolCapacity::default().with_cleanup_threads(workers));
+            let (entered, entries) = mpsc::channel();
+            let (finished, completions) = mpsc::channel();
+            // Dropping these senders also releases every job on assertion failure.
+            let mut releases = Vec::new();
+            for id in 0..workers {
+                assert!(pools.acquire_file());
+                let owner = Arc::clone(&pools);
+                let entered = entered.clone();
+                let finished = finished.clone();
+                let (release, wait) = mpsc::channel();
+                releases.push(Some(release));
+                pools.spawn_cleanup(Box::new(move || {
+                    let _ = entered.send(id);
+                    let _ = wait.recv();
+                    owner.release_file();
+                    drop(owner);
+                    let _ = finished.send(id);
+                }));
+            }
+            for _ in 0..workers {
+                entries
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("every worker enters before any release");
+            }
+            assert_eq!(pools.open_files(), workers);
+            for (id, release) in releases.iter_mut().enumerate() {
+                release.take().unwrap().send(()).unwrap();
+                assert_eq!(
+                    completions.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    id
+                );
+                assert_eq!(pools.open_files(), workers - id - 1);
+            }
+            let weak = Arc::downgrade(&pools);
+            drop(pools);
+            assert!(
+                weak.upgrade().is_none(),
+                "cleanup does not retain idle pools"
+            );
+        }
     }
 }
