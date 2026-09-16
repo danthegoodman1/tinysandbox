@@ -62,6 +62,7 @@ jobs:
         run: |
           node --test scripts/release-version.test.mjs scripts/release-native-artifacts.test.mjs scripts/write-native-lockfile.test.mjs scripts/verify-glibc-baseline.test.mjs
           node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --bump current)"
+          node scripts/release-version.mjs check "$(node scripts/release-version.mjs next --package portable --bump current)" --package portable
       - run: cargo fmt --all --check
       # The rest of this job builds the workspace with all features, so the
       # steps share one target directory. The core feature-set runs compile a

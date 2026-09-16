@@ -19,23 +19,33 @@ const npmPackages = [
   ...nativeNpmPackages
 ]
 const npmLockfiles = ["tinysandbox-node/package-lock.json"]
+const portableManifest = "tinysandbox-js-runtime/package.json"
+const portableLockfile = "tinysandbox-js-runtime/package-lock.json"
+const portablePackageName = "@tinysandbox/js-runtime"
 
 export function run(args, options = {}) {
   const repoRoot = options.repoRoot ?? defaultRepoRoot
   const stdout = options.stdout ?? console.log
   const [command, ...commandArgs] = args
+  const packageKind = readOption(commandArgs, "--package") ?? "native"
+  if (!["native", "portable"].includes(packageKind)) {
+    fail(`unsupported release package ${packageKind}`)
+  }
+  const versioning = packageKind === "portable"
+    ? { read: readPortableVersion, apply: applyPortableVersion, check: checkPortableVersion }
+    : { read: readCurrentVersion, apply: applyVersion, check: checkVersion }
 
   if (command === "next") {
     const explicitBump = readOption(commandArgs, "--bump")
     const message = readOption(commandArgs, "--message") ?? ""
-    const currentVersion = readCurrentVersion(repoRoot)
+    const currentVersion = versioning.read(repoRoot)
     stdout(nextVersion(currentVersion, releaseBump(explicitBump, message, currentVersion)))
   } else if (command === "apply") {
-    applyVersion(requiredVersionArg(command, commandArgs), repoRoot)
+    versioning.apply(requiredVersionArg(command, commandArgs), repoRoot)
   } else if (command === "check") {
-    checkVersion(requiredVersionArg(command, commandArgs), repoRoot)
+    versioning.check(requiredVersionArg(command, commandArgs), repoRoot)
   } else {
-    fail("usage: release-version.mjs next [--bump current|patch|minor|major] [--message text] | apply <version> | check <version>")
+    fail("usage: release-version.mjs next [--bump current|patch|minor|major] [--message text] | apply <version> | check <version> [--package native|portable]")
   }
 }
 
@@ -43,6 +53,51 @@ export function readCurrentVersion(repoRoot = defaultRepoRoot) {
   const rootVersion = readRustPackageVersion(repoRoot, "Cargo.toml", "tinysandbox")
   checkVersion(rootVersion, repoRoot)
   return rootVersion
+}
+
+export function readPortableVersion(repoRoot = defaultRepoRoot) {
+  const { manifest } = readPortableManifests(repoRoot)
+  checkPortableVersion(manifest.version, repoRoot)
+  return manifest.version
+}
+
+export function applyPortableVersion(version, repoRoot = defaultRepoRoot) {
+  parseVersion(version)
+  const { manifest, lockfile } = readPortableManifests(repoRoot)
+  manifest.version = version
+  lockfile.version = version
+  lockfile.packages[""].version = version
+  writeJson(repoRoot, portableManifest, manifest)
+  writeJson(repoRoot, portableLockfile, lockfile)
+}
+
+export function checkPortableVersion(version, repoRoot = defaultRepoRoot) {
+  parseVersion(version)
+  const { manifest, lockfile } = readPortableManifests(repoRoot)
+  for (const [path, value] of [
+    [portableManifest, manifest],
+    [portableLockfile, lockfile],
+    [`${portableLockfile} root package`, lockfile.packages[""]]
+  ]) {
+    if (value.version !== version) {
+      fail(`${path} version is ${value.version}, expected ${version}`)
+    }
+  }
+}
+
+function readPortableManifests(repoRoot) {
+  const manifest = readJson(repoRoot, portableManifest)
+  const lockfile = readJson(repoRoot, portableLockfile)
+  for (const [path, value] of [
+    [portableManifest, manifest],
+    [portableLockfile, lockfile],
+    [`${portableLockfile} root package`, lockfile.packages?.[""]]
+  ]) {
+    if (value?.name !== portablePackageName) {
+      fail(`${path} must describe ${portablePackageName}`)
+    }
+  }
+  return { manifest, lockfile }
 }
 
 export function releaseBump(explicitBump, message, currentVersion = "0.0.0") {
