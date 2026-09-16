@@ -16,6 +16,10 @@ use super::fs::STREAM_CHUNK_BYTES;
 use super::jq_protocol::{JqInputSource, JqOptions, JqRequest};
 use crate::wasm::EPOCH_TICK;
 pub(crate) const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const JQ_WASM: &[u8] = include_bytes!("../../assets/jq.wasm");
+/// Machine code for [`JQ_WASM`], produced by `build.rs` for this target.
+#[cfg(jq_precompiled)]
+const JQ_CWASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jq.cwasm"));
 
 pub(crate) enum JqStreamMessage {
     Stdout(Vec<u8>),
@@ -41,19 +45,15 @@ fn compiled_runtime() -> wasmtime::Result<&'static CompiledRuntime> {
         .map_err(|err| wasmtime::Error::msg(err.to_string()))
 }
 
+/// Loads the module, preferring the build script's trusted artifact.
 fn load_module(engine: &Engine) -> wasmtime::Result<Module> {
     #[cfg(jq_precompiled)]
     #[allow(unsafe_code)]
     // SAFETY: only our build script's artifact from the fixed jq guest is embedded.
-    if let Ok(module) = unsafe {
-        Module::deserialize(
-            engine,
-            include_bytes!(concat!(env!("OUT_DIR"), "/jq.cwasm")),
-        )
-    } {
+    if let Ok(module) = unsafe { Module::deserialize(engine, JQ_CWASM) } {
         return Ok(module);
     }
-    Module::new(engine, include_bytes!("../../assets/jq.wasm"))
+    Module::new(engine, JQ_WASM)
 }
 
 struct State {
@@ -143,6 +143,9 @@ pub(crate) fn run(
             &io_runtime,
         );
     }
+    // Delivery is bounded by the same deadline as the output, so a consumer that
+    // stalls past it never sees this. The caller reads that silence as the
+    // cancellation it is.
     let _ = send(
         &output,
         JqStreamMessage::Done(result),
@@ -207,10 +210,14 @@ fn run_inner(
     })();
     let state = store.data();
     let (exit_code, error) = match result {
-        _ if state.checkpoint().is_err() => (124, None),
-        Err(_) if state.memory_exceeded => (5, Some("jq: memory limit exceeded\n".into())),
+        // A run that reached its own end keeps the code it produced. Testing the
+        // clock first reported a timeout for evaluations that had already
+        // emitted every value, purely because the deadline passed while the host
+        // tidied up afterwards.
         Ok(code) => (code, None),
+        Err(_) if state.memory_exceeded => (5, Some("jq: memory limit exceeded\n".into())),
         Err(err) if matches!(err.downcast_ref::<Trap>(), Some(Trap::Interrupt)) => (124, None),
+        Err(_) if state.checkpoint().is_err() => (124, None),
         Err(err) => (5, Some(format!("jq: guest execution failed: {err}\n"))),
     };
     Ok((
@@ -392,6 +399,19 @@ mod tests {
     use super::super::jq_protocol::parse_jq_args;
     use super::*;
     use std::time::Duration;
+
+    #[cfg(jq_precompiled)]
+    #[test]
+    fn embedded_artifact_matches_the_runtime_engine() {
+        // Check compatibility directly so a silent runtime compile fallback
+        // cannot hide a build/runtime configuration mismatch. Falling back means
+        // compiling the guest inside the first jq of the process, with every
+        // other worker blocked behind it.
+        #[allow(unsafe_code)]
+        // SAFETY: the artifact is the fixed build output embedded in this crate.
+        unsafe { Module::deserialize(crate::wasm::engine().unwrap(), JQ_CWASM) }
+            .expect("embedded jq artifact is compatible");
+    }
 
     #[tokio::test]
     async fn cancellation_interrupts_an_entered_guest_and_releases_its_worker() {

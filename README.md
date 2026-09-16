@@ -1202,6 +1202,10 @@ are not rolled back. Cancellation releases handles and aborts staged S3 writes;
 slow cleanup can outlive the result. Custom backends should override `Vfs::abort`
 when closing would publish staged data; the default delegates to `close`.
 
+A `js` script that reaches its own end closes the descriptors it left open,
+whatever exit status it chose, matching a descriptor it closed itself. Only a
+run the sandbox cut short aborts them.
+
 Trusted host callbacks can opt into cooperative cancellation with Rust
 `js_global_with_context` and `fetch_with_context`; existing one-argument
 callbacks remain supported. `HostContext` exposes the monotonic deadline,

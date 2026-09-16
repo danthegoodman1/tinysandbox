@@ -696,6 +696,19 @@ test('disabled commands are absent from execution and bin', async () => {
   assert.doesNotMatch((await sandbox.exec('ls /bin')).stdout, /\bjq\b|\bcd\b/)
 })
 
+test('disabling a command that does not exist is an error, not a silent pass', async () => {
+  // Removal is a no-op for an unknown name, so accepting one left the
+  // capability enabled while reporting success.
+  assert.throws(() => new Sandbox({ disabledCommands: ['JQ'] }), /no such command: JQ/)
+  assert.throws(() => new Sandbox({ disabledCommands: ['jq', 'nope'] }), /no such command: nope/)
+  // A name listed twice is still a real command, not an unknown one.
+  const twice = new Sandbox({ disabledCommands: ['jq', 'jq'] })
+  assert.equal((await twice.exec("jq -n '1'")).exitCode, 127)
+  // Custom commands register before removal, so they can be disabled too.
+  const custom = new Sandbox({ commands: { greet: () => ({ stdout: 'hi' }) }, disabledCommands: ['greet'] })
+  assert.equal((await custom.exec('greet')).exitCode, 127)
+})
+
 test('host descriptors survive distinct fs facade calls and large reads fail before allocation', async () => {
   const sandbox = new Sandbox()
   await sandbox.fs.writeFile('/workspace/f', Buffer.from('abcdef'))

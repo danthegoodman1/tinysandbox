@@ -132,8 +132,9 @@ paths resolve from `cwd`.
 The exported `Vfs` interface is deliberately small and synchronous: `stat`,
 `readdir`, `mkdir`, `rename`, `unlink`, `rmdir`, `open`, `readAt`, `writeAt`,
 `truncate`, and `close`, plus optional `abort` for discarding staged writes.
-Successful runs close any remaining descriptors; failed or timed-out runs call
-`abort` when supplied, otherwise `close`. Handles must continue to refer to the
+A run that reaches its own end closes any remaining descriptors, whatever exit
+status the script chose; a run the host cut short — a timeout, an abort signal,
+or an exhausted output limit — calls `abort` when supplied, otherwise `close`. Handles must continue to refer to the
 same file after its original path is renamed, unlinked, or reused.
 Paths delivered to it are normalized absolute paths;
 handles and offsets are non-negative safe integers, and positional operations

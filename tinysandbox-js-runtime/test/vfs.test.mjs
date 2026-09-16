@@ -204,8 +204,15 @@ fs.closeSync(fd);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("teardown finishes success and aborts failed or timed out staged handles", async () => {
-  for (const [ending, expected] of [["", 0], ["process.exit(7)", 7], ["throw new Error('stop')", 1], ["while (true) {}", 124]]) {
+test("teardown finishes the runs that ended and aborts the ones cut short", async () => {
+  // A script picks its own exit status; reaching the end of it is what makes
+  // the writes real. Only the host ending a run early rolls them back.
+  for (const [ending, expected, commits] of [
+    ["", 0, true],
+    ["process.exit(7)", 7, true],
+    ["throw new Error('stop')", 1, true],
+    ["while (true) {}", 124, false],
+  ]) {
     const vfs = new TestVfs({ "/file": "data" });
     let finished = 0, aborted = 0;
     const close = vfs.close.bind(vfs);
@@ -214,9 +221,89 @@ test("teardown finishes success and aborts failed or timed out staged handles", 
     const result = await engine.runCode(`require('fs').openSync('/file', 'r'); ${ending}`, { vfs, timeoutMs: 100 });
     assert.equal(result.exitCode, expected, result.stderr);
     assert.equal(vfs.handles.size, 0);
-    assert.equal(finished, expected === 0 ? 1 : 0);
-    assert.equal(aborted, expected === 0 ? 0 : 1);
+    assert.equal(finished, commits ? 1 : 0, ending);
+    assert.equal(aborted, commits ? 0 : 1, ending);
   }
+});
+
+test("a nonzero exit keeps the writes a run left to teardown", async () => {
+  // The same script committing or discarding its output depending on the status
+  // it chose split one run's writes: an explicitly closed descriptor committed
+  // either way, one left open did not.
+  class StagingVfs extends TestVfs {
+    constructor(files) { super(files); this.staged = new Map(); this.committed = []; this.discarded = []; }
+    open(path, mode) { const handle = super.open(path, mode); if (mode.write) this.staged.set(handle, path); return handle; }
+    close(handle) { const path = this.staged.get(handle); if (path) { this.committed.push(path); this.staged.delete(handle); } return super.close(handle); }
+    abort(handle) { const path = this.staged.get(handle); if (path) { this.discarded.push(path); this.staged.delete(handle); this.nodes.delete(path); } return super.close(handle); }
+  }
+
+  const write = "const fs = require('fs'); const fd = fs.openSync('/log.txt', 'w'); fs.writeSync(fd, 'important', 0);";
+  const left = new StagingVfs({});
+  const result = await engine.runCode(`${write} process.exit(3);`, { vfs: left });
+  assert.equal(result.exitCode, 3, result.stderr);
+  assert.deepEqual(left.committed, ["/log.txt"]);
+  assert.deepEqual(left.discarded, []);
+
+  const closed = new StagingVfs({});
+  await engine.runCode(`${write} fs.closeSync(fd); process.exit(3);`, { vfs: closed });
+  assert.deepEqual(closed.committed, ["/log.txt"], "closing explicitly commits the same way");
+
+  const cancelled = new StagingVfs({});
+  const stopped = await engine.runCode(`${write} while (true) {}`, { vfs: cancelled, timeoutMs: 50 });
+  assert.equal(stopped.exitCode, 124);
+  assert.deepEqual(cancelled.discarded, ["/log.txt"], "a run the host cut short still rolls back");
+});
+
+test("a host response the guest recovered from does not roll back its writes", async () => {
+  // hostResponseBytes here is below the E2BIG notice the runtime falls back to,
+  // so the oversized readdir fails twice before a shorter message fits. The
+  // guest catches that, finishes, and exits 0: nothing was cut short.
+  class StagingVfs extends TestVfs {
+    constructor(files) { super(files); this.staged = new Map(); this.committed = []; this.discarded = []; }
+    open(path, mode) { const handle = super.open(path, mode); if (mode.write) this.staged.set(handle, path); return handle; }
+    close(handle) { const path = this.staged.get(handle); if (path) { this.committed.push(path); this.staged.delete(handle); } return super.close(handle); }
+    abort(handle) { const path = this.staged.get(handle); if (path) { this.discarded.push(path); this.staged.delete(handle); this.nodes.delete(path); } return super.close(handle); }
+  }
+
+  const files = {};
+  for (let index = 0; index < 40; index++) files[`/big/entry-with-a-long-name-${index}.txt`] = "x";
+  const vfs = new StagingVfs(files);
+  const result = await engine.runCode(
+    `const fs = require('fs');
+     const fd = fs.openSync('/log.txt', 'w');
+     fs.writeSync(fd, 'important', 0);
+     try { fs.readdirSync('/big'); } catch { console.log('caught'); }
+     console.log('done');`,
+    { vfs, hostResponseBytes: 64 }
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "caught\ndone\n");
+  assert.deepEqual(vfs.committed, ["/log.txt"]);
+  assert.deepEqual(vfs.discarded, []);
+});
+
+test("a guest cannot spend host time zero-filling buffers it never fills", async () => {
+  // The read length is the guest's to choose and the file's size does not bound
+  // it, so a per-call allocation turned a 1-byte file into megabytes of churn.
+  const measure = async (length) => {
+    const vfs = new TestVfs({ "/file": "a" });
+    const started = process.hrtime.bigint();
+    const result = await engine.runCode(
+      `const fs = require('fs');
+       const buffer = Buffer.alloc(${length});
+       const fd = fs.openSync('/file', 'r');
+       for (let index = 0; index < 2000; index++) fs.readSync(fd, buffer, 0, ${length}, 0);
+       fs.closeSync(fd);`,
+      { vfs, timeoutMs: 120000 }
+    );
+    assert.equal(result.exitCode, 0, result.stderr);
+    return Number(process.hrtime.bigint() - started) / 1e6;
+  };
+
+  const small = await measure(1);
+  const large = await measure(1_000_000);
+  assert.ok(large < small * 2 + 200, `large requests cost ${large.toFixed(0)}ms against ${small.toFixed(0)}ms for small ones`);
 });
 
 test("teardown reports close failures and still releases every descriptor", async () => {

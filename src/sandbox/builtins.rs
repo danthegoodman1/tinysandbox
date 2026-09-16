@@ -463,6 +463,12 @@ fn jq_cmd(ctx: CommandContext) -> CommandFuture {
             }
         }
 
+        // The worker bounds its terminal message by the same deadline as its
+        // output, so a consumer still writing when that deadline passes can lose
+        // the result rather than the worker failing. That is a timeout.
+        if Instant::now() >= deadline || fs.checkpoint().await.is_err() {
+            return CommandResult::new(124);
+        }
         CommandResult::failure()
     })
 }
@@ -793,7 +799,8 @@ fn grep(ctx: CommandContext) -> CommandFuture {
             while let Some(input) = inputs.next(&fs).await {
                 let path = match input {
                     Ok(path) => path,
-                    Err((path, err)) => {
+                    Err(GrepInputError::Cancelled) => return CommandResult::new(124),
+                    Err(GrepInputError::Failed(path, err)) => {
                         had_error = true;
                         write_vfs_error(&mut stderr, "grep", &path, err).await;
                         continue;
@@ -902,7 +909,7 @@ fn sort(ctx: CommandContext) -> CommandFuture {
         .await
         {
             Ok(input) => input,
-            Err(()) => return CommandResult::new(2),
+            Err(code) => return CommandResult::new(code),
         };
         if fs.checkpoint().await.is_err() {
             return CommandResult::new(124);
@@ -1882,6 +1889,12 @@ async fn remove_path(fs: &Fs, path: &str, recursive: bool) -> Result<(), VfsErro
     Ok(())
 }
 
+/// Why the next input never arrived: the path failed, or the execution stopped.
+enum GrepInputError {
+    Failed(String, VfsError),
+    Cancelled,
+}
+
 // Discover the next file only when grep is ready to consume it. Retaining an
 // eager list of every path made a wide tree an unnecessary working-memory cost.
 struct GrepInputs {
@@ -1899,7 +1912,7 @@ impl GrepInputs {
         }
     }
 
-    async fn next(&mut self, fs: &Fs) -> Option<Result<String, (String, VfsError)>> {
+    async fn next(&mut self, fs: &Fs) -> Option<Result<String, GrepInputError>> {
         loop {
             let path = if let Some((parent, entries)) = self.directories.last_mut() {
                 match entries.next() {
@@ -1912,24 +1925,24 @@ impl GrepInputs {
             } else {
                 self.roots.next()?
             };
-            if let Err(err) = fs.checkpoint().await {
+            if fs.checkpoint().await.is_err() {
                 self.roots = Vec::new().into_iter();
                 self.directories.clear();
-                return Some(Err((path, err)));
+                return Some(Err(GrepInputError::Cancelled));
             }
             if path == "-" {
                 return Some(Ok(path));
             }
             let metadata = match fs.stat(&path).await {
                 Ok(metadata) => metadata,
-                Err(err) => return Some(Err((path, err))),
+                Err(err) => return Some(Err(GrepInputError::Failed(path, err))),
             };
             if !self.recursive || metadata.file_type != FileType::Directory {
                 return Some(Ok(path));
             }
             match fs.readdir(&path).await {
                 Ok(entries) => self.directories.push((path, entries.into_iter())),
-                Err(err) => return Some(Err((path, err))),
+                Err(err) => return Some(Err(GrepInputError::Failed(path, err))),
             }
         }
     }
@@ -1974,6 +1987,7 @@ async fn grep_reader(
     Ok(matched > 0)
 }
 
+/// Reads every input, or reports the failure and yields the exit code to use.
 async fn read_inputs(
     fs: &Fs,
     files: &[String],
@@ -1981,7 +1995,7 @@ async fn read_inputs(
     limit: usize,
     cmd: &str,
     stderr: &mut BoxAsyncWrite,
-) -> Result<Vec<u8>, ()> {
+) -> Result<Vec<u8>, i32> {
     let mut input = Vec::new();
     let default_files = ["-".to_owned()];
     for file in if files.is_empty() {
@@ -1998,6 +2012,12 @@ async fn read_inputs(
             }
         };
         if let Err(err) = result {
+            // Cancellation surfaces here as a plain I/O error, and reporting it
+            // as one named a file that was never the problem. Every other
+            // checkpoint in this file answers a stopped execution with 124.
+            if fs.is_cancelled() {
+                return Err(124);
+            }
             if err.kind() == io::ErrorKind::InvalidData {
                 let _ = stderr
                     .write_all(format!("{cmd}: input too large for tinysandbox {cmd}\n").as_bytes())
@@ -2005,7 +2025,7 @@ async fn read_inputs(
             } else {
                 report_stream_error(stderr, cmd, file, err).await;
             }
-            return Err(());
+            return Err(2);
         }
     }
     Ok(input)
@@ -2590,6 +2610,59 @@ impl std::ops::AddAssign for Counts {
 #[cfg(test)]
 mod tests {
     use super::basename;
+
+    /// A filesystem whose execution has already run out of wall time.
+    fn stopped_fs() -> super::Fs {
+        use super::Fs;
+        use crate::sandbox::control::ExecutionControl;
+        use crate::sandbox::pools::{PoolCapacity, Pools};
+        use crate::sandbox::{Arc, Limits};
+        use crate::vfs::InMemoryVfs;
+        use std::collections::BTreeSet;
+        use std::time::Duration;
+
+        Fs::scoped(
+            Arc::new(InMemoryVfs::default()),
+            Arc::new(BTreeSet::new()),
+            "/".to_owned(),
+            ExecutionControl::new(Limits {
+                wall_time: Duration::ZERO,
+                ..Limits::default()
+            }),
+            Pools::new(PoolCapacity::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn reading_inputs_answers_a_stopped_execution_with_a_timeout() {
+        // Cancellation reaches this path as a plain I/O error. Reporting it as
+        // one printed "Input/output error" against a file that read fine and
+        // exited 2, where every other checkpoint in this file returns 124.
+        use super::{BoxAsyncRead, BoxAsyncWrite, read_inputs};
+
+        let fs = stopped_fs();
+        let mut stdin: BoxAsyncRead = Box::pin(tokio::io::empty());
+        let mut stderr: BoxAsyncWrite = Box::pin(tokio::io::sink());
+        let files = ["/input.txt".to_owned()];
+        let result = read_inputs(&fs, &files, &mut stdin, 1024, "sort", &mut stderr).await;
+        assert_eq!(result.err(), Some(124));
+    }
+
+    #[tokio::test]
+    async fn walking_grep_inputs_answers_a_stopped_execution_with_cancellation() {
+        use super::{GrepInputError, GrepInputs};
+
+        let fs = stopped_fs();
+        let mut inputs = GrepInputs::new(vec!["/tree".to_owned()], true);
+        assert!(matches!(
+            inputs.next(&fs).await,
+            Some(Err(GrepInputError::Cancelled))
+        ));
+        assert!(
+            inputs.next(&fs).await.is_none(),
+            "a stopped walk yields nothing further"
+        );
+    }
 
     #[tokio::test]
     async fn jq_waiting_for_worker_admission_obeys_exec_deadline() {
