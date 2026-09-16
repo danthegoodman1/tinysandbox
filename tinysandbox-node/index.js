@@ -162,31 +162,20 @@ function callbackContext(native) {
 }
 
 function wrapVfs(vfs) {
-  return Object.fromEntries(
-    vfsOperations.map((name) => [
-      name,
-      async (request) => {
-        try {
-          return normalizeVfsResponse(name, await vfs[name](request))
-        } catch (err) {
-          return { error: errorPayload(err) }
-        }
+  const operations = [...vfsOperations, ...['stats', 'abort'].filter((name) => typeof vfs[name] === 'function')]
+  if (vfs.abort !== undefined && typeof vfs.abort !== 'function') {
+    throw new TypeError('vfs.abort must be a function when supplied')
+  }
+  return Object.fromEntries(operations.map((name) => [
+    name,
+    async (request) => {
+      try {
+        return normalizeVfsResponse(name, await vfs[name](request))
+      } catch (err) {
+        return { error: errorPayload(err) }
       }
-    ]).concat(
-      typeof vfs.stats === 'function'
-        ? [[
-            'stats',
-            async (request) => {
-              try {
-                return normalizeVfsResponse('stats', await vfs.stats(request))
-              } catch (err) {
-                return { error: errorPayload(err) }
-              }
-            }
-          ]]
-        : []
-    )
-  )
+    }
+  ]))
 }
 
 function normalizeJsonValue(value) {
@@ -389,6 +378,10 @@ class SandboxFs {
 
   close(handle) {
     return decorateFsPromise(this.inner.close(handle))
+  }
+
+  abort(handle) {
+    return decorateFsPromise(this.inner.abort(handle))
   }
 }
 

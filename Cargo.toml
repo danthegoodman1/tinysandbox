@@ -12,7 +12,7 @@ repository = "https://github.com/danthegoodman1/tinysandbox"
 readme = "README.md"
 keywords = ["sandbox", "agent", "shell", "vfs", "quickjs"]
 categories = ["virtualization", "filesystem", "development-tools"]
-exclude = ["PLAN.md", "original-plan.md", ".github/", ".vscode/", "scripts/release-version*.mjs", "tinysandbox-node/"]
+exclude = [".github/", ".vscode/", "scripts/release-version*.mjs", "tinysandbox-node/"]
 
 [dependencies]
 aws-sdk-s3 = { version = "1.140.0", optional = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "rustls"] }

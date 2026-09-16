@@ -313,6 +313,8 @@ pub trait Vfs: Send + Sync {
     /// offset. Non-empty writes whose `offset + data.len()` overflows the
     /// implementation's addressable range must fail with `EINVAL`; writes that
     /// fit the address range but exceed quota must fail with `ENOSPC`.
+    /// A handle with a terminal staged-I/O failure reports that error instead,
+    /// including for an empty write.
     fn write_at(&self, handle: FileHandle, offset: u64, data: &[u8]) -> VfsResult<usize>;
 
     /// Changes the length of a file opened for writing.
@@ -322,11 +324,14 @@ pub trait Vfs: Send + Sync {
     /// `truncate(handle, u64::MAX)` to `ENOSPC`.
     fn truncate(&self, handle: FileHandle, len: u64) -> VfsResult<()>;
 
-    /// Closes a file handle.
+    /// Closes a file handle, publishing staged writes when supported.
+    /// The handle is consumed even if publishing fails; callers must not retry
+    /// close on the same handle.
     fn close(&self, handle: FileHandle) -> VfsResult<()>;
 
     /// Releases a handle without publishing staged writes. The default closes it;
     /// nontransactional backends do not roll back writes already performed.
+    /// Like close, abort consumes the handle even when cleanup reports an error.
     fn abort(&self, handle: FileHandle) -> VfsResult<()> {
         self.close(handle)
     }

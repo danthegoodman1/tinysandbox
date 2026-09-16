@@ -742,3 +742,48 @@ test('shared pools bound sandboxes together and separate pools keep them apart',
 
   assert.throws(() => new Sandbox({ pools: {} }), /Pools instance/)
 })
+
+test('custom VFS abort survives every adapter and host handle operations', { timeout: 10000 }, async () => {
+  for (const ending of ['', 'process.exit(7)', 'throw new Error("guest")', 'while(true){}']) {
+    const vfs = createMemoryVfs();
+    let closed = 0, aborted = 0;
+    const close = vfs.close.bind(vfs);
+    let notifyCleaned;
+    const cleaned = new Promise(resolve => { notifyCleaned = resolve; });
+    vfs.close = async (request) => { closed++; await close(request); notifyCleaned(); };
+    vfs.abort = async (request) => { aborted++; await close(request); notifyCleaned(); };
+    const sandbox = new Sandbox({ mounts: { disk: { type: 'custom', vfs } }, limits: { wallTimeMs: 1000 } });
+    const result = await sandbox.exec(`js -e 'const fs=require("fs");const fd=fs.openSync("/disk/out","w");fs.writeSync(fd,Buffer.from("data"));${ending}'`);
+    await cleaned;
+    const cancelled = ending === 'while(true){}';
+    assert.equal(result.exitCode, cancelled ? 124 : ending === '' ? 0 : ending.startsWith('process') ? 7 : 1, result.stderr);
+    assert.equal(closed, cancelled ? 0 : 1);
+    assert.equal(aborted, cancelled ? 1 : 0);
+  }
+
+  const vfs = createMemoryVfs();
+  let aborted = 0;
+  const close = vfs.close.bind(vfs);
+  vfs.abort = async (request) => { aborted++; return close(request); };
+  const sandbox = new Sandbox({ mounts: { disk: { type: 'custom', vfs } } });
+  const handle = await sandbox.fs.open('/disk/file', { write: true, create: true });
+  await sandbox.fs.abort(handle);
+  assert.equal(aborted, 1);
+  await assert.rejects(sandbox.fs.close(handle), { code: 'EBADF' });
+  await assert.rejects(sandbox.fs.abort(handle), { code: 'EBADF' });
+  const legacy = new Sandbox({ mounts: { disk: { type: 'custom', vfs: createMemoryVfs() } } });
+  await legacy.fs.abort(await legacy.fs.open('/disk/file', { write: true, create: true }));
+});
+
+test('failed whole-file writes abort a custom VFS instead of closing it', async () => {
+  const vfs = createMemoryVfs();
+  let closed = 0, aborted = 0;
+  const close = vfs.close.bind(vfs);
+  vfs.close = async (request) => { closed++; return close(request); };
+  vfs.abort = async (request) => { aborted++; return close(request); };
+  vfs.writeAt = () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); };
+  const sandbox = new Sandbox({ mounts: { disk: { type: 'custom', vfs } } });
+  await assert.rejects(sandbox.fs.writeFile('/disk/file', Buffer.from('partial')), { code: 'ENOSPC' });
+  assert.equal(aborted, 1);
+  assert.equal(closed, 0);
+});

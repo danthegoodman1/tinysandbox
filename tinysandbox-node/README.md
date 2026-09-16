@@ -105,6 +105,14 @@ than edited. `readOnly` refuses every mutation with `EACCES`, `directoryRename`
 governs the copy-and-delete walk that renames a directory, and
 `conditionalWrites` guards writes against concurrent replacement.
 
+A failed streaming write discards its staging and attempts to abort its multipart
+upload. Further writes, truncates, and close report the original error; close
+still consumes the handle. Guest teardown cannot publish a partial replacement
+after a caught write failure. `sandbox.fs.abort(handle)` explicitly discards
+staged writes. Custom JavaScript VFS adapters can implement `abort({ handle })`;
+adapters without it fall back to `close`. Memory and local filesystems retain
+writes already performed.
+
 There is no object cache, quota/stat accounting, snapshot support, or version
 browsing. Grant `s3:GetObject` plus prefix-restricted `s3:ListBucket` for
 reads, adding `s3:PutObject`, `s3:DeleteObject`, and `s3:AbortMultipartUpload`

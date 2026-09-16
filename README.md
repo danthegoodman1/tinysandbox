@@ -879,8 +879,8 @@ supported.
 S3 has no partial-object update, so a writable handle stages its contents and
 lands them as one object operation when the handle closes. Writes become
 visible to other handles and other readers at that point, not before, and
-`close` is the call that reports a write failure. Two handles open on one path
-stage independently, so the last close wins.
+`close` reports publication failures. Two handles open on one path stage
+independently, subject to the write preconditions below.
 
 How a handle stages depends on whether it needs the object's existing bytes:
 
@@ -898,6 +898,12 @@ capped: it uploads 8 MiB parts and frees them as it goes, so a new object of
 any size costs bounded memory. Seeking back below what a stream has already
 uploaded also reports `EFBIG`, since those bytes are no longer in memory.
 
+If staging or uploading a stream fails, the handle becomes terminal: later
+writes, truncates, and close report the first error. Its staged bytes are
+discarded and any multipart upload is aborted on a best-effort basis. Close
+consumes the handle even on failure. Catching a write error in a guest cannot
+make teardown publish a partial replacement; the original object stays intact.
+
 Handles that never write cost nothing extra: `touch` on an existing object and
 a read-write open that is only read never download or replace it.
 
@@ -911,6 +917,9 @@ S3 has no atomic directory rename. Renaming a directory copies and then deletes
 every key beneath it: two requests per key, and an interrupted rename leaves
 keys under both prefixes. Set `directory_rename` to false to reject it with
 `EXDEV` instead.
+The complete destination subtree is checked against the backend's 256-component
+depth ceiling before any copy or delete. Metadata lookups use bounded directory
+probes; only `readdir` and recursive mutations enumerate directory contents.
 
 Read-only mounts stay available through `S3VfsConfig::read_only()`, which
 refuses every write and path mutation with `EACCES` before issuing a request.
@@ -1201,6 +1210,8 @@ already-running trusted VFS operations or callbacks may finish and their effects
 are not rolled back. Cancellation releases handles and aborts staged S3 writes;
 slow cleanup can outlive the result. Custom backends should override `Vfs::abort`
 when closing would publish staged data; the default delegates to `close`.
+Native Node custom VFS adapters can supply `abort({ handle })` for the same
+purpose. Host callers can explicitly discard a handle with `sandbox.fs.abort()`.
 
 A `js` script that reaches its own end closes the descriptors it left open,
 whatever exit status it chose, matching a descriptor it closed itself. Only a
@@ -1228,7 +1239,9 @@ and assignment-only stages), and 1,024 simultaneously open files. `sort` and
 against the larger of `shell_input_bytes` and `host_input_bytes`, including
 retained environment copies and field storage, before opening any redirects.
 Normalized paths have a hard depth
-ceiling of 256, which `max_path_depth` can lower per exec. Host `sandbox.fs()`
+ceiling of 256, which `max_path_depth` can lower per exec. Built-in backends also
+reject directory moves that would put descendants beyond their depth ceiling,
+measured relative to the backend root. Host `sandbox.fs()`
 operations use the default whole-file and per-I/O caps; stream large files with
 handles. Raw reads/writes allow at least one 64 KiB stream chunk even under a
 smaller whole-file cap.

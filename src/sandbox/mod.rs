@@ -22,6 +22,7 @@
 mod builtins;
 pub mod command;
 mod control;
+mod expansion;
 pub mod fs;
 #[cfg(feature = "js")]
 pub mod host;
@@ -43,6 +44,7 @@ use std::time::{Duration, Instant};
 
 pub use control::HostContext;
 use control::{ExecutionControl, ExecutionGuard};
+use expansion::{Budget, ExpandedCommand};
 use fs::{Fs, STREAM_CHUNK_BYTES, errno_message, normalize_absolute};
 pub use pools::{PoolCapacity, Pools};
 use tokio::io::{AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -50,7 +52,7 @@ use tokio::{task, time};
 
 use crate::shell::{
     self, AndOrList, AndOrOp, Command as AstCommand, Pipeline, Redirect, RedirectOp,
-    RedirectTarget, Segment, SimpleCommand, Word,
+    RedirectTarget, SimpleCommand,
 };
 use crate::vfs::mount::validate_mount_name;
 use crate::vfs::{Errno, FileType, InMemoryVfs, Metadata, MountedVfs, Vfs, VfsError, VfsStats};
@@ -465,43 +467,39 @@ impl Sandbox {
             return 125;
         }
 
-        // Admit the entire pipeline before allocating expanded argv, opening
-        // redirects, or creating pipes. Include field-vector storage as well as
-        // payload bytes so whitespace expansion cannot bypass the budget.
-        let mut expansion_remaining = self
-            .limits
-            .shell_input_bytes
-            .max(self.limits.host_input_bytes);
+        // Expand every stage under one budget before opening any redirects or
+        // pipes. Execution consumes these values without expanding them again.
+        let mut budget = Budget(
+            self.limits
+                .shell_input_bytes
+                .max(self.limits.host_input_bytes),
+        );
+        let mut expanded = Vec::new();
         for command in &pipeline.commands {
             task::yield_now().await;
             if exec.control.is_cancelled() {
                 return 124;
             }
             let AstCommand::Simple(simple) = command;
-            if let Some(cost) =
-                expansion_cost(simple, &session.env, exec.last_status, expansion_remaining)
-            {
-                expansion_remaining -= cost;
-            } else {
+            let Some(command) = budget.expand(simple, &session.env, exec.last_status) else {
                 exec.write_stderr(b"tinysandbox: shell expansion limit exceeded\n");
                 exec.limit_hit = true;
                 return 125;
-            }
+            };
+            expanded.push(command);
         }
-
-        if pipeline.commands.len() == 1 {
-            let AstCommand::Simple(simple) = &pipeline.commands[0];
-            return self.exec_single_simple(simple, session, exec).await;
+        if expanded.len() == 1 {
+            return self
+                .exec_single_simple(expanded.pop().expect("one command"), session, exec)
+                .await;
         }
-
         let mut stages = Vec::new();
-        for command in &pipeline.commands {
+        for command in expanded {
             task::yield_now().await;
             if exec.control.is_cancelled() {
                 return 124;
             }
-            let AstCommand::Simple(simple) = command;
-            stages.push(self.prepare_stage(simple, session, exec).await);
+            stages.push(self.prepare_stage(command, session, exec).await);
         }
         exec.command_count += stages.len();
         self.run_pipeline_stages(stages, exec).await
@@ -509,7 +507,7 @@ impl Sandbox {
 
     async fn exec_single_simple(
         &self,
-        simple: &SimpleCommand,
+        expanded: ExpandedCommand<'_>,
         session: &mut Session,
         exec: &mut ExecState,
     ) -> i32 {
@@ -519,16 +517,16 @@ impl Sandbox {
             return 125;
         }
 
-        let assignment_values =
-            expand_assignments(&simple.assignments, &session.env, exec.last_status);
-        let words = expand_words(&simple.words, &session.env, exec.last_status);
+        let ExpandedCommand {
+            syntax: simple,
+            mut env,
+            words,
+            targets,
+        } = expanded;
         exec.command_count += 1;
-
-        // Shell assignments in a null command persist even if its redirect fails.
+        // Null assignments persist even when a later redirect fails.
         if words.is_empty() {
-            for (name, value) in &assignment_values {
-                session.env.insert(name.clone(), value.clone());
-            }
+            std::mem::swap(&mut session.env, &mut env);
         }
         let command_name = words
             .first()
@@ -542,9 +540,7 @@ impl Sandbox {
             Arc::clone(&exec.control),
             Arc::clone(&self.pools),
         );
-        let mut redirects = match prepare_redirects(simple, &fs, &session.env, exec.last_status)
-            .await
-        {
+        let mut redirects = match prepare_redirects(simple, targets, &fs).await {
             Ok(redirects) => redirects,
             Err((path, err)) => {
                 exec.write_stderr(
@@ -562,16 +558,10 @@ impl Sandbox {
                 );
                 return 1;
             }
-            for (name, value) in assignment_values {
-                session.env.insert(name, value);
-            }
             return 0;
         }
 
-        let mut command_env = session.env.clone();
-        for (name, value) in assignment_values {
-            command_env.insert(name, value);
-        }
+        let mut command_env = env;
         command_env.insert("?".to_owned(), exec.last_status.to_string());
 
         let mut special_stdout = Vec::new();
@@ -720,13 +710,16 @@ impl Sandbox {
 
     async fn prepare_stage(
         &self,
-        simple: &SimpleCommand,
+        expanded: ExpandedCommand<'_>,
         session: &Session,
         exec: &ExecState,
     ) -> PreparedStage {
-        let assignment_values =
-            expand_assignments(&simple.assignments, &session.env, exec.last_status);
-        let words = expand_words(&simple.words, &session.env, exec.last_status);
+        let ExpandedCommand {
+            syntax: simple,
+            mut env,
+            words,
+            targets,
+        } = expanded;
         let name = words.first().cloned().unwrap_or_else(|| {
             simple
                 .assignments
@@ -741,13 +734,8 @@ impl Sandbox {
             Arc::clone(&exec.control),
             Arc::clone(&self.pools),
         );
-        let mut env = session.env.clone();
-        for (name, value) in assignment_values {
-            env.insert(name, value);
-        }
         env.insert("?".to_owned(), exec.last_status.to_string());
-        let redirect_env = if words.is_empty() { &env } else { &session.env };
-        let redirects = match prepare_redirects(simple, &fs, redirect_env, exec.last_status).await {
+        let redirects = match prepare_redirects(simple, targets, &fs).await {
             Ok(redirects) => redirects,
             Err((path, err)) => {
                 return PreparedStage {
@@ -2100,21 +2088,26 @@ async fn finish_redirects(redirects: &PreparedRedirects) -> Result<(), (String, 
 
 async fn prepare_redirects(
     simple: &SimpleCommand,
+    targets: Vec<Vec<String>>,
     fs: &Fs,
-    env: &BTreeMap<String, String>,
-    last_status: i32,
 ) -> Result<PreparedRedirects, (String, VfsError)> {
     let mut redirects = PreparedRedirects::default();
     let mut opened: Vec<Arc<RedirectFile>> = Vec::new();
     let result = async {
-        for redirect in &simple.redirects {
+        for (redirect, words) in simple.redirects.iter().zip(targets) {
             fs.checkpoint()
                 .await
                 .map_err(|err| ("redirect".into(), err))?;
             match &redirect.target {
                 RedirectTarget::Fd(fd) => apply_fd_redirect(&mut redirects, redirect, *fd)?,
-                RedirectTarget::Word(word) => {
-                    let path = redirect_target(word, env, last_status)?;
+                RedirectTarget::Word(_) => {
+                    let count = words.len();
+                    let path = words.into_iter().next().unwrap_or_default();
+                    match count {
+                        1 => {}
+                        0 => return Err((path, VfsError::new(Errno::ENOENT))),
+                        _ => return Err((path, VfsError::new(Errno::EINVAL))),
+                    }
                     match (
                         redirect.fd.unwrap_or(default_redirect_fd(redirect.op)),
                         redirect.op,
@@ -2211,239 +2204,6 @@ fn default_redirect_fd(op: RedirectOp) -> u32 {
     match op {
         RedirectOp::Read => 0,
         RedirectOp::Write | RedirectOp::Append => 1,
-    }
-}
-
-fn redirect_target(
-    word: &Word,
-    env: &BTreeMap<String, String>,
-    last_status: i32,
-) -> Result<String, (String, VfsError)> {
-    let words = expand_word(word, env, last_status);
-    match words.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => Err((String::new(), VfsError::new(Errno::ENOENT))),
-        [first, ..] => Err((first.clone(), VfsError::new(Errno::EINVAL))),
-    }
-}
-
-fn expansion_cost(
-    simple: &SimpleCommand,
-    env: &BTreeMap<String, String>,
-    last_status: i32,
-    limit: usize,
-) -> Option<usize> {
-    let mut cost = 0usize;
-    let mut charge = |n: usize| {
-        cost = cost.saturating_add(n);
-        cost <= limit
-    };
-    // The current environment is cloned for command execution. Assignments
-    // contribute their new values below, bounding retained session growth too.
-    for (name, value) in env {
-        if !charge(name.len().saturating_add(value.len())) {
-            return None;
-        }
-    }
-    let mut assigned = BTreeMap::new();
-    for assignment in &simple.assignments {
-        if !charge(
-            assignment
-                .name
-                .len()
-                .saturating_add(2 * std::mem::size_of::<String>()),
-        ) {
-            return None;
-        }
-        let mut bytes = 0usize;
-        for segment in &assignment.value.segments {
-            let value = match segment {
-                Segment::Literal { value, .. } => std::borrow::Cow::Borrowed(value.as_str()),
-                Segment::Expansion { name, .. } => expansion_value(name, env, last_status),
-            };
-            bytes = bytes.saturating_add(value.len());
-            if bytes > limit {
-                return None;
-            }
-        }
-        assigned.insert(
-            assignment.name.as_str(),
-            (&assignment.value, bytes, None::<usize>),
-        );
-    }
-    for (word, split, redirect) in simple
-        .assignments
-        .iter()
-        .map(|a| (&a.value, false, false))
-        .chain(simple.words.iter().map(|w| (w, true, false)))
-        .chain(simple.redirects.iter().filter_map(|r| match &r.target {
-            RedirectTarget::Word(w) => Some((w, true, true)),
-            _ => None,
-        }))
-    {
-        if !charge(std::mem::size_of::<String>()) {
-            return None;
-        }
-        for segment in &word.segments {
-            let (value, fields) = match segment {
-                Segment::Literal { value, .. } => {
-                    (std::borrow::Cow::Borrowed(value.as_str()), false)
-                }
-                Segment::Expansion { name, quoted } => {
-                    (expansion_value(name, env, last_status), split && !quoted)
-                }
-            };
-            // Null commands apply assignments before redirect expansion.
-            // Cache estimates by variable and admit bytes before scanning for
-            // fields. Repeated references cannot cause quadratic rescanning of
-            // assignment syntax or materialize an amplified redirect string.
-            let assigned_value = if redirect && let Segment::Expansion { name, .. } = segment {
-                assigned.get_mut(name.as_str())
-            } else {
-                None
-            };
-            let bytes = assigned_value
-                .as_ref()
-                .map_or(value.len(), |(_, n, _)| value.len().max(*n));
-            if !charge(bytes) {
-                return None;
-            }
-            if fields {
-                let mut field_count = value.split_whitespace().count().saturating_add(2);
-                if let Some((word, _, cached_fields)) = assigned_value {
-                    let count = cached_fields.get_or_insert_with(|| {
-                        let mut count = 1usize;
-                        for segment in &word.segments {
-                            let value = match segment {
-                                Segment::Literal { value, .. } => {
-                                    std::borrow::Cow::Borrowed(value.as_str())
-                                }
-                                Segment::Expansion { name, .. } => {
-                                    expansion_value(name, env, last_status)
-                                }
-                            };
-                            count = count
-                                .saturating_add(value.split_whitespace().count().saturating_add(2));
-                        }
-                        count
-                    });
-                    field_count = field_count.max(*count);
-                }
-                if !charge(
-                    field_count.saturating_mul(
-                        std::mem::size_of::<String>() + std::mem::size_of::<&str>(),
-                    ),
-                ) {
-                    return None;
-                }
-            }
-        }
-    }
-    Some(cost)
-}
-
-fn expand_assignments(
-    assignments: &[crate::shell::Assignment],
-    env: &BTreeMap<String, String>,
-    last_status: i32,
-) -> Vec<(String, String)> {
-    assignments
-        .iter()
-        .map(|assignment| {
-            (
-                assignment.name.clone(),
-                expand_assignment_value(&assignment.value, env, last_status),
-            )
-        })
-        .collect()
-}
-
-fn expand_words(words: &[Word], env: &BTreeMap<String, String>, last_status: i32) -> Vec<String> {
-    words
-        .iter()
-        .flat_map(|word| expand_word(word, env, last_status))
-        .collect()
-}
-
-fn expand_word(word: &Word, env: &BTreeMap<String, String>, last_status: i32) -> Vec<String> {
-    let mut fields = vec![String::new()];
-    let mut produced = false;
-    for segment in &word.segments {
-        match segment {
-            Segment::Literal { value, .. } => {
-                produced = true;
-                fields.last_mut().expect("field exists").push_str(value);
-            }
-            Segment::Expansion { name, quoted: true } => {
-                produced = true;
-                fields
-                    .last_mut()
-                    .expect("field exists")
-                    .push_str(&expansion_value(name, env, last_status));
-            }
-            Segment::Expansion {
-                name,
-                quoted: false,
-            } => {
-                let value = expansion_value(name, env, last_status);
-                let parts: Vec<_> = value.split_whitespace().collect();
-                if parts.is_empty() {
-                    if !value.is_empty() && fields.last().is_some_and(|field| !field.is_empty()) {
-                        fields.push(String::new());
-                    }
-                    continue;
-                }
-                produced = true;
-                if value.chars().next().is_some_and(char::is_whitespace)
-                    && fields.last().is_some_and(|field| !field.is_empty())
-                {
-                    fields.push(String::new());
-                }
-                fields.last_mut().expect("field exists").push_str(parts[0]);
-                for part in parts.into_iter().skip(1) {
-                    fields.push(part.to_owned());
-                }
-                if value.chars().last().is_some_and(char::is_whitespace) {
-                    fields.push(String::new());
-                }
-            }
-        }
-    }
-    if !produced {
-        return Vec::new();
-    }
-    while fields.last().is_some_and(String::is_empty) && fields.len() > 1 {
-        fields.pop();
-    }
-    fields
-}
-
-fn expand_assignment_value(
-    word: &Word,
-    env: &BTreeMap<String, String>,
-    last_status: i32,
-) -> String {
-    let mut out = String::new();
-    for segment in &word.segments {
-        match segment {
-            Segment::Literal { value, .. } => out.push_str(value),
-            Segment::Expansion { name, .. } => {
-                out.push_str(&expansion_value(name, env, last_status))
-            }
-        }
-    }
-    out
-}
-
-fn expansion_value<'a>(
-    name: &str,
-    env: &'a BTreeMap<String, String>,
-    last_status: i32,
-) -> std::borrow::Cow<'a, str> {
-    if name == "?" {
-        std::borrow::Cow::Owned(last_status.to_string())
-    } else {
-        std::borrow::Cow::Borrowed(env.get(name).map(String::as_str).unwrap_or_default())
     }
 }
 

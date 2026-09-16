@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::path::normalize_path;
+use super::path::{MAX_PATH_DEPTH, normalize_path};
 use super::{
     DirEntry, Errno, FileHandle, FileType, Metadata, OpenMode, Vfs, VfsError, VfsResult,
     VfsSnapshot,
@@ -224,6 +224,16 @@ impl Vfs for InMemoryVfs {
             },
             Err(err) if err.errno() == Errno::ENOENT => {}
             Err(err) => return Err(err),
+        }
+
+        if source_kind == NodeKind::Directory
+            && to_path.len() > from_path.len()
+            && !subtree_fits(
+                get_node(&state.root, &from_path)?,
+                MAX_PATH_DEPTH - to_path.len(),
+            )
+        {
+            return Err(VfsError::new(Errno::EINVAL));
         }
 
         let removed = {
@@ -572,6 +582,27 @@ struct Handle {
     readable: bool,
     writable: bool,
     append: bool,
+}
+
+// One iterator per level keeps checking a wide tree bounded by its depth.
+fn subtree_fits(node: &Node, allowance: usize) -> bool {
+    let Node::Directory(entries) = node else {
+        return true;
+    };
+    let mut stack = vec![entries.values()];
+    while let Some(entries) = stack.last_mut() {
+        let Some(child) = entries.next() else {
+            stack.pop();
+            continue;
+        };
+        if stack.len() > allowance {
+            return false;
+        }
+        if let Node::Directory(children) = child {
+            stack.push(children.values());
+        }
+    }
+    true
 }
 
 fn metadata_for_node(state: &State, node: &Node) -> VfsResult<Metadata> {
