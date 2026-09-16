@@ -7,10 +7,13 @@ import { test } from "node:test"
 
 import {
   applyVersion,
+  applyPortableVersion,
   checkVersion,
+  checkPortableVersion,
   nextVersion,
   parseVersion,
   readCurrentVersion,
+  readPortableVersion,
   hasBreakingChange,
   hasReleaseMarker,
   releaseBump,
@@ -103,6 +106,7 @@ test("parseVersion accepts release semver only", () => {
 
 test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) => {
   const repoRoot = createFixtureRepo(t)
+  const portableBefore = readFileSync(join(repoRoot, "tinysandbox-js-runtime/package-lock.json"), "utf8")
 
   applyVersion("1.4.0", repoRoot)
   checkVersion("1.4.0", repoRoot)
@@ -134,6 +138,137 @@ test("applyVersion updates Rust, npm, and lockfile manifests in lockstep", (t) =
   assert.equal(lockfile.packages[""].version, "1.4.0")
   for (const name of nativePackageNames) {
     assert.deepEqual(lockfile.packages[`node_modules/${name}`], { optional: true })
+  }
+  assert.equal(readFileSync(join(repoRoot, "tinysandbox-js-runtime/package-lock.json"), "utf8"), portableBefore)
+  assert.equal(readPortableVersion(repoRoot), "0.3.0")
+})
+
+test("portable next uses the shared bump policy with its own version", (t) => {
+  const repoRoot = createFixtureRepo(t)
+  applyVersion("0.8.3", repoRoot)
+  for (const [args, expected] of [
+    [["--bump", "auto", "--message", "fix: admit callbacks before invoking"], "0.3.1"],
+    [["--message", "feat!: changed contract"], "0.4.0"],
+    [["--message", "release #minor"], "0.4.0"],
+    [["--message", "release #major"], "1.0.0"],
+    [["--bump", "patch", "--message", "feat!: changed contract"], "0.3.1"],
+    [["--bump", "minor"], "0.4.0"],
+    [["--bump", "major"], "1.0.0"],
+    [["--bump", "current"], "0.3.0"]
+  ]) {
+    const lines = []
+    run(["next", "--package", "portable", ...args], { repoRoot, stdout: line => lines.push(line) })
+    assert.deepEqual(lines, [expected])
+  }
+  assert.equal(readPortableVersion(repoRoot), "0.3.0", "selection does not mutate manifests")
+  assert.equal(readCurrentVersion(repoRoot), "0.8.3")
+})
+
+test("portable apply updates all version fields without touching dependencies or native versions", (t) => {
+  const repoRoot = createFixtureRepo(t)
+  const manifestPath = join(repoRoot, "tinysandbox-js-runtime/package.json")
+  const lockPath = join(repoRoot, "tinysandbox-js-runtime/package-lock.json")
+  const before = JSON.parse(readFileSync(lockPath, "utf8"))
+  const manifestBefore = JSON.parse(readFileSync(manifestPath, "utf8"))
+  const nativeBefore = readFileSync(join(repoRoot, "tinysandbox-node/package-lock.json"), "utf8")
+  run(["apply", "0.3.1", "--package", "portable"], { repoRoot })
+  run(["check", "0.3.1", "--package", "portable"], { repoRoot })
+  before.version = "0.3.1"
+  before.packages[""].version = "0.3.1"
+  manifestBefore.version = "0.3.1"
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), before)
+  assert.deepEqual(JSON.parse(readFileSync(manifestPath, "utf8")), manifestBefore)
+  assert.equal(readFileSync(join(repoRoot, "tinysandbox-node/package-lock.json"), "utf8"), nativeBefore)
+  assert.equal(readCurrentVersion(repoRoot), "0.3.0")
+  // Reapplying the prepared version after a push retry is idempotent.
+  applyPortableVersion("0.3.1", repoRoot)
+  checkPortableVersion("0.3.1", repoRoot)
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), before)
+})
+
+test("portable validation rejects manifest disagreement before release selection", (t) => {
+  for (const location of ["manifest", "lockfile", "root"]) {
+    const repoRoot = createFixtureRepo(t)
+    const path = join(repoRoot, `tinysandbox-js-runtime/${location === "manifest" ? "package.json" : "package-lock.json"}`)
+    const value = JSON.parse(readFileSync(path, "utf8"))
+    const target = location === "root" ? value.packages[""] : value
+    target.version = "9.9.9"
+    writeFileSync(path, JSON.stringify(value))
+    assert.throws(() => checkPortableVersion("0.3.0", repoRoot), /version is 9\.9\.9/)
+    assert.throws(() => run(["next", "--package", "portable"], { repoRoot }), /version is .*expected/)
+  }
+})
+
+test("portable apply validates package identity and lockfile shape before writing", (t) => {
+  for (const corruption of ["manifest-name", "lockfile-name", "root-name", "missing-root"]) {
+    const repoRoot = createFixtureRepo(t)
+    const manifestPath = join(repoRoot, "tinysandbox-js-runtime/package.json")
+    const lockPath = join(repoRoot, "tinysandbox-js-runtime/package-lock.json")
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"))
+    const lockfile = JSON.parse(readFileSync(lockPath, "utf8"))
+    if (corruption === "manifest-name") manifest.name = "other"
+    if (corruption === "lockfile-name") lockfile.name = "other"
+    if (corruption === "root-name") lockfile.packages[""].name = "other"
+    if (corruption === "missing-root") delete lockfile.packages[""]
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+    writeFileSync(lockPath, JSON.stringify(lockfile))
+    const before = readFileSync(manifestPath, "utf8")
+    assert.throws(() => applyPortableVersion("0.3.1", repoRoot), /must describe @tinysandbox\/js-runtime/)
+    assert.equal(readFileSync(manifestPath, "utf8"), before)
+  }
+  const repoRoot = createFixtureRepo(t)
+  assert.throws(() => applyPortableVersion("invalid", repoRoot), /unsupported semver/)
+  assert.throws(() => run(["next", "--package", "typo"], { repoRoot }), /unsupported release package/)
+})
+
+test("workflow prepares independent versions and publishes portable before pushing them", (t) => {
+  const repoRoot = createFixtureRepo(t)
+  applyVersion("0.8.3", repoRoot)
+  const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8")
+  const step = name => {
+    const block = workflow.split(`      - name: ${name}\n`)[1]?.split(/\n      - /u)[0]
+    const script = block?.match(/        run: \|\n(?<body>[\s\S]*)/u)?.groups.body
+    assert.ok(script, `missing workflow script: ${name}`)
+    return script.replace(/^ {10}/gmu, "")
+  }
+  const output = join(repoRoot, "outputs")
+  execFileSync("bash", ["-euo", "pipefail", "-c", step("Determine release version")], {
+    cwd: new URL("../", import.meta.url),
+    env: { ...process.env, RELEASE_REPO_ROOT: repoRoot, GITHUB_OUTPUT: output, RELEASE_BUMP: "auto", RELEASE_MESSAGE: "fix: release portable changes" },
+    stdio: "pipe"
+  })
+  const prepared = Object.fromEntries(readFileSync(output, "utf8").trim().split("\n").map(line => line.split("=")))
+  assert.deepEqual(prepared, { version: "0.8.4", portable_version: "0.3.1" })
+
+  // Execute the real publish/push shell with fake external boundaries. No
+  // package registry or repository is changed by this regression.
+  const bin = join(repoRoot, "bin")
+  mkdirSync(bin)
+  const log = join(repoRoot, "calls")
+  writeFileSync(join(bin, "npm"), `#!/bin/bash
+printf 'npm %s\\n' "$*" >> "$CALL_LOG"
+if [ "$1" = view ]; then exit "$VIEW_STATUS"; fi
+if [ "$1" = publish ]; then exit "$PUBLISH_STATUS"; fi
+exit 99
+`, { mode: 0o755 })
+  writeFileSync(join(bin, "git"), `#!/bin/bash
+printf 'git %s\\n' "$*" >> "$CALL_LOG"
+exit 0
+`, { mode: 0o755 })
+  for (const [view, publish, expected] of [
+    [1, 0, ["npm view @tinysandbox/js-runtime@0.3.1 version", "npm publish --access public", "git push origin HEAD:main"]],
+    [0, 0, ["npm view @tinysandbox/js-runtime@0.3.1 version", "git push origin HEAD:main"]],
+    [1, 1, ["npm view @tinysandbox/js-runtime@0.3.1 version", "npm publish --access public"]]
+  ]) {
+    writeFileSync(log, "")
+    const execute = () => execFileSync("bash", ["-euo", "pipefail", "-c", `${step("Publish portable runtime")}\n${step("Push the release version")}`], {
+      cwd: join(repoRoot, "tinysandbox-js-runtime"),
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CALL_LOG: log, VIEW_STATUS: String(view), PUBLISH_STATUS: String(publish), VERSION: prepared.version, PORTABLE_VERSION: prepared.portable_version },
+      stdio: "pipe"
+    })
+    if (publish) assert.throws(execute, error => error.status === 1)
+    else execute()
+    assert.deepEqual(readFileSync(log, "utf8").trim().split("\n"), expected)
   }
 })
 
@@ -216,6 +351,13 @@ function createFixtureRepo(t) {
   for (const target of nativeTargets) {
     mkdirSync(join(repoRoot, "tinysandbox-node", "npm", target), { recursive: true })
   }
+  mkdirSync(join(repoRoot, "tinysandbox-js-runtime"))
+  const portable = { name: "@tinysandbox/js-runtime", version: "0.3.0", devDependencies: { typescript: "^7.0.2" } }
+  writeFileSync(join(repoRoot, "tinysandbox-js-runtime/package.json"), `${JSON.stringify(portable, null, 2)}\n`)
+  writeFileSync(join(repoRoot, "tinysandbox-js-runtime/package-lock.json"), `${JSON.stringify({
+    name: portable.name, version: portable.version, lockfileVersion: 3, requires: true,
+    packages: { "": portable, "node_modules/typescript": { version: "7.0.2", resolved: "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz", integrity: "sha512-fixture", dev: true } }
+  }, null, 2)}\n`)
   writeFileSync(
     join(repoRoot, "Cargo.toml"),
     `[workspace]

@@ -185,3 +185,20 @@ This package runs JavaScript only and has no jq command or `jqMemoryBytes` optio
 The package build type-checks the implementation with strict TypeScript and
 emits JavaScript and declarations together. Run `npm test` for the shared guest
 corpus, independent Node filesystem comparisons, and resource-limit regressions.
+
+## Releases
+
+The portable package keeps its own version number and releases automatically
+alongside the Rust and native Node packages after successful CI on `main`.
+Every eligible release increments both version lines, even when changes affect
+only one package. The default bump is a patch; standalone `#minor` / `#major`
+commit markers and Conventional Commits breaking-change markers use the same
+rules as the native release. A breaking change below 1.0 increments the minor.
+
+The Release workflow's manual `bump` input applies to both version lines;
+`current` retries their checked-in versions. Automatic releases honor
+`[skip release]` and release commits. The workflow updates the portable manifest
+and lockfile together, verifies the package, and pushes the shared version
+commit only after all packages publish successfully. Rerunning a failed release
+from the same source reuses its prepared versions and skips packages already
+published at those versions.

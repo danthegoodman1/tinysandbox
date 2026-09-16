@@ -163,7 +163,7 @@ test("the release commit lands after publishing and repairs itself on rebase", (
   // because `cargo publish --locked` refuses to package a dirty tree.
   const publish = workflow.match(/\n  publish:\n(?<body>[\s\S]*)$/)?.groups?.body
   assert.ok(publish, "release workflow must define the publish job")
-  const order = ["Apply lockstep version", "Resolve the native lockfile entries", "Commit the release version", "Publish crate", "Publish native and facade npm packages", "Push the release version"]
+  const order = ["Apply lockstep version", "Resolve the native lockfile entries", "Commit the release version", "Publish crate", "Publish native and facade npm packages", "Publish portable runtime", "Push the release version"]
   const positions = order.map((name) => publish.indexOf(`- name: ${name}`))
   assert.ok(positions.every((at) => at >= 0), `publish must define ${order.join(", ")}`)
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b), "publish steps are out of order")
@@ -174,6 +174,8 @@ test("the release commit lands after publishing and repairs itself on rebase", (
   assert.match(retry, /node scripts\/release-version\.mjs apply "\$\{VERSION\}"/)
   assert.match(retry, /node scripts\/write-native-lockfile\.mjs "\$\{VERSION\}"/)
   assert.match(retry, /node scripts\/release-version\.mjs check "\$\{VERSION\}"/)
+  assert.match(retry, /node scripts\/release-version\.mjs apply "\$\{PORTABLE_VERSION\}" --package portable/)
+  assert.match(retry, /node scripts\/release-version\.mjs check "\$\{PORTABLE_VERSION\}" --package portable/)
   assert.match(retry, /git commit --amend --no-edit/)
 })
 
@@ -185,21 +187,27 @@ test("the lockfile is resolved from local tarballs, never from the registry", ()
   assert.doesNotMatch(step, /npm (view|install)/, "resolving must not wait on registry propagation")
 })
 
-test("portable JS runtime publishes independently after successful main CI", () => {
-  const job = workflow.match(
-    /\n  publish-portable-js-runtime:\n(?<body>[\s\S]*?)\n  build-linux-native:/
-  )?.groups?.body
-  assert.ok(job, "release workflow must define the portable runtime publish job")
-  assert.match(job, /github\.event\.workflow_run\.conclusion == 'success'/)
-  assert.match(job, /github\.event\.workflow_run\.head_branch == 'main'/)
-  assert.match(job, /cache-dependency-path: tinysandbox-js-runtime\/package-lock\.json/)
-  assert.match(job, /working-directory: tinysandbox-js-runtime/)
-  assert.match(job, /npm ci/)
-  assert.match(job, /npm test/)
-  assert.match(job, /npm pack --dry-run/)
-  assert.match(job, /npm view "\$\{package_name\}@\$\{package_version\}" version/)
-  assert.match(job, /npm publish --access public/)
-  assert.doesNotMatch(job, /needs: prepare/)
+test("portable runtime shares release preparation, eligibility, and the final version commit", () => {
+  const prepare = workflow.match(/\n  prepare:\n(?<body>[\s\S]*?)\n  build-linux-native:/)?.groups?.body
+  const publish = workflow.match(/\n  publish:\n(?<body>[\s\S]*)$/)?.groups?.body
+  assert.ok(prepare)
+  assert.ok(publish)
+  assert.match(prepare, /release-version\.mjs next --package portable --bump "\$RELEASE_BUMP" --message "\$RELEASE_MESSAGE"/)
+  assert.match(prepare, /portable_version: \$\{\{ steps\.version\.outputs\.portable_version \}\}/)
+  assert.match(publish, /if: needs\.prepare\.outputs\.release == 'true'/)
+  assert.match(publish, /PORTABLE_VERSION: \$\{\{ needs\.prepare\.outputs\.portable_version \}\}/)
+  assert.match(publish, /RELEASE_PATHS:[^\n]*tinysandbox-js-runtime\/package\.json tinysandbox-js-runtime\/package-lock\.json/)
+  assert.match(publish, /release-version\.mjs apply "\$\{PORTABLE_VERSION\}" --package portable/)
+  assert.match(publish, /release-version\.mjs check "\$\{PORTABLE_VERSION\}" --package portable/)
+  assert.match(publish, /chore\(release\): \$\{VERSION\}, portable \$\{PORTABLE_VERSION\} \[skip release\]/)
+  const verify = publish.match(/- name: Verify portable runtime package\n(?<body>[\s\S]*?)\n      - name:/)?.groups?.body
+  assert.match(verify, /working-directory: tinysandbox-js-runtime/)
+  assert.match(verify, /npm ci/)
+  assert.match(verify, /npm test/)
+  assert.ok(publish.indexOf("Verify portable runtime package") < publish.indexOf("Commit the release version"))
+  assert.ok(publish.indexOf("Inspect portable runtime tarball") < publish.indexOf("Commit the release version"))
+  assert.doesNotMatch(workflow, /\n  publish-portable-js-runtime:/, "only one job may publish and record versions")
+  assert.match(ciWorkflow, /release-version\.mjs check[^\n]*--package portable/)
 })
 
 test("platform packages and optional dependencies stay in lockstep", () => {
@@ -235,7 +243,7 @@ test("npm pack metadata supports npm 11 and npm 12 output", () => {
 })
 
 test("workflows pin npm CLIs compatible with their Node versions", () => {
-  assert.equal([...workflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 4)
+  assert.equal([...workflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 3)
   assert.equal([...ciWorkflow.matchAll(/npm install -g npm@12\.0\.2/g)].length, 1)
   assert.equal([...ciWorkflow.matchAll(/npm install -g npm@11\.12\.1/g)].length, 4)
 })
