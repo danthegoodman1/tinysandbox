@@ -182,7 +182,7 @@ fn compatibility_endpoint_guard_is_strictly_loopback_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires scripts/test-s3-compat.sh and its loopback-only MinIO container"]
+#[ignore = "requires scripts/test-s3-compat.sh and its loopback-only s3proxy container"]
 async fn s3_compatible_adapter_vfs_and_sandbox_end_to_end() {
     let config = TestConfig::from_env();
     let client = config.client();
