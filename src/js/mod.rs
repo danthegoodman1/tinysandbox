@@ -415,7 +415,17 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
     }
     free.call(&mut store, ptr)?;
 
-    store.data_mut().finish_files(exit_code == 0)?;
+    // Reaching here means the guest ran to its own end. The exit status is the
+    // script's to choose, and a descriptor it closed itself already committed
+    // regardless of it; keying durability on the status would split one run's
+    // writes between committed and discarded. Rollback belongs to the paths
+    // above and to Drop, which cover the runs the host cut short.
+    // Reaching here means the guest ran to its own end. The exit status is the
+    // script's to choose, and a descriptor it closed itself already committed
+    // regardless of it; keying durability on the status would split one run's
+    // writes between committed and discarded. Rollback belongs to the paths
+    // above and to Drop, which cover the runs the host cut short.
+    store.data_mut().finish_files(true)?;
     let state = store.data();
     Ok(JsRunResult {
         exit_code,

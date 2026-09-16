@@ -2341,3 +2341,130 @@ async fn warm_js_runtime() {
     let result = Sandbox::builder().build().exec("js -e ''").await;
     assert_eq!(result.exit_code, 0, "{}", result.stderr);
 }
+
+/// Counts how each handle was released, so a run's durability decision is
+/// visible without a backend that stages writes.
+#[derive(Debug)]
+struct ReleaseCountingVfs {
+    inner: InMemoryVfs,
+    closed: std::sync::atomic::AtomicUsize,
+    aborted: std::sync::atomic::AtomicUsize,
+}
+
+impl ReleaseCountingVfs {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemoryVfs::default(),
+            closed: std::sync::atomic::AtomicUsize::new(0),
+            aborted: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.closed.load(Ordering::SeqCst),
+            self.aborted.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl Vfs for ReleaseCountingVfs {
+    fn stat(&self, path: &str) -> tinysandbox::vfs::VfsResult<tinysandbox::vfs::Metadata> {
+        self.inner.stat(path)
+    }
+    fn readdir(&self, path: &str) -> tinysandbox::vfs::VfsResult<Vec<tinysandbox::vfs::DirEntry>> {
+        self.inner.readdir(path)
+    }
+    fn mkdir(&self, path: &str) -> tinysandbox::vfs::VfsResult<()> {
+        self.inner.mkdir(path)
+    }
+    fn rename(&self, from: &str, to: &str) -> tinysandbox::vfs::VfsResult<()> {
+        self.inner.rename(from, to)
+    }
+    fn unlink(&self, path: &str) -> tinysandbox::vfs::VfsResult<()> {
+        self.inner.unlink(path)
+    }
+    fn rmdir(&self, path: &str) -> tinysandbox::vfs::VfsResult<()> {
+        self.inner.rmdir(path)
+    }
+    fn open(
+        &self,
+        path: &str,
+        mode: OpenMode,
+    ) -> tinysandbox::vfs::VfsResult<tinysandbox::vfs::FileHandle> {
+        self.inner.open(path, mode)
+    }
+    fn read_at(
+        &self,
+        handle: tinysandbox::vfs::FileHandle,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> tinysandbox::vfs::VfsResult<usize> {
+        self.inner.read_at(handle, offset, buf)
+    }
+    fn write_at(
+        &self,
+        handle: tinysandbox::vfs::FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> tinysandbox::vfs::VfsResult<usize> {
+        self.inner.write_at(handle, offset, data)
+    }
+    fn truncate(
+        &self,
+        handle: tinysandbox::vfs::FileHandle,
+        len: u64,
+    ) -> tinysandbox::vfs::VfsResult<()> {
+        self.inner.truncate(handle, len)
+    }
+    fn close(&self, handle: tinysandbox::vfs::FileHandle) -> tinysandbox::vfs::VfsResult<()> {
+        self.closed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.close(handle)
+    }
+    fn abort(&self, handle: tinysandbox::vfs::FileHandle) -> tinysandbox::vfs::VfsResult<()> {
+        self.aborted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.abort(handle)
+    }
+}
+
+#[tokio::test]
+async fn js_teardown_finishes_the_runs_that_ended_and_aborts_the_ones_cut_short() {
+    // A script picks its own exit status; reaching the end of it is what makes
+    // the writes real, and a descriptor the script closed itself committed
+    // regardless of that status. Rollback belongs to the runs the host stopped.
+    // The portable runtime pins the same table.
+    warm_js_runtime().await;
+    for (ending, expected, commits) in [
+        ("", 0, true),
+        ("throw new Error('stop')", 1, true),
+        ("process.exit(7)", 7, true),
+        ("while (true) {}", 124, false),
+    ] {
+        let vfs = ReleaseCountingVfs::new();
+        let sandbox = Sandbox::builder()
+            .mount_arc("workspace", vfs.clone())
+            .limits(Limits::default().with_wall_time(Duration::from_millis(300)))
+            .build();
+        let script = format!(
+            "const fs = require('fs'); const fd = fs.openSync('/workspace/log.txt', 'w'); fs.writeSync(fd, 'important', 0); {ending}"
+        );
+        let result = sandbox
+            .exec(&format!("js -e '{}'", shell_single_quote(&script)))
+            .await;
+        assert_eq!(result.exit_code, expected, "{ending}: {}", result.stderr);
+
+        let started = Instant::now();
+        while vfs.counts() == (0, 0) && started.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (closed, aborted) = vfs.counts();
+        assert_eq!(
+            (closed > 0, aborted > 0),
+            (commits, !commits),
+            "{ending} released the handle the wrong way: {closed} closed, {aborted} aborted"
+        );
+    }
+}

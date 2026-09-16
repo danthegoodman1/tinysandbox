@@ -286,3 +286,19 @@ test("exceeding the concurrent host call limit fails the call, not the run", asy
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "true\n");
 });
+
+test("sparse arrays serialize the way JSON.stringify does", async () => {
+  // The guest config and VFS directory listings reach the response encoder
+  // without passing assertJsonValue, so holes arrive here rather than being
+  // rejected earlier. Skipping them shifted every later entry, and a leading
+  // hole produced JSON the guest could not parse at all.
+  const engine = await createEngine(bytes);
+  const argv = ["js", "-e", "third"];
+  delete argv[0];
+  delete argv[1];
+
+  const result = await engine.runCode("console.log(JSON.stringify(process.argv))", { argv });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, `${JSON.stringify(argv)}\n`);
+  assert.equal(result.stdout, '[null,null,"third"]\n');
+});

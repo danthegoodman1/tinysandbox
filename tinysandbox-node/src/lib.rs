@@ -293,6 +293,24 @@ impl Sandbox {
                 }
             }
             if let Some(disabled) = get_optional::<Vec<String>>(&options, "disabledCommands")? {
+                // Removing a name that was never registered is a no-op, so a
+                // typo or the wrong case would leave the capability enabled and
+                // report success. Check every name before removing any, so
+                // listing one twice is not mistaken for an unknown command.
+                let unknown: Vec<&str> = disabled
+                    .iter()
+                    .filter(|name| !builder.has_command(name))
+                    .map(String::as_str)
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "disabledCommands names no such command: {}",
+                            unknown.join(", ")
+                        ),
+                    ));
+                }
                 for name in disabled {
                     builder = builder.without_command(&name);
                 }

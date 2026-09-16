@@ -444,7 +444,12 @@ impl S3Vfs {
             .ok_or(vfs_error(Errno::EIO))?;
         state.handles.insert(
             handle,
-            Arc::new(Mutex::new(HandleState { key, mode, staging })),
+            Arc::new(Mutex::new(HandleState {
+                key,
+                mode,
+                staging,
+                released: false,
+            })),
         );
         Ok(handle)
     }
@@ -920,8 +925,66 @@ impl Vfs for S3Vfs {
     }
 
     fn read_at(&self, handle: FileHandle, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let shared = self.handle_state(handle)?;
+        self.read_resolved(&self.handle_state(handle)?, offset, buf)
+    }
+
+    fn write_at(&self, handle: FileHandle, offset: u64, data: &[u8]) -> VfsResult<usize> {
+        self.write_resolved(&self.handle_state(handle)?, offset, data)
+    }
+
+    fn truncate(&self, handle: FileHandle, len: u64) -> VfsResult<()> {
+        self.truncate_resolved(&self.handle_state(handle)?, len)
+    }
+
+    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
+        let shared = self
+            .state()
+            .handles
+            .remove(&handle)
+            .ok_or(vfs_error(Errno::EBADF))?;
         let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        // Under the lock, so a writer that resolved this handle before it left
+        // the table finds it released instead of opening an upload nothing will
+        // complete or abort.
+        state.released = true;
+        if let Staging::Stream(stream) = &state.staging
+            && let Some(upload) = &stream.upload
+        {
+            self.ops
+                .abort_upload(AbortUploadRequest {
+                    bucket: self.bucket.clone(),
+                    key: state.key.clone(),
+                    upload_id: upload.id.clone(),
+                })
+                .map_err(RemoteError::into_vfs)?;
+        }
+        Ok(())
+    }
+
+    fn close(&self, handle: FileHandle) -> VfsResult<()> {
+        let shared = self
+            .state()
+            .handles
+            .remove(&handle)
+            .ok_or(vfs_error(Errno::EBADF))?;
+        let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        state.released = true;
+        self.commit(&mut state)
+    }
+}
+
+impl S3Vfs {
+    /// Reads through a handle already resolved from the table.
+    fn read_resolved(
+        &self,
+        shared: &Arc<Mutex<HandleState>>,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> VfsResult<usize> {
+        let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.released {
+            return Err(vfs_error(Errno::EBADF));
+        }
         if !state.mode.read {
             return Err(vfs_error(Errno::EBADF));
         }
@@ -952,9 +1015,17 @@ impl Vfs for S3Vfs {
         Ok(len)
     }
 
-    fn write_at(&self, handle: FileHandle, offset: u64, data: &[u8]) -> VfsResult<usize> {
-        let shared = self.handle_state(handle)?;
+    /// Writes through a handle already resolved from the table.
+    fn write_resolved(
+        &self,
+        shared: &Arc<Mutex<HandleState>>,
+        offset: u64,
+        data: &[u8],
+    ) -> VfsResult<usize> {
         let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.released {
+            return Err(vfs_error(Errno::EBADF));
+        }
         if !state.mode.write {
             return Err(vfs_error(Errno::EBADF));
         }
@@ -1006,9 +1077,12 @@ impl Vfs for S3Vfs {
         }
     }
 
-    fn truncate(&self, handle: FileHandle, len: u64) -> VfsResult<()> {
-        let shared = self.handle_state(handle)?;
+    /// Truncates through a handle already resolved from the table.
+    fn truncate_resolved(&self, shared: &Arc<Mutex<HandleState>>, len: u64) -> VfsResult<()> {
         let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.released {
+            return Err(vfs_error(Errno::EINVAL));
+        }
         if !state.mode.write {
             return Err(vfs_error(Errno::EINVAL));
         }
@@ -1039,39 +1113,6 @@ impl Vfs for S3Vfs {
         }
     }
 
-    fn abort(&self, handle: FileHandle) -> VfsResult<()> {
-        let shared = self
-            .state()
-            .handles
-            .remove(&handle)
-            .ok_or(vfs_error(Errno::EBADF))?;
-        let state = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Staging::Stream(stream) = &state.staging
-            && let Some(upload) = &stream.upload
-        {
-            self.ops
-                .abort_upload(AbortUploadRequest {
-                    bucket: self.bucket.clone(),
-                    key: state.key.clone(),
-                    upload_id: upload.id.clone(),
-                })
-                .map_err(RemoteError::into_vfs)?;
-        }
-        Ok(())
-    }
-
-    fn close(&self, handle: FileHandle) -> VfsResult<()> {
-        let shared = self
-            .state()
-            .handles
-            .remove(&handle)
-            .ok_or(vfs_error(Errno::EBADF))?;
-        let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        self.commit(&mut state)
-    }
-}
-
-impl S3Vfs {
     fn read_remote(
         &self,
         key: &str,
@@ -1127,6 +1168,10 @@ struct HandleState {
     key: String,
     mode: OpenMode,
     staging: Staging,
+    /// Set under this handle's lock once close or abort has run. A caller that
+    /// resolved the handle before it left the table can still be waiting on that
+    /// lock, and must not stage bytes or open an upload behind the release.
+    released: bool,
 }
 
 #[derive(Debug)]
@@ -3712,6 +3757,35 @@ mod tests {
         assert_eq!(bucket.open_uploads(), 0);
         assert_eq!(bucket.aborted().len(), 1);
         assert!(vfs.state().handles.is_empty());
+    }
+
+    #[test]
+    fn a_handle_released_mid_write_cannot_orphan_an_upload() {
+        // abort takes the handle out of the table and only then locks it, so a
+        // writer that resolved the same handle a moment earlier is still holding
+        // an Arc to it. Reaching its lock after the abort had found nothing to
+        // clean up, that writer opened a multipart upload no one would ever
+        // complete or abort.
+        let bucket = FakeBucket::new();
+        let mut vfs = bucket_vfs(&bucket, None);
+        vfs.part_size = 8;
+        let handle = vfs
+            .open("/streamed", OpenMode::write_only().create().truncate())
+            .expect("open a streaming handle");
+
+        let resolved = vfs
+            .handle_state(handle)
+            .expect("writer resolves the handle");
+        vfs.abort(handle).expect("abort wins the race to the lock");
+
+        assert_errno(vfs.write_resolved(&resolved, 0, &[b'x'; 24]), Errno::EBADF);
+        assert_eq!(
+            bucket.open_uploads(),
+            0,
+            "a released handle must not open an upload"
+        );
+        assert_errno(vfs.read_resolved(&resolved, 0, &mut [0; 8]), Errno::EBADF);
+        assert_errno(vfs.truncate_resolved(&resolved, 0), Errno::EINVAL);
     }
 
     #[tokio::test]

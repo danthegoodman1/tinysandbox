@@ -84,7 +84,11 @@ export interface SandboxOptions {
   cwd?: string
   persistSession?: boolean
   commands?: Record<string, JsCommand>
-  /** Commands removed after registration; e.g. ["jq"] to disable the jq command. */
+  /**
+   * Commands removed after registration; e.g. ["jq"] to disable the jq command.
+   * Naming a command that is not registered throws, so a typo cannot leave the
+   * capability enabled.
+   */
   disabledCommands?: Array<string>
   /**
    * Host functions bound into the sandboxed JavaScript global scope. Each key

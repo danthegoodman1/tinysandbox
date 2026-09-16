@@ -425,6 +425,15 @@ function createVfsDispatcher(vfs: Vfs, cwd: string, hostInputBytes: number, host
     }
   };
   const metadata = (path: string, syscall = "stat") => checkedMetadata(callVfs(vfs, "stat", [path], syscall, path), syscall, path);
+  // One buffer serves every read. The guest picks the length, so allocating and
+  // zeroing it per call let a script spend host time reading a 1-byte file with
+  // megabyte requests. Dispatch is synchronous and the bytes are encoded before
+  // it returns, so the next read can reuse the same memory.
+  let scratch = new Uint8Array(0);
+  const readInto = (length: number) => {
+    if (scratch.byteLength < length) scratch = new Uint8Array(length);
+    return scratch.subarray(0, length);
+  };
   const mkdirRecursive = (path: string) => {
     checkpoint();
     if (path === "/") return;
@@ -507,7 +516,7 @@ function createVfsDispatcher(vfs: Vfs, cwd: string, hostInputBytes: number, host
         const position = checkedInteger(args?.position, "tinysandbox", undefined, true);
         const offset = position ?? file.position;
         const length = Math.min(MAX_HOST_READ_BYTES, readBytes, checkedInteger(args?.length, "tinysandbox"));
-        const buffer = new Uint8Array(length);
+        const buffer = readInto(length);
         const count = callVfs(vfs, "readAt", [file.handle, offset, buffer], "read");
         if (!Number.isSafeInteger(count) || count < 0 || count > length) throw vfsFailure(new Error("invalid VFS read count"), "read");
         if (position === null) file.position += count;
@@ -732,6 +741,10 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
             throw limitFailure;
           }
         }
+        // A caller that caught the throw above and sent something that fits has
+        // recovered: the guest gets an answer and keeps running, so the run is
+        // no longer failing on this limit and its writes still deserve to commit.
+        if (limitFailure?.kind === "hostResponse") limitFailure = undefined;
         response = bytes;
       };
       const tinysandbox = {
@@ -898,7 +911,12 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
         releaseExpiry();
         signal?.removeEventListener("abort", onAbort);
         isCancelled();
-        cleanupFailure = vfsDispatcher?.closeAll(completed && exitCode === 0 && !timedOut && limitFailure === undefined);
+        // Commit whenever the guest reached its own end. The exit status is the
+        // script's to choose, and a descriptor it closed itself already
+        // committed regardless of it; keying durability on the status instead
+        // would split one run's writes between committed and discarded.
+        // Rollback belongs to the runs the host cut short.
+        cleanupFailure = vfsDispatcher?.closeAll(completed && !timedOut && limitFailure === undefined);
       }
       if (cleanupFailure !== undefined && exitCode === 0) {
         exitCode = 1;
@@ -1007,7 +1025,14 @@ function boundedJson(value: unknown, cap: number): Uint8Array {
     else if (typeof item === "boolean") append(String(item));
     else if (Array.isArray(item)) {
       append("[");
-      item.forEach((entry, index) => { if (index) append(","); write(entry, depth + 1); });
+      for (let index = 0; index < item.length; index++) {
+        if (index) append(",");
+        // Match JSON.stringify: holes and undefined entries serialize as null.
+        // Skipping them, as forEach does, shifts or corrupts the output.
+        const entry = item[index];
+        if (entry === undefined) append("null");
+        else write(entry, depth + 1);
+      }
       append("]");
     } else if (item !== null && typeof item === "object") {
       append("{");

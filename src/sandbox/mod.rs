@@ -1053,9 +1053,18 @@ impl SandboxBuilder {
 
     /// Removes a command, including a default builtin, from lookup and `/bin`.
     /// For example, use `without_command("rm")` to remove that command capability.
+    ///
+    /// A name that is not registered is left alone. Pair this with
+    /// [`SandboxBuilder::has_command`] where a misspelled name should be an
+    /// error rather than a capability that quietly stays available.
     pub fn without_command(mut self, name: &str) -> Self {
         self.commands.remove(name);
         self
+    }
+
+    /// Whether a command is currently registered under this exact name.
+    pub fn has_command(&self, name: &str) -> bool {
+        self.commands.contains_key(name)
     }
 
     /// Registers a custom command by name.
