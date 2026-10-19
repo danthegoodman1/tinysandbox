@@ -113,6 +113,9 @@ runs, including a synchronous callback; an `fs.promises` call waits for a slot
 instead. Promises returned by admitted callbacks remain observed even when the
 run is cancelled before consuming their results.
 
+`process.exit()` ends the guest at once, as in Node: queued promise callbacks
+do not run, and pending host calls are abandoned rather than awaited.
+
 ## Optional filesystem capability
 
 Pass a `Vfs` implementation to enable the same `Buffer`, `fs` subset,

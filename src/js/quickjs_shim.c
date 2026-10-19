@@ -75,6 +75,8 @@ typedef struct {
     PendingCall pending[TB_MAX_PENDING];
     int pending_count;
     int active;
+    /* process.exit() was called: nothing else in the program may run. */
+    int exited;
 } Session;
 
 static Session tb_session;
@@ -960,6 +962,7 @@ static JSValue js_process_exit(JSContext *ctx, JSValueConst this_val, int argc, 
     JS_SetPropertyStr(ctx, exit, "__tinysandboxExit", JS_NewBool(ctx, 1));
     JS_SetPropertyStr(ctx, exit, "code", JS_NewInt32(ctx, code));
     JS_SetUncatchableError(ctx, exit);
+    tb_session.exited = 1;
     return JS_Throw(ctx, exit);
 }
 
@@ -1191,13 +1194,15 @@ static int32_t session_finish(int32_t code)
 
 /* Drains the job queue, then either parks the guest awaiting the host or ends
  * it. Outstanding host calls are the only thing that can advance a drained
- * queue, so their presence is exactly the suspend condition. */
+ * queue, so their presence is exactly the suspend condition. As in Node,
+ * process.exit() ends the program at once, whatever its status: queued jobs
+ * never run and outstanding host calls are abandoned. */
 static int32_t session_settle(int32_t code)
 {
-    if (code == 0) {
+    if (code == 0 && !tb_session.exited) {
         code = drain_pending_jobs(tb_session.rt, tb_session.ctx, &tb_session.rejections);
     }
-    if (code == 0 && tb_session.pending_count > 0) {
+    if (code == 0 && !tb_session.exited && tb_session.pending_count > 0) {
         return TB_SUSPENDED;
     }
     return session_finish(code);
@@ -1326,10 +1331,10 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     }
     if (prelude_len > 0) {
         int32_t code = handle_eval_result(ctx, JS_Eval(ctx, prelude, prelude_len, "<prelude>", JS_EVAL_TYPE_GLOBAL));
-        if (code == 0) {
+        if (code == 0 && !tb_session.exited) {
             code = drain_pending_jobs(rt, ctx, &tb_session.rejections);
         }
-        if (code != 0) {
+        if (code != 0 || tb_session.exited) {
             JS_FreeCString(ctx, prelude);
             JS_FreeValue(ctx, prelude_value);
             JS_FreeValue(ctx, run_main);

@@ -31,6 +31,27 @@
     "stderrPrefix": ""
   },
   {
+    "name": "exit-skips-queued-jobs",
+    "code": "Promise.resolve().then(() => console.log('queued')); console.log('before'); process.exit(0)",
+    "exitCode": 0,
+    "stdout": "before\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "exit-inside-job",
+    "code": "Promise.resolve().then(() => { console.log('first'); process.exit(0) }).then(() => console.log('never')); Promise.resolve().then(() => console.log('second'))",
+    "exitCode": 0,
+    "stdout": "first\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "exit-after-await",
+    "code": "(async () => { await null; console.log('a'); process.exit(4) })(); Promise.resolve().then(() => console.log('b'))",
+    "exitCode": 4,
+    "stdout": "a\n",
+    "stderrPrefix": ""
+  },
+  {
     "name": "exception",
     "code": "throw new Error('boom')",
     "exitCode": 1,

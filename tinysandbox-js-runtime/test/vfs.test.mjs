@@ -530,8 +530,8 @@ test("teardown awaits asynchronous commits and rolls back calls the guest abando
   assert.equal(left.handles.size, 0);
 
   const exited = new AsyncStagingVfs({});
-  const early = await engine.runCode("require('fs').promises.writeFile('/late', 'x'); process.exit(3)", { vfs: exited });
-  assert.equal(early.exitCode, 3, early.stderr);
+  const early = await engine.runCode("require('fs').promises.writeFile('/late', 'x'); process.exit(0)", { vfs: exited });
+  assert.equal(early.exitCode, 0, early.stderr);
   assert.deepEqual(exited.committed, []);
   assert.deepEqual(exited.discarded, ["/late"], "a write still opening when the guest exited is discarded");
   assert.equal(exited.handles.size, 0);

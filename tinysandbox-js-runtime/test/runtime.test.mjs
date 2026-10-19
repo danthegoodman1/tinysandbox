@@ -268,6 +268,24 @@ test("concurrent awaited globals settle in completion order", async () => {
   assert.equal(result.stdout, "slow,fast\n");
 });
 
+test("process.exit ends the guest while awaited globals are still pending", async () => {
+  // Node runs nothing after process.exit(), whatever the status. A pending host
+  // call used to keep the guest alive, and its continuation ran after the exit.
+  const engine = await createEngine(bytes);
+  const later = (ms, value) => async () => { await new Promise((r) => setTimeout(r, ms)); return value; };
+  for (const [code, exitCode, stdout] of [
+    ["slow().then(() => console.log('after exit')); process.exit(0)", 0, ""],
+    ["(async () => { await fast(); console.log('first'); process.exit(0) })(); slow().then(() => console.log('second'))", 0, "first\n"],
+    ["(async () => { await fast(); process.exit(5) })(); slow().then(() => console.log('second'))", 5, ""],
+  ]) {
+    const started = performance.now();
+    const result = await engine.runCode(code, { globals: { slow: later(200, "slow"), fast: later(5, "fast") } });
+    assert.equal(result.exitCode, exitCode, code);
+    assert.equal(result.stdout, stdout, code);
+    assert.ok(performance.now() - started < 150, `${code} waited for an abandoned call`);
+  }
+});
+
 test("exceeding the concurrent host call limit fails the call, not the run", async () => {
   const engine = await createEngine(bytes);
   // 64 slots: 65 simultaneous awaits must report a bounded failure rather than

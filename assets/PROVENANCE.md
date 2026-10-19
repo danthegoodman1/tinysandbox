@@ -26,7 +26,7 @@ network, process, or environment capability; time comes from one explicit import
 - QuickJS stack limit: 786,432 bytes (`768 KiB`), leaving headroom inside the linked 1 MiB C stack
 - QuickJS sources linked: `quickjs.c`, `dtoa.c`, `libregexp.c`, `libunicode.c`
 - Tinysandbox shim: `src/js/quickjs_shim.c`
-- Artifact: 631,375 bytes, SHA-256 `fdc3b41d793edaa1fbee2a7a3b75fd70a6dab9b656b3c3054f2bb9856f2ed1a4`
+- Artifact: 631,445 bytes, SHA-256 `0f22c90b184359272a5022d28abadf0f52371e1a89129ac968cfe9beb6155e12`
 - Initial linear memory: 19 WebAssembly pages, 1,245,184 bytes (1.1875 MiB)
 
 Inspect the artifact without installing `wasm-tools` or another package:
@@ -76,5 +76,7 @@ guest call that awaits its answer passes a reserved slot, or `-1` when all 64
 are taken; the synchronous `fs` API passes `-2` and must be answered inline.
 The portable host can then defer `fs.promises` calls to an asynchronous VFS
 without ever deferring an answer a synchronous caller needs. An ABI 13 guest
-reserves slots for synchronous calls too, so the host rejects it. Two rebuilds
+reserves slots for synchronous calls too, so the host rejects it. The same
+artifact ends the guest as soon as it calls `process.exit()`, as Node does,
+without draining queued jobs or waiting on outstanding host calls. Two rebuilds
 on Linux x86_64 produced the current SHA-256 above byte for byte.
