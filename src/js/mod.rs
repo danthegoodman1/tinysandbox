@@ -788,9 +788,10 @@ fn define_tinysandbox_imports(linker: &mut Linker<HostState>) -> wasmtime::Resul
          op_len: i32,
          json_ptr: i32,
          json_len: i32,
-         // Slot the guest reserved for a deferred answer. This host owns a
-         // dedicated thread and blocks on host futures, so it always answers
-         // inline and never resolves a slot.
+         // Slot the guest reserved for a deferred answer, or negative when it
+         // needs the answer inline. This host owns a dedicated thread and
+         // blocks on host futures, so it always answers inline and never
+         // resolves a slot.
          _call_id: i32|
          -> wasmtime::Result<i32> {
             if caller.data().fs.is_cancelled() || caller.data().remaining_wall_time().is_zero() {

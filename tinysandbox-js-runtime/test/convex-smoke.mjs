@@ -28,6 +28,6 @@ const bundle = join(directory, "action.mjs");
 await writeFile(bundle, result.outputFiles[0].contents);
 const action = await import(pathToFileURL(bundle));
 const output = await action.jsRuntimeSmoke.handler();
-if (output !== "convex") throw new Error(`Convex-compatible bundle smoke returned ${JSON.stringify(output)}`);
+if (output !== "convex stored") throw new Error(`Convex-compatible bundle smoke returned ${JSON.stringify(output)}`);
 console.log(`convex_v8_bundle_bytes=${result.outputFiles[0].contents.byteLength}`);
 console.log("convex_v8_bundle_smoke=PASS");

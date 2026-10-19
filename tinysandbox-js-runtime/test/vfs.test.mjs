@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import { createEngine, VfsError } from "../dist/index.js";
-import { TestVfs } from "./test-vfs.mjs";
+import { AsyncTestVfs, TestVfs } from "./test-vfs.mjs";
 
 const bytes = await readFile(new URL("../quickjs.wasm", import.meta.url));
 const engine = await createEngine(bytes);
@@ -14,11 +14,16 @@ const portableVfsCorpus = JSON.parse(await readFile(new URL("../../tests/fixture
 
 test("runs the shared Rust/V8 VFS and CommonJS corpus", async () => {
   for (const item of portableVfsCorpus) {
-    const vfs = new TestVfs(Object.fromEntries(item.files.map(file => [file.path, file.text])));
-    const result = await engine.runFile(item.entry, { vfs, argv: item.argv });
-    assert.equal(result.exitCode, item.exitCode, item.name);
-    assert.equal(result.stdout, item.stdout, item.name);
-    assert.ok(result.stderr.startsWith(item.stderrPrefix), `${item.name}: ${result.stderr}`);
+    // The fs.promises case also runs against a Vfs that answers asynchronously.
+    for (const Vfs of item.name === "fs-promises" ? [TestVfs, AsyncTestVfs] : [TestVfs]) {
+      const vfs = new Vfs(Object.fromEntries(item.files.map(file => [file.path, file.text])));
+      const result = await engine.runFile(item.entry, { vfs, argv: item.argv });
+      const label = `${item.name} (${Vfs.name})`;
+      assert.equal(result.exitCode, item.exitCode, label);
+      assert.equal(result.stdout, item.stdout, label);
+      assert.ok(result.stderr.startsWith(item.stderrPrefix), `${label}: ${result.stderr}`);
+      assert.equal(vfs.handles.size, 0, label);
+    }
   }
 });
 
@@ -172,7 +177,7 @@ test("VFS failures use stable errno mapping and rejecting async implementations 
   const asynchronous = new TestVfs({ "/x": "x" });
   asynchronous.stat = async () => { throw new VfsError("EACCES"); };
   const asyncResult = await engine.runCode("const fs=require('fs'); try { fs.statSync('/x') } catch (e) { console.log(e.code, e.errno) }", { vfs: asynchronous });
-  assert.equal(asyncResult.stdout, "EIO -5\n");
+  assert.equal(asyncResult.stdout, "EAGAIN -35\n");
   await new Promise(resolve => setImmediate(resolve));
 });
 
@@ -406,3 +411,266 @@ test("a rejected host global surfaces in the guest without an unhandled rejectio
   }
   assert.equal(unhandled, undefined);
 });
+
+test("fs.promises matches real Node against synchronous and asynchronous Vfs implementations", async () => {
+  const code = `
+const fs = require('fs');
+const fsp = require('fs/promises');
+(async () => {
+  console.log(fsp === fs.promises);
+  await fsp.writeFile('a.txt', 'hello λ');
+  await fsp.appendFile('a.txt', '!');
+  console.log(await fsp.readFile('a.txt', 'utf8'), (await fsp.readFile('a.txt')).length);
+  await fsp.mkdir('dir/sub', { recursive: true });
+  await fsp.writeFile('dir/b', Buffer.from([0, 255]));
+  console.log((await fsp.readdir('dir', { withFileTypes: true })).map(e => [e.name, e.isFile(), e.isDirectory()].join(':')).sort().join(','));
+  const stats = await fsp.stat('dir/b');
+  console.log(stats.size, stats.isFile(), stats.isDirectory());
+  const fh = await fsp.open('io', 'w+');
+  console.log((await fh.write('abcdef')).bytesWritten);
+  const buffer = Buffer.alloc(3);
+  const read = await fh.read(buffer, 0, 3, 1);
+  console.log(read.bytesRead, buffer.toString(), read.buffer === buffer);
+  console.log((await fh.write(Buffer.from('XY'), 0, 2, 0)).bytesWritten);
+  await fh.truncate(4);
+  await fh.close();
+  await fh.close();
+  console.log(fh.fd, await fsp.readFile('io', 'utf8'));
+  try { await fh.read(buffer, 0, 1, 0) } catch (e) { console.log(e.code) }
+  try { await fsp.readFile('missing') } catch (e) { console.log(e.code, e.errno, e.syscall) }
+  try { await fsp.rmdir('dir') } catch (e) { console.log(e.code) }
+  await fsp.rm('dir', { recursive: true });
+  await fsp.rm('dir', { recursive: true, force: true });
+  const values = await Promise.all([1, 2, 3, 4].map(async i => { await fsp.writeFile('p' + i, String(i)); return fsp.readFile('p' + i, 'utf8'); }));
+  console.log(values.join(''));
+})();
+`;
+  const directory = await mkdtemp(join(tmpdir(), "tinysandbox-promises-"));
+  try {
+    const oracle = spawnSync(process.execPath, ["-e", code], { cwd: directory, encoding: "utf8" });
+    assert.equal(oracle.status, 0, oracle.stderr);
+    for (const Vfs of [TestVfs, AsyncTestVfs]) {
+      const vfs = new Vfs({ "/work/.keep": "" });
+      const result = await engine.runCode(code, { vfs, cwd: "/work" });
+      assert.equal(result.exitCode, 0, result.stderr);
+      assert.equal(result.stdout, oracle.stdout, Vfs.name);
+      assert.equal(vfs.handles.size, 0, Vfs.name);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("synchronous calls against an asynchronous Vfs fail with EAGAIN and leave nothing open", async () => {
+  const vfs = new AsyncTestVfs({ "/app/mod.js": "module.exports = 1", "/data": "x" });
+  const result = await engine.runCode(`
+const fs = require('fs');
+for (const attempt of [() => fs.readFileSync('/data'), () => fs.existsSync('/data'), () => require('/app/mod.js'), () => fs.openSync('/data', 'r')]) {
+  try { attempt(); console.log('answered') } catch (e) { console.log(e.code, e.errno, e.message) }
+}
+`, { vfs });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout,
+    "EAGAIN -35 EAGAIN: operation would block; use fs.promises, open '/data'\n" +
+    "EAGAIN -35 EAGAIN: operation would block; use fs.promises, stat '/data'\n" +
+    "EAGAIN -35 EAGAIN: operation would block; use fs.promises, stat '/app/mod.js'\n" +
+    "EAGAIN -35 EAGAIN: operation would block; use fs.promises, open '/data'\n");
+  // The opens the guest gave up on still produced handles; the run closed them.
+  assert.equal(vfs.calls.filter(call => call.method === "open").length, 2);
+  assert.equal(vfs.handles.size, 0);
+});
+
+class CommittingVfs extends TestVfs {
+  constructor(files, failure) { super(files); this.committed = []; this.failure = failure; }
+  close(handle) {
+    const opened = this.handles.get(handle);
+    if (!opened?.mode.write) return super.close(handle);
+    return new Promise(resolve => setTimeout(resolve, 5)).then(() => {
+      super.close(handle);
+      if (this.failure) throw new VfsError(this.failure);
+      this.committed.push(opened.path);
+    });
+  }
+}
+
+test("synchronous writes work when only the Vfs commit is asynchronous", async () => {
+  const code = `
+const fs = require('fs');
+fs.writeFileSync('/out/a.txt', 'A');
+const fd = fs.openSync('/out/b.txt', 'w');
+fs.writeSync(fd, 'B');
+fs.closeSync(fd);
+console.log(fs.readFileSync('/out/a.txt', 'utf8'), fs.readFileSync('/out/b.txt', 'utf8'));
+`;
+  const vfs = new CommittingVfs({ "/out/.keep": "" });
+  const result = await engine.runCode(code, { vfs });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "A B\n");
+  assert.deepEqual(vfs.committed.sort(), ["/out/a.txt", "/out/b.txt"]);
+  assert.equal(vfs.handles.size, 0);
+
+  const failing = new CommittingVfs({ "/out/.keep": "" }, "ENOSPC");
+  const failed = await engine.runCode(code, { vfs: failing });
+  assert.equal(failed.exitCode, 1);
+  assert.equal(failed.stdout, "A B\n");
+  assert.match(failed.stderr, /no space left on device/);
+  assert.equal(failing.handles.size, 0);
+});
+
+class AsyncStagingVfs extends AsyncTestVfs {
+  constructor(files) { super(files); this.staged = new Map(); this.committed = []; this.discarded = []; }
+  async open(path, mode) { const handle = await super.open(path, mode); if (mode.write) this.staged.set(handle, path); return handle; }
+  async close(handle) { const path = this.staged.get(handle); if (path) { this.committed.push(path); this.staged.delete(handle); } return super.close(handle); }
+  async abort(handle) { const path = this.staged.get(handle); if (path) { this.discarded.push(path); this.staged.delete(handle); this.nodes.delete(path); } return TestVfs.prototype.close.call(this, handle); }
+}
+
+test("teardown awaits asynchronous commits and rolls back calls the guest abandoned", async () => {
+  const left = new AsyncStagingVfs({});
+  const finished = await engine.runCode("(async () => { const fh = await require('fs').promises.open('/log', 'w'); await fh.write('important') })()", { vfs: left });
+  assert.equal(finished.exitCode, 0, finished.stderr);
+  assert.deepEqual(left.committed, ["/log"], "a descriptor left open commits before the run resolves");
+  assert.equal(left.handles.size, 0);
+
+  const exited = new AsyncStagingVfs({});
+  const early = await engine.runCode("require('fs').promises.writeFile('/late', 'x'); process.exit(0)", { vfs: exited });
+  assert.equal(early.exitCode, 0, early.stderr);
+  assert.deepEqual(exited.committed, []);
+  assert.deepEqual(exited.discarded, ["/late"], "a write still opening when the guest exited is discarded");
+  assert.equal(exited.handles.size, 0);
+
+  const cut = new AsyncStagingVfs({});
+  const stopped = await engine.runCode("(async () => { const fh = await require('fs').promises.open('/log', 'w'); await fh.write('x'); while (true) {} })()", { vfs: cut, timeoutMs: 100 });
+  assert.equal(stopped.exitCode, 124);
+  // A run cut short does not wait past its deadline, so the abort lands after it resolves.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(cut.discarded, ["/log"]);
+  assert.equal(cut.handles.size, 0);
+});
+
+test("awaited filesystem calls stop at the deadline or on abort", async () => {
+  const hung = () => {
+    const vfs = new AsyncTestVfs({ "/data": "x", "/script.js": "console.log('ran')" });
+    vfs.readAt = () => new Promise(() => {});
+    return vfs;
+  };
+  const code = "require('fs').promises.readFile('/data').then(() => console.log('read'))";
+  let started = performance.now();
+  const timedOut = await engine.runCode(code, { vfs: hung(), timeoutMs: 50 });
+  assert.equal(timedOut.exitCode, 124);
+  assert.equal(timedOut.stderr, "js: command timed out\n");
+  assert.ok(performance.now() - started < 1000);
+
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 20);
+  started = performance.now();
+  const cancelled = await engine.runCode(code, { vfs: hung(), timeoutMs: 10_000, signal: controller.signal });
+  assert.equal(cancelled.exitCode, 124);
+  assert.equal(cancelled.stderr, "js: command cancelled\n");
+  assert.ok(performance.now() - started < 1000);
+
+  const entry = await engine.runFile("/script.js", { vfs: hung(), timeoutMs: 50 });
+  assert.equal(entry.exitCode, 124);
+  assert.equal(entry.stderr, "js: command timed out\n");
+
+  // The guest finished, but the commit it left to teardown never settles.
+  const uncommitted = new AsyncTestVfs({ "/data": "x" });
+  uncommitted.close = () => new Promise(() => {});
+  started = performance.now();
+  const pending = await engine.runCode("(async () => { await require('fs').promises.open('/data'); console.log('done') })()", { vfs: uncommitted, timeoutMs: 100 });
+  assert.equal(pending.exitCode, 124);
+  assert.equal(pending.stderr, "js: command timed out\n");
+  assert.ok(performance.now() - started < 1000);
+});
+
+test("fs.promises calls past the host's outstanding-call limit wait for a slot", async () => {
+  const files = {};
+  for (let index = 0; index < 150; index++) files[`/f${index}`] = String(index);
+  const vfs = new AsyncTestVfs(files);
+  const result = await engine.runCode(
+    "(async () => { const all = await Promise.all(Array.from({ length: 150 }, (_, i) => require('fs').promises.readFile('/f' + i, 'utf8'))); console.log(all.length, all[149]) })()",
+    { vfs },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "150 149\n");
+  assert.equal(vfs.handles.size, 0);
+});
+
+test("opens still waiting on the Vfs count toward maxOpenFiles", async () => {
+  const vfs = new AsyncTestVfs({ "/x": "x" });
+  const result = await engine.runCode(
+    "(async () => { const results = await Promise.allSettled([1, 2, 3].map(() => require('fs').promises.open('/x'))); console.log(results.map(r => r.status === 'fulfilled' ? 'ok' : r.reason.code).join(',')) })()",
+    { vfs, maxOpenFiles: 2 },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "ok,ok,ENOSPC\n");
+  assert.equal(vfs.handles.size, 0);
+});
+
+test("a rejecting asynchronous Vfs surfaces in the guest without an unhandled rejection", async () => {
+  let unhandled;
+  const capture = (reason) => { unhandled = reason; };
+  process.on("unhandledRejection", capture);
+  try {
+    const vfs = new AsyncTestVfs({ "/x": "x" });
+    vfs.stat = async () => { throw new VfsError("EACCES"); };
+    const result = await engine.runCode("require('fs').promises.stat('/x').catch(e => console.log(e.code, e.errno, e.message))", { vfs });
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "EACCES -13 EACCES: permission denied, stat '/x'\n");
+    await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", capture);
+  }
+  assert.equal(unhandled, undefined);
+});
+
+test("Vfs calls get a context whose signal outlives the guest until the run stops waiting", async () => {
+  // A hung read: the signal aborts at the deadline, which lets the Vfs cancel it.
+  const hung = new AsyncTestVfs({ "/data": "x" });
+  let readContext;
+  hung.readAt = (handle, offset, buffer, context) => {
+    readContext = context;
+    return new Promise((resolve, reject) => context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true }));
+  };
+  const timedOut = await engine.runCode("require('fs').promises.readFile('/data')", { vfs: hung, timeoutMs: 50 });
+  assert.equal(timedOut.exitCode, 124);
+  assert.equal(readContext.signal.aborted, true);
+  assert.equal(readContext.isCancelled(), true);
+  assert.equal(readContext.remainingTimeMs(), 0);
+  assert.ok(Math.abs(readContext.deadlineMs - Date.now()) < 1000);
+  // The run does not wait past its deadline, so the cancelled read's close lands just after.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(hung.handles.size, 0, "the cancelled read closed its handle");
+
+  // The caller's signal aborts it as well.
+  const cancelled = new AsyncTestVfs({ "/data": "x" });
+  cancelled.readAt = hung.readAt;
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(new Error("caller stopped")), 20);
+  const stopped = await engine.runCode("require('fs').promises.readFile('/data')", { vfs: cancelled, timeoutMs: 10_000, signal: controller.signal });
+  assert.equal(stopped.exitCode, 124);
+  assert.equal(readContext.signal.reason.message, "caller stopped");
+
+  // A commit after the guest finished still sees a live signal; the run then
+  // resolves and aborts it.
+  const committing = new CommittingVfs({ "/out/.keep": "" });
+  let commitContext, abortedDuringCommit;
+  const commit = committing.close.bind(committing);
+  committing.close = (handle, context) => {
+    commitContext = context;
+    abortedDuringCommit = context.signal.aborted;
+    return commit(handle, context);
+  };
+  const finished = await engine.runCode("require('fs').writeFileSync('/out/a.txt', 'A')", { vfs: committing });
+  assert.equal(finished.exitCode, 0, finished.stderr);
+  assert.deepEqual(committing.committed, ["/out/a.txt"]);
+  assert.equal(abortedDuringCommit, false);
+  assert.equal(commitContext.signal.aborted, true);
+
+  // runFile reads its entry with the same kind of context.
+  const entry = new AsyncTestVfs({ "/script.js": "console.log('ran')" });
+  entry.readAt = hung.readAt;
+  const unread = await engine.runFile("/script.js", { vfs: entry, timeoutMs: 50 });
+  assert.equal(unread.exitCode, 124);
+  assert.equal(readContext.signal.aborted, true);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(entry.handles.size, 0);
+});
+

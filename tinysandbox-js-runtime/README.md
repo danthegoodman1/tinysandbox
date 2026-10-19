@@ -108,14 +108,18 @@ answered inline and its promise is already settled: a microtask, not a
 suspension, so only the globals that need it pay for suspending. Concurrent
 awaits settle in completion order, and a rejected promise surfaces in the guest
 as a catchable error. At most 64 host calls may be outstanding at once. When all
-slots are occupied, another call is rejected before its host callback runs,
-including a synchronous callback. Promises returned by admitted callbacks remain
-observed even when the run is cancelled before consuming their results.
+slots are occupied, another global call is rejected before its host callback
+runs, including a synchronous callback; an `fs.promises` call waits for a slot
+instead. Promises returned by admitted callbacks remain observed even when the
+run is cancelled before consuming their results.
+
+`process.exit()` ends the guest at once, as in Node: queued promise callbacks
+do not run, and pending host calls are abandoned rather than awaited.
 
 ## Optional filesystem capability
 
-Pass a synchronous `Vfs` implementation to enable the same `Buffer`, `fs`
-subset, and relative/absolute CommonJS loader as tinysandbox's `/bin/js`:
+Pass a `Vfs` implementation to enable the same `Buffer`, `fs` subset,
+`fs.promises`, and relative/absolute CommonJS loader as tinysandbox's `/bin/js`:
 
 ```ts
 const result = await engine.runFile("main.js", {
@@ -132,9 +136,9 @@ defaults to `["js", originalPath]`, preserving the path string passed by the
 caller. Relative `require()` resolves from the requiring module; direct `fs`
 paths resolve from `cwd`.
 
-The exported `Vfs` interface is deliberately small and synchronous: `stat`,
-`readdir`, `mkdir`, `rename`, `unlink`, `rmdir`, `open`, `readAt`, `writeAt`,
-`truncate`, and `close`, plus optional `abort` for discarding staged writes.
+The exported `Vfs` interface is deliberately small: `stat`, `readdir`, `mkdir`,
+`rename`, `unlink`, `rmdir`, `open`, `readAt`, `writeAt`, `truncate`, and
+`close`, plus optional `abort` for discarding staged writes.
 A run that reaches its own end closes any remaining descriptors, whatever exit
 status the script chose; a run the host cut short — a timeout, an abort signal,
 or an exhausted output limit — calls `abort` when supplied, otherwise `close`. Handles must continue to refer to the
@@ -144,8 +148,50 @@ handles and offsets are non-negative safe integers, and positional operations
 do not change the guest fd cursor. Implementations report one of the exported
 `VfsErrno` strings by throwing `new VfsError(code)`. Quotas and storage
 accounting belong to the supplied implementation. The package provides no
-production filesystem or storage backend; the repository's `TestVfs` exists
-only under `test/` for examples and conformance tests.
+production filesystem or storage backend; the repository's `TestVfs` and
+`AsyncTestVfs` exist only under `test/` for examples and conformance tests.
+
+### Asynchronous storage
+
+Any `Vfs` method may return a promise, so an implementation can front network
+storage such as S3. Guest `fs.promises` calls, also available as
+`require("fs/promises")`, await it: the guest suspends, the host returns to the
+event loop, and the call resumes when the promise settles. A method that
+answers directly costs a microtask, as a synchronous global does.
+`fs.promises` provides `readFile`, `writeFile`, `appendFile`, `mkdir`,
+`readdir`, `stat`, `rename`, `rm`, `unlink`, `rmdir`, `copyFile`, and `open`,
+whose `FileHandle` supports `read`, `write`, `truncate`, and `close`.
+
+```js
+const result = await engine.runCode(
+  "(async () => { console.log(await require('fs').promises.readFile('/data/report.csv', 'utf8')) })()",
+  { vfs: objectStoreVfs },
+);
+```
+
+Synchronous guest calls cannot wait. When one reaches a `Vfs` method that
+returns a promise, it fails with `EAGAIN` (`operation would block; use
+fs.promises`), and the runtime releases any handle an abandoned `open` later
+produces. A promise from `close` or `abort` is the exception: the synchronous
+call returns, and the run settles the promise before it resolves, failing when
+it rejects. A `Vfs` can therefore answer reads from a cache, stage writes in
+memory, and commit them asynchronously on `close` while `readFileSync`,
+`writeFileSync`, and `require()` keep working. A `readAt` promise must fill its
+buffer before it resolves.
+
+Every `Vfs` method receives a `VfsContext` as its last argument, with the same
+`signal`, `deadlineMs`, `remainingTimeMs()`, and `isCancelled()` members a
+global's context has. Its signal aborts at the run's deadline, when the
+caller's signal aborts, or when `runCode()` resolves, so an implementation can
+cancel a request the run will no longer wait for. It stays live after the guest
+finishes, so teardown commits can complete.
+
+`runCode()` settles every filesystem call it started before it resolves, but
+never waits past the deadline, the same bound it applies to awaited globals.
+Calls the guest left running when it exited stop at their next `Vfs` step and
+abort any handle they opened. Remaining descriptors then close, or abort for a
+run the host cut short. A finished run whose closes are still pending at the
+deadline reports a timeout.
 
 Omitting `vfs` leaves the run storage-independent: `Buffer` is absent and both
 `require("fs")` and file-module requests throw
@@ -167,7 +213,7 @@ requested to stay within the response budget. Paths and recursive traversal
 are limited to 256 components.
 
 The monotonic `timeoutMs` budget covers source loading in `runFile`, guest
-execution, and synchronous host calls. A host callback already executing cannot
+execution, synchronous host calls, and the promises the guest awaits. A host callback already executing cannot
 be interrupted mid-call; further guest filesystem operations are rejected after
 it returns if the deadline has expired.
 

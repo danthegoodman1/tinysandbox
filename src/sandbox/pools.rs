@@ -170,7 +170,7 @@ impl Pools {
 
     pub(crate) fn acquire_file(&self) -> bool {
         self.open_files
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.capacity.open_files).then_some(n + 1)
             })
             .is_ok()

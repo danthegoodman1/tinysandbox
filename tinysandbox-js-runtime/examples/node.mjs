@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createEngine } from "../dist/index.js";
-import { TestVfs } from "../test/test-vfs.mjs";
+import { AsyncTestVfs, TestVfs } from "../test/test-vfs.mjs";
 
 const wasm = await readFile(new URL("../quickjs.wasm", import.meta.url));
 const engine = await createEngine(wasm);
@@ -25,11 +25,19 @@ const searched = await engine.runCode(
 );
 console.log(searched);
 
-// TestVfs is a deterministic example fixture, not part of the runtime API.
-// Production callers supply their own synchronous storage implementation.
+// TestVfs and AsyncTestVfs are deterministic example fixtures, not part of the
+// runtime API. Production callers supply their own storage implementation.
 const vfs = new TestVfs({
   "/app/main.js": "console.log(__filename, require('./message').text)",
   "/app/message.js": "exports.text = require('fs').readFileSync('./value', 'utf8')",
   "/app/value": "from-vfs",
 });
 console.log(await engine.runFile("main.js", { vfs, cwd: "/app" }));
+
+// A Vfs may return promises, as a network-backed store would. Guest code
+// awaits them through fs.promises; the synchronous fs API fails with EAGAIN.
+const remote = new AsyncTestVfs({ "/data/report.txt": "from-async-vfs" });
+console.log(await engine.runCode(
+  "(async () => { console.log(await require('fs').promises.readFile('/data/report.txt', 'utf8')) })()",
+  { vfs: remote },
+));
