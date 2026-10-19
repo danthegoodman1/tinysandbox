@@ -147,3 +147,14 @@ export class TestVfs {
     if (!this.handles.delete(handle)) throw new VfsError("EBADF");
   }
 }
+
+const later = () => new Promise(resolve => setTimeout(resolve, 0));
+
+// Answers every call on a later macrotask, as a network-backed Vfs would.
+export class AsyncTestVfs extends TestVfs {}
+for (const method of ["stat", "readdir", "mkdir", "rename", "unlink", "rmdir", "open", "readAt", "writeAt", "truncate", "close"]) {
+  AsyncTestVfs.prototype[method] = async function (...args) {
+    await later();
+    return TestVfs.prototype[method].apply(this, args);
+  };
+}

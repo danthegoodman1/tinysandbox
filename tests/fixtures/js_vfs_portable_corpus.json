@@ -24,5 +24,19 @@
     "exitCode": 0,
     "stdout": "/workspace/app/main.js /workspace/app arg\ntrue 1 42\n3 bcd abXYe\ncounter.js,data.json,main.js\nENOENT -2\n",
     "stderrPrefix": ""
+  },
+  {
+    "name": "fs-promises",
+    "entry": "/workspace/promises.js",
+    "argv": ["js", "/workspace/promises.js"],
+    "files": [
+      {
+        "path": "/workspace/promises.js",
+        "text": "const fs=require('fs')\nconst fsp=require('fs/promises')\n;(async()=>{\nconsole.log(fsp===fs.promises)\nawait fsp.writeFile('/workspace/a.txt','hello')\nawait fsp.appendFile('/workspace/a.txt','!')\nconsole.log(await fsp.readFile('/workspace/a.txt','utf8'))\nawait fsp.mkdir('/workspace/d/e',{recursive:true})\nconsole.log((await fsp.readdir('/workspace/d',{withFileTypes:true})).map(e=>e.name+':'+e.isDirectory()).join(','))\nconsole.log((await fsp.stat('/workspace/a.txt')).size)\nawait fsp.copyFile('/workspace/a.txt','/workspace/d/b.txt')\nawait fsp.rename('/workspace/d/b.txt','/workspace/d/c.txt')\nconst fh=await fsp.open('/workspace/d/c.txt','r+')\nconst buf=Buffer.alloc(3)\nconst r=await fh.read(buf,0,3,1)\nconst w=await fh.write('XY',0)\nawait fh.truncate(4)\nawait fh.close()\nawait fh.close()\nconsole.log(r.bytesRead,buf.toString(),w.bytesWritten,fh.fd,await fsp.readFile('/workspace/d/c.txt','utf8'))\nawait fsp.unlink('/workspace/d/c.txt')\nawait fsp.rm('/workspace/d',{recursive:true})\nconsole.log(await fsp.stat('/workspace/d').then(()=>'exists',e=>e.code))\ntry{await fsp.readFile('/workspace/missing')}catch(e){console.log(e.code,e.errno,e.syscall)}\ntry{fs.readFile('/workspace/a.txt',()=>{})}catch(e){console.log(e.message)}\n})()"
+      }
+    ],
+    "exitCode": 0,
+    "stdout": "true\nhello!\ne:true\n6\n3 ell 2 -1 XYll\nENOENT\nENOENT -2 open\nfs.readFile callbacks are not supported in tinysandbox; use fs.readFileSync or fs.promises\n",
+    "stderrPrefix": ""
   }
 ]

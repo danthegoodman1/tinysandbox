@@ -308,6 +308,7 @@ identical output):
 | Area | Supported |
 | --- | --- |
 | `fs` (sync) | `readFileSync`, `readLinesSync` (UTF-8 line iterator, 64KB buffer), `writeFileSync`, `appendFileSync`, `mkdirSync`, `readdirSync` (incl. `withFileTypes`), `statSync`, `renameSync`, `rmSync`, `unlinkSync`, `rmdirSync`, `existsSync`, `copyFileSync`, `openSync`, `readSync`, `writeSync`, `ftruncateSync`, `closeSync` |
+| `fs.promises` | Also `require('fs/promises')`: `readFile`, `writeFile`, `appendFile`, `mkdir`, `readdir`, `stat`, `rename`, `rm`, `unlink`, `rmdir`, `copyFile`, and `open`, whose `FileHandle` supports `read`, `write`, `truncate`, and `close` |
 | `require` | Relative/absolute CommonJS: `./x`, `../x`, `/x`, extension inference (`.js`, `.json`), `dir/index.js`, module cache, Node cycle semantics, `module.exports`/`exports` aliasing, `require.main`, `MODULE_NOT_FOUND` shapes |
 | Globals | `console.log/info/warn/error` (Node formatting incl. `%s %d %j`-style substitution), `process.argv/env/cwd()/exit()`, `__filename`, `__dirname`, `Buffer` (`from`, `alloc`, `isBuffer`, `toString('utf8'/'hex'/'base64')`) |
 | Fetch | WHATWG-subset `fetch`, `Headers`, and `Response` backed only by an embedder-provided handler |
@@ -334,9 +335,10 @@ a monotonic deadline, separate QuickJS heap and stack limits, output/response
 caps, and optional JSON-safe dotted globals. A global may be `async`: the guest
 suspends while the promise settles, which is why its `runCode()` and
 `runFile()` are awaited. Supplying a
-synchronous VFS additionally enables `runFile()`, the supported `fs` subset,
+VFS additionally enables `runFile()`, the supported `fs` subset,
 `Buffer`, and CommonJS file loading; omitting it leaves the runtime without
-filesystem capability. The package does not include the shell, coreutils,
+filesystem capability. VFS methods may return promises, which guest
+`fs.promises` calls await, so the VFS can front network storage such as S3. The package does not include the shell, coreutils,
 native bindings, a concrete storage backend, or ambient network access. Its
 [package README](tinysandbox-js-runtime/README.md) documents the small API and
 host examples. A minimal

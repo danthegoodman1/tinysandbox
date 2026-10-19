@@ -24,7 +24,7 @@ const RESERVED_GLOBALS = new Set([
     "Buffer", "Headers", "Response", "__dirname", "__filename", "console",
     "exports", "fetch", "globalThis", "module", "process", "require",
 ]);
-const ABI_VERSION = 13;
+const ABI_VERSION = 14;
 /* Host answer to a guest call: response staged now, or settled later. */
 const HOST_INLINE = 0;
 const HOST_DEFERRED = 1;
@@ -58,6 +58,7 @@ const decoder = new TextDecoder();
 const fatalDecoder = new TextDecoder("utf-8", { fatal: true });
 export const QUICKJS_INITIAL_MEMORY_BYTES = INITIAL_PAGES * PAGE_BYTES;
 const VFS_ERRNOS = Object.freeze({
+    EAGAIN: [-35, "resource temporarily unavailable"],
     EBADF: [-9, "bad file descriptor"],
     EBUSY: [-16, "resource busy or locked"],
     EXDEV: [-18, "cross-device link not permitted"],
@@ -166,6 +167,31 @@ function monotonicNow() {
     }
     return now.call(globalThis.performance);
 }
+/* Resolves at the deadline or when the caller aborts. The timer is created on
+ * first use, so a run that never waits on the host creates none, and release
+ * frees it so a finished run does not keep the event loop alive. */
+function expiryTimer(deadline, signal) {
+    let expiry;
+    let release = () => { };
+    return {
+        wait() {
+            expiry ??= new Promise((resolve) => {
+                const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - monotonicNow()));
+                const onAborted = () => resolve(undefined);
+                signal?.addEventListener("abort", onAborted, { once: true });
+                if (signal?.aborted)
+                    resolve(undefined);
+                release = () => {
+                    clearTimeout(timer);
+                    signal?.removeEventListener("abort", onAborted);
+                    resolve(undefined);
+                };
+            });
+            return expiry;
+        },
+        release: () => release(),
+    };
+}
 function jsonError(error) {
     const message = error instanceof Error ? error.message : String(error);
     const code = error && typeof error === "object" && typeof record(error).code === "string" ? record(error).code : undefined;
@@ -205,9 +231,12 @@ function assertJsonValue(value, path = "value", seen = new Set()) {
 }
 class HostCallFailure extends Error {
     payload;
-    constructor(payload) {
+    /** The synchronous API stopped at a Vfs promise, and that call is still running. */
+    wouldBlock;
+    constructor(payload, wouldBlock = false) {
         super(payload.message);
         this.payload = payload;
+        this.wouldBlock = wouldBlock;
     }
 }
 function vfsFailure(error, syscall, path) {
@@ -219,9 +248,12 @@ function vfsFailure(error, syscall, path) {
 function invalidVfsCall(syscall, path) {
     return vfsFailure(new VfsError("EINVAL"), syscall, path);
 }
+function hostFailure(error) {
+    return error instanceof HostCallFailure ? error.payload : jsonError(error);
+}
 function validateVfs(vfs) {
     if (vfs === null || typeof vfs !== "object")
-        throw new TypeError("vfs must be an object implementing the synchronous Vfs interface");
+        throw new TypeError("vfs must be an object implementing the Vfs interface");
     for (const method of ["stat", "readdir", "mkdir", "rename", "unlink", "rmdir", "open", "readAt", "writeAt", "truncate", "close"]) {
         if (typeof record(vfs)[method] !== "function")
             throw new TypeError(`vfs.${method} must be a function`);
@@ -230,24 +262,63 @@ function validateVfs(vfs) {
         throw new TypeError("vfs.abort must be a function when supplied");
     return vfs;
 }
-function callVfs(vfs, method, args, syscall, path) {
+/* Thrown into an operation at a Vfs promise its caller cannot wait for. */
+class WouldBlock extends Error {
+}
+function* callVfs(vfs, method, args, syscall, path) {
     try {
         const operation = vfs[method];
         const value = operation.apply(vfs, args);
-        if (thenable(value)) {
-            // Async VFS methods are unsupported, but attach a rejection handler so a
-            // mistaken async implementation cannot escape this deterministic error.
-            try {
-                value.then(() => { }, () => { });
-            }
-            catch { }
-            throw new TypeError(`vfs.${method} returned a Promise; Vfs methods must be synchronous`);
-        }
-        return value;
+        if (!thenable(value))
+            return value;
+        const release = method === "open" ? (handle) => discardHandle(vfs, handle) : undefined;
+        return (yield { promise: value, detach: method === "close" || method === "abort", release });
     }
     catch (error) {
+        if (error instanceof WouldBlock) {
+            const [errno] = VFS_ERRNOS.EAGAIN;
+            throw new HostCallFailure({ code: "EAGAIN", errno, message: "operation would block; use fs.promises", syscall, ...(path === undefined ? {} : { path }) }, true);
+        }
         throw vfsFailure(error, syscall, path);
     }
+}
+function discardHandle(vfs, handle) {
+    if (typeof handle === "number" && Number.isSafeInteger(handle) && handle >= 0)
+        return (vfs.abort ?? vfs.close).call(vfs, handle);
+}
+/* Runs an operation to completion before returning. Each Vfs promise goes to
+ * `settleLater`. A detached close or abort counts as done; any other call fails
+ * with EAGAIN, and the operation's own cleanup still runs. */
+function runInline(operation, settleLater) {
+    let step = operation.next();
+    while (!step.done) {
+        settleLater(step.value);
+        step = step.value.detach ? operation.next(undefined) : operation.throw(new WouldBlock());
+    }
+    return step.value;
+}
+/* Runs an operation inline until its Vfs first returns a promise, then
+ * continues asynchronously, so a Vfs that answers directly never suspends the
+ * guest. */
+function runAwaitable(operation) {
+    const first = operation.next();
+    if (first.done)
+        return first.value;
+    return (async () => {
+        let step = first;
+        while (!step.done) {
+            let value;
+            try {
+                value = await step.value.promise;
+            }
+            catch (error) {
+                step = operation.throw(error);
+                continue;
+            }
+            step = operation.next(value);
+        }
+        return step.value;
+    })();
 }
 function normalizeAbsolute(path) {
     const parts = [];
@@ -341,20 +412,20 @@ function openMode(flags, path) {
         default: throw invalidVfsCall("open", path);
     }
 }
-function openVfs(vfs, path, mode) {
-    const handle = callVfs(vfs, "open", [path, mode], "open", path);
+function* openVfs(vfs, path, mode) {
+    const handle = yield* callVfs(vfs, "open", [path, mode], "open", path);
     if (!Number.isSafeInteger(handle) || handle < 0) {
         try {
-            callVfs(vfs, "close", [handle], "close");
+            yield* callVfs(vfs, "close", [handle], "close");
         }
         catch { }
         throw vfsFailure(new Error("invalid VFS handle"), "open", path);
     }
     return handle;
 }
-function readAll(vfs, path, maximumBytes, checkpoint = () => { }) {
+function* readAll(vfs, path, maximumBytes, checkpoint = () => { }) {
     checkpoint();
-    const handle = openVfs(vfs, path, openMode("r", path));
+    const handle = yield* openVfs(vfs, path, openMode("r", path));
     const chunks = [];
     let length = 0;
     let failure;
@@ -362,7 +433,7 @@ function readAll(vfs, path, maximumBytes, checkpoint = () => { }) {
         for (;;) {
             checkpoint();
             const buffer = new Uint8Array(Math.min(8192, maximumBytes - Math.min(length, maximumBytes) + 1));
-            const count = callVfs(vfs, "readAt", [handle, length, buffer], "read");
+            const count = yield* callVfs(vfs, "readAt", [handle, length, buffer], "read");
             checkpoint();
             if (!Number.isSafeInteger(count) || count < 0 || count > buffer.byteLength)
                 throw vfsFailure(new Error("invalid VFS read count"), "read");
@@ -378,7 +449,7 @@ function readAll(vfs, path, maximumBytes, checkpoint = () => { }) {
         failure = error;
     }
     try {
-        callVfs(vfs, "close", [handle], "close");
+        yield* callVfs(vfs, "close", [handle], "close");
     }
     catch (error) {
         if (failure === undefined)
@@ -388,16 +459,16 @@ function readAll(vfs, path, maximumBytes, checkpoint = () => { }) {
         throw failure;
     return join(chunks, length);
 }
-function writeAll(vfs, path, data, append, checkpoint) {
+function* writeAll(vfs, path, data, append, checkpoint) {
     checkpoint();
     const mode = openMode(append ? "a" : "w", path);
-    const handle = openVfs(vfs, path, mode);
+    const handle = yield* openVfs(vfs, path, mode);
     let written = 0;
     let failure;
     try {
         while (written < data.byteLength) {
             checkpoint();
-            const count = callVfs(vfs, "writeAt", [handle, written, data.subarray(written)], "write");
+            const count = yield* callVfs(vfs, "writeAt", [handle, written, data.subarray(written)], "write");
             if (!Number.isSafeInteger(count) || count < 0 || count > data.byteLength - written)
                 throw vfsFailure(new Error("invalid VFS write count"), "write");
             if (count === 0)
@@ -409,7 +480,7 @@ function writeAll(vfs, path, data, append, checkpoint) {
         failure = error;
     }
     try {
-        callVfs(vfs, failure !== undefined && vfs.abort ? "abort" : "close", [handle], "close");
+        yield* callVfs(vfs, failure !== undefined && vfs.abort ? "abort" : "close", [handle], "close");
     }
     catch (error) {
         if (failure === undefined)
@@ -422,6 +493,21 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
     validateVfs(vfs);
     const files = new Map();
     let nextFd = 3;
+    let opening = 0;
+    // Vfs work the run started and has not seen settle, and the first failure
+    // among the closes it settles on the guest's behalf.
+    const inflight = new Set();
+    let failure;
+    const track = (work) => {
+        const settled = Promise.resolve(work).then(() => { }, () => { }).then(() => { inflight.delete(settled); });
+        inflight.add(settled);
+    };
+    const settleLater = ({ promise, detach, release }) => {
+        if (detach)
+            track(Promise.resolve(promise).catch((error) => { failure ??= vfsFailure(error, "close"); }));
+        else
+            track(release === undefined ? promise : Promise.resolve(promise).then(release));
+    };
     const absolute = (value) => {
         if (typeof value !== "string")
             throw invalidVfsCall("tinysandbox");
@@ -431,9 +517,9 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
         return path;
     };
     const readBytes = Math.min(hostInputBytes, Math.max(0, Math.floor((hostResponseBytes - 128) / 4) * 3));
-    const readFile = (path, cap) => {
+    const readFile = function* (path, cap) {
         try {
-            return readAll(vfs, path, cap, checkpoint);
+            return yield* readAll(vfs, path, cap, checkpoint);
         }
         catch (error) {
             if (error instanceof RangeError)
@@ -441,18 +527,26 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
             throw error;
         }
     };
-    const metadata = (path, syscall = "stat") => checkedMetadata(callVfs(vfs, "stat", [path], syscall, path), syscall, path);
-    // One buffer serves every read. The guest picks the length, so allocating and
-    // zeroing it per call let a script spend host time reading a 1-byte file with
-    // megabyte requests. Dispatch is synchronous and the bytes are encoded before
-    // it returns, so the next read can reuse the same memory.
-    let scratch = new Uint8Array(0);
-    const readInto = (length) => {
-        if (scratch.byteLength < length)
-            scratch = new Uint8Array(length);
-        return scratch.subarray(0, length);
+    const metadata = function* (path, syscall = "stat") {
+        return checkedMetadata(yield* callVfs(vfs, "stat", [path], syscall, path), syscall, path);
     };
-    const mkdirRecursive = (path) => {
+    // Reads reuse a spare buffer. The guest picks the length, so allocating and
+    // zeroing one per call let a script spend host time reading a 1-byte file
+    // with megabyte requests. A read waiting on the Vfs keeps its buffer, and one
+    // the synchronous API gave up on never returns it, so only overlapping reads
+    // allocate.
+    let spare;
+    const takeBuffer = (length) => {
+        const buffer = spare !== undefined && spare.byteLength >= length ? spare : new Uint8Array(length);
+        if (buffer === spare)
+            spare = undefined;
+        return buffer;
+    };
+    const returnBuffer = (buffer) => {
+        if (spare === undefined || buffer.byteLength > spare.byteLength)
+            spare = buffer;
+    };
+    const mkdirRecursive = function* (path) {
         checkpoint();
         if (path === "/")
             return;
@@ -461,58 +555,61 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
             checkpoint();
             current += `/${part}`;
             try {
-                callVfs(vfs, "mkdir", [current], "mkdir", path);
+                yield* callVfs(vfs, "mkdir", [current], "mkdir", path);
             }
             catch (error) {
-                if (!(error instanceof HostCallFailure) || error.payload.code !== "EEXIST" || metadata(current).fileType !== "directory")
+                if (!(error instanceof HostCallFailure) || error.payload.code !== "EEXIST" || (yield* metadata(current)).fileType !== "directory")
                     throw error;
             }
         }
     };
-    const removePath = (path, recursive) => {
+    const removePath = function* (path, recursive) {
         checkpoint();
         if (path.split("/").length > 257)
             throw invalidVfsCall("rm", path);
-        const info = metadata(path, "rm");
+        const info = yield* metadata(path, "rm");
         if (info.fileType === "file")
-            return callVfs(vfs, "unlink", [path], "unlink", path);
+            return yield* callVfs(vfs, "unlink", [path], "unlink", path);
         if (!recursive)
             throw vfsFailure(new VfsError("EISDIR"), "rm", path);
-        const entries = callVfs(vfs, "readdir", [path], "scandir", path);
+        const entries = yield* callVfs(vfs, "readdir", [path], "scandir", path);
         if (!Array.isArray(entries))
             throw vfsFailure(new Error("invalid VFS directory entries"), "scandir", path);
         for (const entry of entries) {
             if (!entry || typeof entry.name !== "string" || entry.name.includes("/"))
                 throw vfsFailure(new Error("invalid VFS directory entry"), "scandir", path);
-            removePath(path === "/" ? `/${entry.name}` : `${path}/${entry.name}`, true);
+            yield* removePath(path === "/" ? `/${entry.name}` : `${path}/${entry.name}`, true);
         }
-        return callVfs(vfs, "rmdir", [path], "rmdir", path);
+        return yield* callVfs(vfs, "rmdir", [path], "rmdir", path);
     };
-    const dispatch = (op, args) => {
+    const dispatch = function* (op, args) {
         checkpoint();
         switch (op) {
             case "readFile": {
                 const path = absolute(args?.path);
-                return encodeBase64(remapHostFailure(() => readFile(path, readBytes), "open", path));
+                return encodeBase64(yield* remapHostFailure(() => readFile(path, readBytes), "open", path));
             }
             case "writeFile": {
                 const path = absolute(args?.path);
-                remapHostFailure(() => writeAll(vfs, path, decodeBase64(args?.data, hostInputBytes), false, checkpoint), "open", path);
+                yield* remapHostFailure(() => writeAll(vfs, path, decodeBase64(args?.data, hostInputBytes), false, checkpoint), "open", path);
                 return null;
             }
             case "appendFile": {
                 const path = absolute(args?.path);
-                remapHostFailure(() => writeAll(vfs, path, decodeBase64(args?.data, hostInputBytes), true, checkpoint), "open", path);
+                yield* remapHostFailure(() => writeAll(vfs, path, decodeBase64(args?.data, hostInputBytes), true, checkpoint), "open", path);
                 return null;
             }
             case "mkdir": {
                 const path = absolute(args?.path);
-                args?.recursive ? mkdirRecursive(path) : callVfs(vfs, "mkdir", [path], "mkdir", path);
+                if (args?.recursive)
+                    yield* mkdirRecursive(path);
+                else
+                    yield* callVfs(vfs, "mkdir", [path], "mkdir", path);
                 return null;
             }
             case "readdir": {
                 const path = absolute(args?.path);
-                const entries = callVfs(vfs, "readdir", [path], "scandir", path);
+                const entries = yield* callVfs(vfs, "readdir", [path], "scandir", path);
                 if (!Array.isArray(entries))
                     throw vfsFailure(new Error("invalid VFS directory entries"), "scandir", path);
                 return entries.map((entry) => {
@@ -525,19 +622,19 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
                 });
             }
             case "stat": {
-                const info = metadata(absolute(args?.path));
+                const info = yield* metadata(absolute(args?.path));
                 return { size: info.len, isFile: info.fileType === "file", isDirectory: info.fileType === "directory" };
             }
             case "rename": {
                 const from = absolute(args?.from);
                 const to = absolute(args?.to);
-                callVfs(vfs, "rename", [from, to], "rename", from);
+                yield* callVfs(vfs, "rename", [from, to], "rename", from);
                 return null;
             }
             case "rm": {
                 const path = absolute(args?.path);
                 try {
-                    removePath(path, !!args?.recursive);
+                    yield* removePath(path, !!args?.recursive);
                 }
                 catch (error) {
                     if (!(args?.force && error instanceof HostCallFailure && error.payload.code === "ENOENT"))
@@ -547,28 +644,53 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
             }
             case "unlink": {
                 const path = absolute(args?.path);
-                callVfs(vfs, "unlink", [path], "unlink", path);
+                yield* callVfs(vfs, "unlink", [path], "unlink", path);
                 return null;
             }
             case "rmdir": {
                 const path = absolute(args?.path);
-                args?.recursive ? removePath(path, true) : callVfs(vfs, "rmdir", [path], "rmdir", path);
+                if (args?.recursive)
+                    yield* removePath(path, true);
+                else
+                    yield* callVfs(vfs, "rmdir", [path], "rmdir", path);
                 return null;
             }
             case "exists": {
                 try {
-                    metadata(absolute(args?.path));
+                    yield* metadata(absolute(args?.path));
                     return true;
                 }
-                catch {
+                // A stat the synchronous API could not wait for says nothing either way.
+                catch (error) {
+                    if (error instanceof HostCallFailure && error.wouldBlock)
+                        throw error;
                     return false;
                 }
             }
             case "open": {
-                if (files.size >= maxOpenFiles || nextFd >= Number.MAX_SAFE_INTEGER)
+                if (files.size + opening >= maxOpenFiles || nextFd >= Number.MAX_SAFE_INTEGER)
                     throw vfsFailure(new VfsError("ENOSPC"), "open");
                 const path = absolute(args?.path);
-                const handle = openVfs(vfs, path, openMode(args?.flags, path));
+                const mode = openMode(args?.flags, path);
+                opening++;
+                let handle;
+                try {
+                    handle = yield* openVfs(vfs, path, mode);
+                }
+                finally {
+                    opening--;
+                }
+                try {
+                    // An awaited open can finish after the run has ended.
+                    checkpoint();
+                }
+                catch (error) {
+                    try {
+                        yield* callVfs(vfs, vfs.abort ? "abort" : "close", [handle], "close");
+                    }
+                    catch { }
+                    throw error;
+                }
                 const fd = nextFd++;
                 files.set(fd, { handle, position: 0 });
                 return fd;
@@ -581,13 +703,15 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
                 const position = checkedInteger(args?.position, "tinysandbox", undefined, true);
                 const offset = position ?? file.position;
                 const length = Math.min(MAX_HOST_READ_BYTES, readBytes, checkedInteger(args?.length, "tinysandbox"));
-                const buffer = readInto(length);
-                const count = callVfs(vfs, "readAt", [file.handle, offset, buffer], "read");
+                const buffer = takeBuffer(length);
+                const count = yield* callVfs(vfs, "readAt", [file.handle, offset, buffer.subarray(0, length)], "read");
                 if (!Number.isSafeInteger(count) || count < 0 || count > length)
                     throw vfsFailure(new Error("invalid VFS read count"), "read");
                 if (position === null)
                     file.position += count;
-                return { bytesRead: count, data: encodeBase64(buffer.subarray(0, count)) };
+                const data = encodeBase64(buffer.subarray(0, count));
+                returnBuffer(buffer);
+                return { bytesRead: count, data };
             }
             case "write": {
                 const fd = checkedInteger(args?.fd, "tinysandbox");
@@ -597,7 +721,7 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
                 const position = checkedInteger(args?.position, "tinysandbox", undefined, true);
                 const offset = position ?? file.position;
                 const data = decodeBase64(args?.data, hostInputBytes);
-                const count = callVfs(vfs, "writeAt", [file.handle, offset, data], "write");
+                const count = yield* callVfs(vfs, "writeAt", [file.handle, offset, data], "write");
                 if (!Number.isSafeInteger(count) || count < 0 || count > data.byteLength)
                     throw vfsFailure(new Error("invalid VFS write count"), "write");
                 if (position === null)
@@ -609,7 +733,7 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
                 const file = files.get(fd);
                 if (!file)
                     throw vfsFailure(new VfsError("EBADF"), "ftruncate");
-                callVfs(vfs, "truncate", [file.handle, checkedInteger(args?.len ?? 0, "tinysandbox")], "ftruncate");
+                yield* callVfs(vfs, "truncate", [file.handle, checkedInteger(args?.len ?? 0, "tinysandbox")], "ftruncate");
                 return null;
             }
             case "close": {
@@ -617,50 +741,71 @@ function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpe
                 const file = files.get(fd);
                 if (!file)
                     throw vfsFailure(new VfsError("EBADF"), "close");
+                // close() consumes the descriptor even when it fails, and the Vfs may
+                // still be closing when the run ends, so the entry goes first. A failed
+                // close discards whatever it staged instead.
+                files.delete(fd);
                 try {
-                    callVfs(vfs, "close", [file.handle], "close");
+                    yield* callVfs(vfs, "close", [file.handle], "close");
                 }
                 catch (error) {
-                    // close() consumes the descriptor even when it reports an error, so
-                    // dropping the entry first would strand the handle beyond the reach
-                    // of closeAll. Discard whatever the failed close staged instead.
                     if (vfs.abort) {
                         try {
-                            callVfs(vfs, "abort", [file.handle], "close");
+                            yield* callVfs(vfs, "abort", [file.handle], "close");
                         }
                         catch { }
                     }
                     throw error;
-                }
-                finally {
-                    files.delete(fd);
                 }
                 return null;
             }
             case "copyFile": {
                 const source = absolute(args?.src);
                 const destination = absolute(args?.dest);
-                const data = remapHostFailure(() => readFile(source, hostInputBytes), "copyfile", source);
-                remapHostFailure(() => writeAll(vfs, destination, data, false, checkpoint), "copyfile", destination);
+                const data = yield* remapHostFailure(() => readFile(source, hostInputBytes), "copyfile", source);
+                yield* remapHostFailure(() => writeAll(vfs, destination, data, false, checkpoint), "copyfile", destination);
                 return null;
             }
             default: throw invalidVfsCall("tinysandbox");
         }
     };
-    const closeAll = (commit) => {
-        let failure;
+    // For a guest that needs the answer before the call returns.
+    const dispatchInline = (op, args) => runInline(dispatch(op, args), settleLater);
+    // For a guest that awaits the answer.
+    const dispatchAwaitable = (op, args) => {
+        const answer = runAwaitable(dispatch(op, args));
+        if (answer instanceof Promise)
+            track(answer);
+        return answer;
+    };
+    const settle = async (expiry) => {
+        while (inflight.size > 0) {
+            if (!await Promise.race([Promise.all(inflight).then(() => true), expiry().then(() => false)]))
+                return false;
+        }
+        return true;
+    };
+    // Ends the run's filesystem work. Calls still running settle first; now that
+    // the run is over they stop at their next checkpoint. Remaining descriptors
+    // then close, or abort when the run was cut short. Waiting stops at expiry.
+    const finish = async (commit, expiry) => {
+        let expired = !await settle(expiry);
         for (const { handle } of files.values()) {
             try {
-                callVfs(vfs, !commit && vfs.abort ? "abort" : "close", [handle], "close");
+                const closing = runAwaitable(callVfs(vfs, !commit && vfs.abort ? "abort" : "close", [handle], "close"));
+                if (closing instanceof Promise)
+                    track(closing.catch((error) => { failure ??= error; }));
             }
             catch (error) {
                 failure ??= error;
             }
         }
         files.clear();
-        return failure;
+        if (!await settle(expiry))
+            expired = true;
+        return { failure, expired };
     };
-    return { dispatch, closeAll };
+    return { dispatchInline, dispatchAwaitable, finish };
 }
 function exposedHostError(payload) {
     const where = payload.path === undefined ? (payload.syscall ? `, ${payload.syscall}` : "") : `, ${payload.syscall} '${payload.path}'`;
@@ -672,14 +817,15 @@ function exposedHostError(payload) {
         error.path = payload.path;
     return error;
 }
-function remapHostFailure(operation, syscall, path) {
+function* remapHostFailure(operation, syscall, path) {
     try {
-        return operation();
+        return yield* operation();
     }
     catch (error) {
-        if (error instanceof HostCallFailure)
-            throw vfsFailure(new VfsError(error.payload.code), syscall, path);
-        throw error;
+        if (!(error instanceof HostCallFailure))
+            throw error;
+        const { code, errno, message } = error.payload;
+        throw new HostCallFailure({ code, errno, message, syscall, ...(path === undefined ? {} : { path }) }, error.wouldBlock);
     }
 }
 export async function createEngine(wasm) {
@@ -774,26 +920,9 @@ export async function createEngine(wasm) {
             };
             const onAbort = () => { isCancelled(); };
             const cancellationMessage = () => signal?.aborted ? "command cancelled" : "command timed out";
-            // One timer for the whole run, created on first suspension and released
-            // when it ends, so a guest making many host calls does not accumulate
-            // timers or keep the event loop alive after it finishes.
-            let expiry;
-            let releaseExpiry = () => { };
-            const deadlineExpiry = () => {
-                if (expiry === undefined) {
-                    expiry = new Promise((resolve) => {
-                        const timer = setTimeout(() => resolve(undefined), Math.max(0, deadline - monotonicNow()));
-                        const onAborted = () => resolve(undefined);
-                        signal?.addEventListener("abort", onAborted, { once: true });
-                        releaseExpiry = () => {
-                            clearTimeout(timer);
-                            signal?.removeEventListener("abort", onAborted);
-                            resolve(undefined);
-                        };
-                    });
-                }
-                return expiry;
-            };
+            // One timer for the whole run, so a guest making many host calls does not
+            // accumulate timers.
+            const expiry = expiryTimer(deadline, signal);
             const checkpoint = () => {
                 if (isCancelled())
                     throw new RunLimitError("timeout", cancellationMessage());
@@ -859,15 +988,29 @@ export async function createEngine(wasm) {
                         return 0;
                     }
                     if (op !== "global") {
+                        let answer;
                         try {
-                            const value = vfsDispatcher.dispatch(op, argument);
-                            checkpoint();
-                            setResponse({ value });
+                            // Without a slot the guest needs the answer before this returns:
+                            // the synchronous fs API, or fs.promises with every slot taken.
+                            answer = callId < 0 ? vfsDispatcher.dispatchInline(op, argument) : vfsDispatcher.dispatchAwaitable(op, argument);
                         }
                         catch (error) {
-                            setResponse({ error: error instanceof HostCallFailure ? error.payload : jsonError(error) });
+                            setResponse({ error: hostFailure(error) });
+                            return HOST_INLINE;
                         }
-                        return 0;
+                        if (answer instanceof Promise) {
+                            deferred.set(callId, answer.then((value) => ({ callId, response: { value } }), (error) => ({ callId, response: { error: hostFailure(error) } })));
+                            checkpoint();
+                            return HOST_DEFERRED;
+                        }
+                        try {
+                            checkpoint();
+                            setResponse({ value: answer });
+                        }
+                        catch (error) {
+                            setResponse({ error: hostFailure(error) });
+                        }
+                        return HOST_INLINE;
                     }
                     const name = argument?.name;
                     const handler = typeof name === "string" ? globals[name] : undefined;
@@ -955,6 +1098,7 @@ export async function createEngine(wasm) {
             let instance;
             let exitCode = 1;
             let cleanupFailure;
+            let cleanupExpired = false;
             let completed = false;
             try {
                 signal?.addEventListener("abort", onAbort, { once: true });
@@ -990,7 +1134,7 @@ export async function createEngine(wasm) {
                     // that never settles must not outlive the deadline, so the wait races
                     // a timer: suspension is the one point where no guest checkpoint can
                     // observe the clock.
-                    const settled = await Promise.race([...deferred.values(), deadlineExpiry()]);
+                    const settled = await Promise.race([...deferred.values(), expiry.wait()]);
                     if (settled === undefined) {
                         timedOut = true;
                         break;
@@ -1017,15 +1161,23 @@ export async function createEngine(wasm) {
             }
             finally {
                 finished = true;
-                releaseExpiry();
                 signal?.removeEventListener("abort", onAbort);
                 isCancelled();
                 // Commit whenever the guest reached its own end. The exit status is the
                 // script's to choose, and a descriptor it closed itself already
                 // committed regardless of it; keying durability on the status instead
                 // would split one run's writes between committed and discarded.
-                // Rollback belongs to the runs the host cut short.
-                cleanupFailure = vfsDispatcher?.closeAll(completed && !timedOut && limitFailure === undefined);
+                // Rollback belongs to the runs the host cut short. Like a host promise
+                // the guest awaits, Vfs work is not waited on past the deadline.
+                if (vfsDispatcher !== undefined) {
+                    const settled = await vfsDispatcher.finish(completed && !timedOut && limitFailure === undefined, expiry.wait);
+                    cleanupFailure = settled.failure;
+                    cleanupExpired = settled.expired;
+                }
+                expiry.release();
+            }
+            if (cleanupExpired) {
+                return { exitCode: 124, stdout: "", stderr: `js: ${cancellationMessage()}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: memory.buffer.byteLength };
             }
             if (cleanupFailure !== undefined && exitCode === 0) {
                 exitCode = 1;
@@ -1056,9 +1208,23 @@ export async function createEngine(wasm) {
             const cwd = resolvePath("/", options.cwd ?? "/");
             const resolved = resolvePath(cwd, path);
             const sourceBytes = integerOption("sourceBytes", options.sourceBytes, DEFAULT_SOURCE_BYTES);
+            const sourceCap = Math.min(sourceBytes, integerOption("hostInputBytes", options.hostInputBytes, DEFAULT_HOST_INPUT_BYTES));
             let bytes;
             try {
-                bytes = remapHostFailure(() => readAll(vfs, resolved, Math.min(sourceBytes, integerOption("hostInputBytes", options.hostInputBytes, DEFAULT_HOST_INPUT_BYTES)), checkpoint), "open", resolved);
+                bytes = runAwaitable(remapHostFailure(() => readAll(vfs, resolved, sourceCap, checkpoint), "open", resolved));
+                if (bytes instanceof Promise) {
+                    // The read keeps running if the deadline wins; its next checkpoint
+                    // stops it and closes the entry.
+                    const expiry = expiryTimer(deadline, options.signal);
+                    try {
+                        bytes = await Promise.race([bytes, expiry.wait()]);
+                    }
+                    finally {
+                        expiry.release();
+                    }
+                    if (bytes === undefined)
+                        throw new RunLimitError("timeout", options.signal?.aborted ? "command cancelled" : "command timed out");
+                }
             }
             catch (error) {
                 if (error instanceof RunLimitError && error.kind === "timeout")

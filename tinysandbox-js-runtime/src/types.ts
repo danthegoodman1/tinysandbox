@@ -12,7 +12,7 @@ export interface HostContext {
 /** A global may answer immediately or return a promise the guest awaits. */
 export type HostGlobal = (argument: JsonValue, context: HostContext) => JsonValue | Promise<JsonValue>;
 
-export type VfsErrno = "EBADF" | "EBUSY" | "EXDEV" | "EACCES" | "EEXIST" | "EFBIG" | "EIO" | "EINVAL" | "EISDIR" | "ENOENT" | "ENOSPC" | "ENOTDIR" | "ENOTEMPTY";
+export type VfsErrno = "EAGAIN" | "EBADF" | "EBUSY" | "EXDEV" | "EACCES" | "EEXIST" | "EFBIG" | "EIO" | "EINVAL" | "EISDIR" | "ENOENT" | "ENOSPC" | "ENOTDIR" | "ENOTEMPTY";
 
 export interface VfsMetadata {
   fileType: "file" | "directory";
@@ -33,21 +33,26 @@ export interface VfsOpenMode {
   append: boolean;
 }
 
-/** Synchronous, absolute-path, handle-and-offset filesystem capability. */
+/**
+ * Absolute-path, handle-and-offset filesystem capability. A method may answer
+ * directly or return a promise. Guest `fs.promises` calls wait for a promise;
+ * the synchronous guest API and `require()` fail with EAGAIN instead.
+ */
 export interface Vfs {
-  stat(path: string): VfsMetadata;
-  readdir(path: string): VfsDirEntry[];
-  mkdir(path: string): void;
-  rename(from: string, to: string): void;
-  unlink(path: string): void;
-  rmdir(path: string): void;
-  open(path: string, mode: VfsOpenMode): number;
-  readAt(handle: number, offset: number, buffer: Uint8Array): number;
-  writeAt(handle: number, offset: number, data: Uint8Array): number;
-  truncate(handle: number, len: number): void;
-  close(handle: number): void;
+  stat(path: string): VfsMetadata | Promise<VfsMetadata>;
+  readdir(path: string): VfsDirEntry[] | Promise<VfsDirEntry[]>;
+  mkdir(path: string): void | Promise<void>;
+  rename(from: string, to: string): void | Promise<void>;
+  unlink(path: string): void | Promise<void>;
+  rmdir(path: string): void | Promise<void>;
+  open(path: string, mode: VfsOpenMode): number | Promise<number>;
+  /** A promise must fill `buffer` before it resolves. */
+  readAt(handle: number, offset: number, buffer: Uint8Array): number | Promise<number>;
+  writeAt(handle: number, offset: number, data: Uint8Array): number | Promise<number>;
+  truncate(handle: number, len: number): void | Promise<void>;
+  close(handle: number): void | Promise<void>;
   /** Discard staged writes on failure; falls back to close when omitted. */
-  abort?(handle: number): void;
+  abort?(handle: number): void | Promise<void>;
 }
 
 export interface RunCodeOptions {
