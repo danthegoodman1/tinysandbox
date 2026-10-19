@@ -63,7 +63,7 @@ impl ExecutionControl {
     pub(crate) fn acquire_file(&self) -> VfsResult<()> {
         self.check()?;
         self.open_files
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.limits.max_open_files).then_some(n + 1)
             })
             .map(|_| ())
