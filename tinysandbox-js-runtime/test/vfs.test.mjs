@@ -620,3 +620,57 @@ test("a rejecting asynchronous Vfs surfaces in the guest without an unhandled re
   }
   assert.equal(unhandled, undefined);
 });
+
+test("Vfs calls get a context whose signal outlives the guest until the run stops waiting", async () => {
+  // A hung read: the signal aborts at the deadline, which lets the Vfs cancel it.
+  const hung = new AsyncTestVfs({ "/data": "x" });
+  let readContext;
+  hung.readAt = (handle, offset, buffer, context) => {
+    readContext = context;
+    return new Promise((resolve, reject) => context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true }));
+  };
+  const timedOut = await engine.runCode("require('fs').promises.readFile('/data')", { vfs: hung, timeoutMs: 50 });
+  assert.equal(timedOut.exitCode, 124);
+  assert.equal(readContext.signal.aborted, true);
+  assert.equal(readContext.isCancelled(), true);
+  assert.equal(readContext.remainingTimeMs(), 0);
+  assert.ok(Math.abs(readContext.deadlineMs - Date.now()) < 1000);
+  // The run does not wait past its deadline, so the cancelled read's close lands just after.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(hung.handles.size, 0, "the cancelled read closed its handle");
+
+  // The caller's signal aborts it as well.
+  const cancelled = new AsyncTestVfs({ "/data": "x" });
+  cancelled.readAt = hung.readAt;
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(new Error("caller stopped")), 20);
+  const stopped = await engine.runCode("require('fs').promises.readFile('/data')", { vfs: cancelled, timeoutMs: 10_000, signal: controller.signal });
+  assert.equal(stopped.exitCode, 124);
+  assert.equal(readContext.signal.reason.message, "caller stopped");
+
+  // A commit after the guest finished still sees a live signal; the run then
+  // resolves and aborts it.
+  const committing = new CommittingVfs({ "/out/.keep": "" });
+  let commitContext, abortedDuringCommit;
+  const commit = committing.close.bind(committing);
+  committing.close = (handle, context) => {
+    commitContext = context;
+    abortedDuringCommit = context.signal.aborted;
+    return commit(handle, context);
+  };
+  const finished = await engine.runCode("require('fs').writeFileSync('/out/a.txt', 'A')", { vfs: committing });
+  assert.equal(finished.exitCode, 0, finished.stderr);
+  assert.deepEqual(committing.committed, ["/out/a.txt"]);
+  assert.equal(abortedDuringCommit, false);
+  assert.equal(commitContext.signal.aborted, true);
+
+  // runFile reads its entry with the same kind of context.
+  const entry = new AsyncTestVfs({ "/script.js": "console.log('ran')" });
+  entry.readAt = hung.readAt;
+  const unread = await engine.runFile("/script.js", { vfs: entry, timeoutMs: 50 });
+  assert.equal(unread.exitCode, 124);
+  assert.equal(readContext.signal.aborted, true);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(entry.handles.size, 0);
+});
+

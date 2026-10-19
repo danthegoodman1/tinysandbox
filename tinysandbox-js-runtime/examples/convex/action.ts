@@ -1,23 +1,24 @@
-import { createEngine, VfsError, type Vfs } from "@tinysandbox/js-runtime";
+import { createEngine, VfsError, type Vfs, type VfsContext } from "@tinysandbox/js-runtime";
 import quickjsModule from "@tinysandbox/js-runtime/quickjs.wasm";
 import { action } from "./_generated/server";
 
 // A read-only Vfs over an object store such as S3. Every call returns a
 // promise, as a network client would, so guest code reads through fs.promises.
-function objectStoreVfs(get: (key: string) => Promise<Uint8Array | undefined>): Vfs {
+// The context's signal cancels a fetch the run will no longer wait for.
+function objectStoreVfs(get: (key: string, signal: AbortSignal) => Promise<Uint8Array | undefined>): Vfs {
   const handles = new Map<number, Uint8Array>();
   let nextHandle = 1;
   const readOnly = async () => { throw new VfsError("EACCES"); };
-  const object = async (path: string) => {
-    const data = await get(path);
+  const object = async (path: string, { signal }: VfsContext) => {
+    const data = await get(path, signal);
     if (data === undefined) throw new VfsError("ENOENT");
     return data;
   };
   return {
-    async stat(path) { return { fileType: "file", len: (await object(path)).byteLength }; },
-    async open(path, mode) {
+    async stat(path, context) { return { fileType: "file", len: (await object(path, context)).byteLength }; },
+    async open(path, mode, context) {
       if (mode.write) throw new VfsError("EACCES");
-      handles.set(nextHandle, await object(path));
+      handles.set(nextHandle, await object(path, context));
       return nextHandle++;
     },
     async readAt(handle, offset, buffer) {

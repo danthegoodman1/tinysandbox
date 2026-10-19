@@ -1,4 +1,4 @@
-import type { JsonValue, HostGlobal, HostContext, VfsErrno, VfsMetadata, VfsOpenMode, Vfs, RunCodeOptions, RunFileOptions, RunResult, JsEngine } from "./types.js";
+import type { JsonValue, HostGlobal, HostContext, VfsContext, VfsErrno, VfsMetadata, VfsOpenMode, Vfs, RunCodeOptions, RunFileOptions, RunResult, JsEngine } from "./types.js";
 export type * from "./types.js";
 
 type ErrorPayload = { message: string; code?: string };
@@ -266,13 +266,37 @@ function hostFailure(error: unknown) {
   return error instanceof HostCallFailure ? error.payload : jsonError(error);
 }
 
+const VFS_METHODS = ["stat", "readdir", "mkdir", "rename", "unlink", "rmdir", "open", "readAt", "writeAt", "truncate", "close"] as const;
+
 function validateVfs(vfs: unknown): Vfs {
   if (vfs === null || typeof vfs !== "object") throw new TypeError("vfs must be an object implementing the Vfs interface");
-  for (const method of ["stat", "readdir", "mkdir", "rename", "unlink", "rmdir", "open", "readAt", "writeAt", "truncate", "close"]) {
+  for (const method of VFS_METHODS) {
     if (typeof record(vfs)[method] !== "function") throw new TypeError(`vfs.${method} must be a function`);
   }
   if (record(vfs).abort !== undefined && typeof record(vfs).abort !== "function") throw new TypeError("vfs.abort must be a function when supplied");
   return vfs as Vfs;
+}
+
+/* A Vfs whose methods already carry the run's context. */
+type WithoutContext<F> = F extends (...args: [...infer A, VfsContext]) => infer R ? (...args: A) => R : never;
+type BoundVfs = { [K in keyof Vfs]: WithoutContext<NonNullable<Vfs[K]>> };
+
+function withContext(vfs: Vfs, context: VfsContext): BoundVfs {
+  const bind = (method: keyof Vfs) => (...args: unknown[]) => (vfs[method] as (...parameters: unknown[]) => unknown).call(vfs, ...args, context);
+  const bound: Record<string, unknown> = Object.fromEntries(VFS_METHODS.map((method) => [method, bind(method)]));
+  if (vfs.abort !== undefined) bound.abort = bind("abort");
+  return bound as BoundVfs;
+}
+
+/* `refresh` lets polling observe a deadline or abort that no timer has
+ * reported yet. */
+function vfsContext(deadline: number, signal: AbortSignal, refresh: () => void): VfsContext {
+  return Object.freeze({
+    signal,
+    deadlineMs: Date.now() + Math.max(0, deadline - monotonicNow()),
+    remainingTimeMs: () => { refresh(); return signal.aborted ? 0 : Math.max(0, deadline - monotonicNow()); },
+    isCancelled: () => { refresh(); return signal.aborted; },
+  });
 }
 
 /* A Vfs method may return a promise, so filesystem operations are generators
@@ -282,14 +306,14 @@ function validateVfs(vfs: unknown): Vfs {
  * `release` cleans up a result that arrives after its caller gave up. */
 type PendingVfsCall = { promise: PromiseLike<unknown>; detach: boolean; release?: (value: unknown) => unknown };
 type VfsOperation<T> = Generator<PendingVfsCall, T, unknown>;
-type VfsResult<K extends keyof Vfs> = Awaited<ReturnType<NonNullable<Vfs[K]>>>;
+type VfsResult<K extends keyof BoundVfs> = Awaited<ReturnType<NonNullable<BoundVfs[K]>>>;
 
 /* Thrown into an operation at a Vfs promise its caller cannot wait for. */
 class WouldBlock extends Error {}
 
-function* callVfs<K extends keyof Vfs>(vfs: Vfs, method: K, args: Parameters<NonNullable<Vfs[K]>>, syscall: string, path?: string): VfsOperation<VfsResult<K>> {
+function* callVfs<K extends keyof BoundVfs>(vfs: BoundVfs, method: K, args: Parameters<NonNullable<BoundVfs[K]>>, syscall: string, path?: string): VfsOperation<VfsResult<K>> {
   try {
-    const operation = vfs[method] as (...parameters: Parameters<NonNullable<Vfs[K]>>) => ReturnType<NonNullable<Vfs[K]>>;
+    const operation = vfs[method] as unknown as (...parameters: unknown[]) => unknown;
     const value = operation.apply(vfs, args);
     if (!thenable(value)) return value as VfsResult<K>;
     const release = method === "open" ? (handle: unknown) => discardHandle(vfs, handle) : undefined;
@@ -303,7 +327,7 @@ function* callVfs<K extends keyof Vfs>(vfs: Vfs, method: K, args: Parameters<Non
   }
 }
 
-function discardHandle(vfs: Vfs, handle: unknown) {
+function discardHandle(vfs: BoundVfs, handle: unknown) {
   if (typeof handle === "number" && Number.isSafeInteger(handle) && handle >= 0) return (vfs.abort ?? vfs.close).call(vfs, handle);
 }
 
@@ -425,7 +449,7 @@ function openMode(flags: unknown, path: string): VfsOpenMode {
   }
 }
 
-function* openVfs(vfs: Vfs, path: string, mode: VfsOpenMode): VfsOperation<number> {
+function* openVfs(vfs: BoundVfs, path: string, mode: VfsOpenMode): VfsOperation<number> {
   const handle = yield* callVfs(vfs, "open", [path, mode], "open", path);
   if (!Number.isSafeInteger(handle) || handle < 0) {
     try { yield* callVfs(vfs, "close", [handle], "close"); } catch {}
@@ -434,7 +458,7 @@ function* openVfs(vfs: Vfs, path: string, mode: VfsOpenMode): VfsOperation<numbe
   return handle;
 }
 
-function* readAll(vfs: Vfs, path: string, maximumBytes: number, checkpoint: () => void = () => {}): VfsOperation<Uint8Array> {
+function* readAll(vfs: BoundVfs, path: string, maximumBytes: number, checkpoint: () => void = () => {}): VfsOperation<Uint8Array> {
   checkpoint();
   const handle = yield* openVfs(vfs, path, openMode("r", path));
   const chunks: Uint8Array[] = [];
@@ -464,7 +488,7 @@ function* readAll(vfs: Vfs, path: string, maximumBytes: number, checkpoint: () =
   return join(chunks, length);
 }
 
-function* writeAll(vfs: Vfs, path: string, data: Uint8Array, append: boolean, checkpoint: () => void): VfsOperation<void> {
+function* writeAll(vfs: BoundVfs, path: string, data: Uint8Array, append: boolean, checkpoint: () => void): VfsOperation<void> {
   checkpoint();
   const mode = openMode(append ? "a" : "w", path);
   const handle = yield* openVfs(vfs, path, mode);
@@ -489,8 +513,7 @@ function* writeAll(vfs: Vfs, path: string, data: Uint8Array, append: boolean, ch
   if (failure !== undefined) throw failure;
 }
 
-function createVfsDispatcher(vfs: Vfs, cwd: string, hostInputBytes: number, hostResponseBytes: number, maxOpenFiles: number, checkpoint: () => void) {
-  validateVfs(vfs);
+function createVfsDispatcher(vfs: BoundVfs, cwd: string, hostInputBytes: number, hostResponseBytes: number, maxOpenFiles: number, checkpoint: () => void) {
   const files = new Map<number, { handle: number; position: number }>();
   let nextFd = 3;
   let opening = 0;
@@ -796,6 +819,12 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
         throw new TypeError("signal must be an AbortSignal");
       }
       const controller = new AbortController();
+      // Vfs calls keep their signal through teardown, so commits can finish
+      // after the guest does. It aborts once the run stops waiting on them.
+      const vfsController = new AbortController();
+      const stopVfs = () => {
+        if (!vfsController.signal.aborted) vfsController.abort(signal?.reason ?? new DOMException("Execution ended", "AbortError"));
+      };
       const memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: maximumPages });
       const stdout: Uint8Array[] = [];
       const stderr: Uint8Array[] = [];
@@ -812,6 +841,7 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
         if ((finished || timedOut) && !controller.signal.aborted) {
           controller.abort(signal?.reason ?? new DOMException("Execution ended", "AbortError"));
         }
+        if (timedOut) stopVfs();
         return finished || timedOut;
       };
       const deadlineMs = Date.now() + Math.max(0, deadline - monotonicNow());
@@ -845,7 +875,7 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       const checkpoint = () => {
         if (isCancelled()) throw new RunLimitError("timeout", cancellationMessage());
       };
-      const vfsDispatcher = vfs === undefined ? undefined : createVfsDispatcher(vfs, resolvePath("/", options.cwd ?? "/"), hostInputBytes, hostResponseBytes, maxOpenFiles, checkpoint);
+      const vfsDispatcher = vfs === undefined ? undefined : createVfsDispatcher(withContext(vfs, vfsContext(deadline, vfsController.signal, isCancelled)), resolvePath("/", options.cwd ?? "/"), hostInputBytes, hostResponseBytes, maxOpenFiles, checkpoint);
 
       const read = (pointer: number, length: number) => {
         if (!Number.isInteger(pointer) || !Number.isInteger(length) || pointer < 0 || length < 0 || pointer + length > memory.buffer.byteLength) {
@@ -1077,6 +1107,7 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
           cleanupFailure = settled.failure;
           cleanupExpired = settled.expired;
         }
+        stopVfs();
         expiry.release();
       }
       if (cleanupExpired) {
@@ -1108,9 +1139,14 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
       const resolved = resolvePath(cwd, path);
       const sourceBytes = integerOption("sourceBytes", options.sourceBytes, DEFAULT_SOURCE_BYTES);
       const sourceCap = Math.min(sourceBytes, integerOption("hostInputBytes", options.hostInputBytes, DEFAULT_HOST_INPUT_BYTES));
+      const reading = new AbortController();
+      const stopReading = () => {
+        if (!reading.signal.aborted) reading.abort(options.signal?.reason ?? new DOMException("Execution ended", "AbortError"));
+      };
+      const context = vfsContext(deadline, reading.signal, () => { if (options.signal?.aborted || monotonicNow() >= deadline) stopReading(); });
       let bytes;
       try {
-        bytes = runAwaitable(remapHostFailure(() => readAll(vfs, resolved, sourceCap, checkpoint), "open", resolved));
+        bytes = runAwaitable(remapHostFailure(() => readAll(withContext(vfs, context), resolved, sourceCap, checkpoint), "open", resolved));
         if (bytes instanceof Promise) {
           // The read keeps running if the deadline wins; its next checkpoint
           // stops it and closes the entry.
@@ -1122,6 +1158,8 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
         if (error instanceof RunLimitError && error.kind === "timeout") return { exitCode: 124, stdout: "", stderr: `js: ${error.message}\n`, initialWasmMemoryBytes: QUICKJS_INITIAL_MEMORY_BYTES, peakWasmMemoryBytes: 0 };
         if (error instanceof HostCallFailure) throw exposedHostError(error.payload);
         throw error;
+      } finally {
+        stopReading();
       }
       let code;
       try {

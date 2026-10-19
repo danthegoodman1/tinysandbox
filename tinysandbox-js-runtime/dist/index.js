@@ -251,16 +251,34 @@ function invalidVfsCall(syscall, path) {
 function hostFailure(error) {
     return error instanceof HostCallFailure ? error.payload : jsonError(error);
 }
+const VFS_METHODS = ["stat", "readdir", "mkdir", "rename", "unlink", "rmdir", "open", "readAt", "writeAt", "truncate", "close"];
 function validateVfs(vfs) {
     if (vfs === null || typeof vfs !== "object")
         throw new TypeError("vfs must be an object implementing the Vfs interface");
-    for (const method of ["stat", "readdir", "mkdir", "rename", "unlink", "rmdir", "open", "readAt", "writeAt", "truncate", "close"]) {
+    for (const method of VFS_METHODS) {
         if (typeof record(vfs)[method] !== "function")
             throw new TypeError(`vfs.${method} must be a function`);
     }
     if (record(vfs).abort !== undefined && typeof record(vfs).abort !== "function")
         throw new TypeError("vfs.abort must be a function when supplied");
     return vfs;
+}
+function withContext(vfs, context) {
+    const bind = (method) => (...args) => vfs[method].call(vfs, ...args, context);
+    const bound = Object.fromEntries(VFS_METHODS.map((method) => [method, bind(method)]));
+    if (vfs.abort !== undefined)
+        bound.abort = bind("abort");
+    return bound;
+}
+/* `refresh` lets polling observe a deadline or abort that no timer has
+ * reported yet. */
+function vfsContext(deadline, signal, refresh) {
+    return Object.freeze({
+        signal,
+        deadlineMs: Date.now() + Math.max(0, deadline - monotonicNow()),
+        remainingTimeMs: () => { refresh(); return signal.aborted ? 0 : Math.max(0, deadline - monotonicNow()); },
+        isCancelled: () => { refresh(); return signal.aborted; },
+    });
 }
 /* Thrown into an operation at a Vfs promise its caller cannot wait for. */
 class WouldBlock extends Error {
@@ -490,7 +508,6 @@ function* writeAll(vfs, path, data, append, checkpoint) {
         throw failure;
 }
 function createVfsDispatcher(vfs, cwd, hostInputBytes, hostResponseBytes, maxOpenFiles, checkpoint) {
-    validateVfs(vfs);
     const files = new Map();
     let nextFd = 3;
     let opening = 0;
@@ -875,6 +892,13 @@ export async function createEngine(wasm) {
                 throw new TypeError("signal must be an AbortSignal");
             }
             const controller = new AbortController();
+            // Vfs calls keep their signal through teardown, so commits can finish
+            // after the guest does. It aborts once the run stops waiting on them.
+            const vfsController = new AbortController();
+            const stopVfs = () => {
+                if (!vfsController.signal.aborted)
+                    vfsController.abort(signal?.reason ?? new DOMException("Execution ended", "AbortError"));
+            };
             const memory = new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: maximumPages });
             const stdout = [];
             const stderr = [];
@@ -892,6 +916,8 @@ export async function createEngine(wasm) {
                 if ((finished || timedOut) && !controller.signal.aborted) {
                     controller.abort(signal?.reason ?? new DOMException("Execution ended", "AbortError"));
                 }
+                if (timedOut)
+                    stopVfs();
                 return finished || timedOut;
             };
             const deadlineMs = Date.now() + Math.max(0, deadline - monotonicNow());
@@ -927,7 +953,7 @@ export async function createEngine(wasm) {
                 if (isCancelled())
                     throw new RunLimitError("timeout", cancellationMessage());
             };
-            const vfsDispatcher = vfs === undefined ? undefined : createVfsDispatcher(vfs, resolvePath("/", options.cwd ?? "/"), hostInputBytes, hostResponseBytes, maxOpenFiles, checkpoint);
+            const vfsDispatcher = vfs === undefined ? undefined : createVfsDispatcher(withContext(vfs, vfsContext(deadline, vfsController.signal, isCancelled)), resolvePath("/", options.cwd ?? "/"), hostInputBytes, hostResponseBytes, maxOpenFiles, checkpoint);
             const read = (pointer, length) => {
                 if (!Number.isInteger(pointer) || !Number.isInteger(length) || pointer < 0 || length < 0 || pointer + length > memory.buffer.byteLength) {
                     throw new WebAssembly.RuntimeError("guest memory access out of bounds");
@@ -1174,6 +1200,7 @@ export async function createEngine(wasm) {
                     cleanupFailure = settled.failure;
                     cleanupExpired = settled.expired;
                 }
+                stopVfs();
                 expiry.release();
             }
             if (cleanupExpired) {
@@ -1209,9 +1236,16 @@ export async function createEngine(wasm) {
             const resolved = resolvePath(cwd, path);
             const sourceBytes = integerOption("sourceBytes", options.sourceBytes, DEFAULT_SOURCE_BYTES);
             const sourceCap = Math.min(sourceBytes, integerOption("hostInputBytes", options.hostInputBytes, DEFAULT_HOST_INPUT_BYTES));
+            const reading = new AbortController();
+            const stopReading = () => {
+                if (!reading.signal.aborted)
+                    reading.abort(options.signal?.reason ?? new DOMException("Execution ended", "AbortError"));
+            };
+            const context = vfsContext(deadline, reading.signal, () => { if (options.signal?.aborted || monotonicNow() >= deadline)
+                stopReading(); });
             let bytes;
             try {
-                bytes = runAwaitable(remapHostFailure(() => readAll(vfs, resolved, sourceCap, checkpoint), "open", resolved));
+                bytes = runAwaitable(remapHostFailure(() => readAll(withContext(vfs, context), resolved, sourceCap, checkpoint), "open", resolved));
                 if (bytes instanceof Promise) {
                     // The read keeps running if the deadline wins; its next checkpoint
                     // stops it and closes the entry.
@@ -1232,6 +1266,9 @@ export async function createEngine(wasm) {
                 if (error instanceof HostCallFailure)
                     throw exposedHostError(error.payload);
                 throw error;
+            }
+            finally {
+                stopReading();
             }
             let code;
             try {

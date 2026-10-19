@@ -179,6 +179,13 @@ memory, and commit them asynchronously on `close` while `readFileSync`,
 `writeFileSync`, and `require()` keep working. A `readAt` promise must fill its
 buffer before it resolves.
 
+Every `Vfs` method receives a `VfsContext` as its last argument, with the same
+`signal`, `deadlineMs`, `remainingTimeMs()`, and `isCancelled()` members a
+global's context has. Its signal aborts at the run's deadline, when the
+caller's signal aborts, or when `runCode()` resolves, so an implementation can
+cancel a request the run will no longer wait for. It stays live after the guest
+finishes, so teardown commits can complete.
+
 `runCode()` settles every filesystem call it started before it resolves, but
 never waits past the deadline, the same bound it applies to awaited globals.
 Calls the guest left running when it exited stop at their next `Vfs` step and
