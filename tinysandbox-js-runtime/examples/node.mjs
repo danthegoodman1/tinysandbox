@@ -13,7 +13,7 @@ console.log(result);
 // An async global suspends the guest until the promise settles. The guest
 // awaits it like any other promise.
 const searched = await engine.runCode(
-  "(async () => { console.log(JSON.stringify(await tools.search({ q: 'kittens' }))) })()",
+  "console.log(JSON.stringify(await tools.search({ q: 'kittens' })))",
   {
     globals: {
       "tools.search": async ({ q }) => {
@@ -38,6 +38,6 @@ console.log(await engine.runFile("main.js", { vfs, cwd: "/app" }));
 // awaits them through fs.promises; the synchronous fs API fails with EAGAIN.
 const remote = new AsyncTestVfs({ "/data/report.txt": "from-async-vfs" });
 console.log(await engine.runCode(
-  "(async () => { console.log(await require('fs').promises.readFile('/data/report.txt', 'utf8')) })()",
+  "console.log(await require('fs').promises.readFile('/data/report.txt', 'utf8'))",
   { vfs: remote },
 ));

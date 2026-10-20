@@ -1,9 +1,9 @@
 //! Wasmtime-hosted QuickJS command.
 //!
 //! The supported Node `fs` subset intentionally omits `statSync` timestamp,
-//! inode, uid, and gid fields until the VFS exposes them. Scripts still execute
-//! as CommonJS wrappers, so top-level `await` is a syntax error; already-settled
-//! promise chains and `await` inside async functions are drained before exit.
+//! inode, uid, and gid fields until the VFS exposes them. Scripts execute as
+//! CommonJS wrappers; the entry script's wrapper is an async function, so it may
+//! use top-level `await`. Promise jobs are drained before exit.
 //! The guest also receives `fetch`, `Headers`, and `Response` globals backed by
 //! an embedder-provided fetch handler. This is a WHATWG subset: there is no
 //! `Request` class, streams, `AbortController`, redirects, or full header

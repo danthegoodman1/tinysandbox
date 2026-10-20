@@ -38,5 +38,31 @@
     "exitCode": 0,
     "stdout": "true\nhello!\ne:true\n6\n3 ell 2 -1 XYll\nENOENT\nENOENT -2 open\nfs.readFile callbacks are not supported in tinysandbox; use fs.readFileSync or fs.promises\n",
     "stderrPrefix": ""
+  },
+  {
+    "name": "file-entry-top-level-await",
+    "entry": "/workspace/app/tla.js",
+    "argv": ["js", "/workspace/app/tla.js"],
+    "files": [
+      {
+        "path": "/workspace/app/tla.js",
+        "text": "const fsp=require('fs/promises')\nconst config=require('./config.json')\nconst text=await fsp.readFile('/workspace/app/note.txt','utf8')\nconsole.log(config.name,text.trim(),require.main===module)\ntry{require('./late')}catch(err){console.log('late',err.name)}\n"
+      },
+      {
+        "path": "/workspace/app/config.json",
+        "text": "{\"name\":\"cfg\"}\n"
+      },
+      {
+        "path": "/workspace/app/note.txt",
+        "text": "hello\n"
+      },
+      {
+        "path": "/workspace/app/late.js",
+        "text": "await null\nmodule.exports=1\n"
+      }
+    ],
+    "exitCode": 0,
+    "stdout": "cfg hello true\nlate SyntaxError\n",
+    "stderrPrefix": ""
   }
 ]

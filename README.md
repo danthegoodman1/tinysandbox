@@ -310,6 +310,7 @@ identical output):
 | `fs` (sync) | `readFileSync`, `readLinesSync` (UTF-8 line iterator, 64KB buffer), `writeFileSync`, `appendFileSync`, `mkdirSync`, `readdirSync` (incl. `withFileTypes`), `statSync`, `renameSync`, `rmSync`, `unlinkSync`, `rmdirSync`, `existsSync`, `copyFileSync`, `openSync`, `readSync`, `writeSync`, `ftruncateSync`, `closeSync` |
 | `fs.promises` | Also `require('fs/promises')`: `readFile`, `writeFile`, `appendFile`, `mkdir`, `readdir`, `stat`, `rename`, `rm`, `unlink`, `rmdir`, `copyFile`, and `open`, whose `FileHandle` supports `read`, `write`, `truncate`, and `close` |
 | `require` | Relative/absolute CommonJS: `./x`, `../x`, `/x`, extension inference (`.js`, `.json`), `dir/index.js`, module cache, Node cycle semantics, `module.exports`/`exports` aliasing, `require.main`, `MODULE_NOT_FOUND` shapes |
+| Async | Top-level `await` in the entry script; promises and `async` functions run until the program has no work left, and an unsettled top-level `await` exits 13 |
 | Globals | `console.log/info/warn/error` (Node formatting incl. `%s %d %j`-style substitution), `process.argv/env/cwd()/exit()`, `__filename`, `__dirname`, `Buffer` (`from`, `alloc`, `isBuffer`, `toString('utf8'/'hex'/'base64')`) |
 | Fetch | WHATWG-subset `fetch`, `Headers`, and `Response` backed only by an embedder-provided handler |
 | Errors | Node-shaped: `.code` (`'ENOENT'`...), libuv-faithful `.errno`, `.syscall`, `.path`, messages like `ENOENT: no such file or directory, open '/x'` |
@@ -511,7 +512,7 @@ async fn main() {
         .build();
 
     let result = sandbox
-        .exec("js -e '(async () => { console.log((await whoami()).name); console.log((await kv.get({ key: \"a\" })).value) })()'")
+        .exec("js -e 'console.log((await whoami()).name); console.log((await kv.get({ key: \"a\" })).value)'")
         .await;
     assert_eq!(result.stdout, "agent-1\nvalue-for-a\n");
 }
@@ -532,7 +533,7 @@ const sandbox = new Sandbox({
 })
 
 const result = await sandbox.exec(
-  `js -e '(async () => { console.log((await whoami()).name); console.log((await kv.get({ key: "a" })).value) })()'`
+  `js -e 'console.log((await whoami()).name); console.log((await kv.get({ key: "a" })).value)'`
 )
 console.assert(result.stdout === 'agent-1\nvalue-for-a\n')
 ```

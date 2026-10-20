@@ -77,6 +77,9 @@ typedef struct {
     int active;
     /* process.exit() was called: nothing else in the program may run. */
     int exited;
+    /* The entry script's completion promise, settled when its top-level code
+     * finishes, including any top-level await. */
+    JSValue main;
 } Session;
 
 static Session tb_session;
@@ -716,11 +719,12 @@ static const char TINYSANDBOX_GLUE[] =
 "    localRequire.cache = moduleCache\n"
 "    return localRequire\n"
 "  }\n"
-"  function executeJsModule(module, source, thisArg) {\n"
-"    const wrapper = `(function (exports, require, module, __filename, __dirname) {${stripBomAndShebang(source)}\\n})`\n"
+"  // The entry script runs as an async function so it may use top-level await;\n"
+"  // required modules stay synchronous, as require() returns their exports.\n"
+"  function executeJsModule(module, source, thisArg, entry) {\n"
+"    const wrapper = `(${entry ? 'async ' : ''}function (exports, require, module, __filename, __dirname) {${stripBomAndShebang(source)}\\n})`\n"
 "    const compiled = evalModule(wrapper, module.filename)\n"
-"    const thisValue = arguments.length < 3 ? module.exports : thisArg\n"
-"    return compiled.call(thisValue, module.exports, module.require, module, module.filename, module.dirname)\n"
+"    return compiled.call(thisArg, module.exports, module.require, module, module.filename, module.dirname)\n"
 "  }\n"
 "  function executeJsonModule(module, source) {\n"
 "    try { module.exports = JSON.parse(stripBomAndShebang(source)) }\n"
@@ -740,7 +744,7 @@ static const char TINYSANDBOX_GLUE[] =
 "    try {\n"
 "      const source = readModuleText(path)\n"
 "      if (path.endsWith('.json')) executeJsonModule(module, source)\n"
-"      else executeJsModule(module, source)\n"
+"      else executeJsModule(module, source, module.exports, false)\n"
 "      module.loaded = true\n"
 "      return module.exports\n"
 "    } catch (err) {\n"
@@ -762,10 +766,10 @@ static const char TINYSANDBOX_GLUE[] =
 "    globalThis.require = module.require\n"
 "    globalThis.__filename = module.filename\n"
 "    globalThis.__dirname = module.dirname\n"
-"    executeJsModule(module, source, isEval ? globalThis : module.exports)\n"
+"    const completion = executeJsModule(module, source, isEval ? globalThis : module.exports, true)\n"
 "    module.loaded = true\n"
 "    globalThis.exports = module.exports\n"
-"    return module.exports\n"
+"    return completion\n"
 "  }\n"
 "  function quote(value) { return `'${String(value).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\")}'` }\n"
 "  function inspect(value, nested, depth, seen, state) {\n"
@@ -1183,6 +1187,8 @@ static int32_t session_finish(int32_t code)
         }
     }
     tb_session.pending_count = 0;
+    JS_FreeValue(ctx, tb_session.main);
+    tb_session.main = JS_UNDEFINED;
     clear_unhandled_rejections(ctx, &tb_session.rejections);
     JS_FreeContext(ctx);
     JS_FreeRuntime(tb_session.rt);
@@ -1196,7 +1202,8 @@ static int32_t session_finish(int32_t code)
  * it. Outstanding host calls are the only thing that can advance a drained
  * queue, so their presence is exactly the suspend condition. As in Node,
  * process.exit() ends the program at once, whatever its status: queued jobs
- * never run and outstanding host calls are abandoned. */
+ * never run and outstanding host calls are abandoned, and a program that runs
+ * out of work while its top-level await is still pending exits with 13. */
 static int32_t session_settle(int32_t code)
 {
     if (code == 0 && !tb_session.exited) {
@@ -1204,6 +1211,12 @@ static int32_t session_settle(int32_t code)
     }
     if (code == 0 && !tb_session.exited && tb_session.pending_count > 0) {
         return TB_SUSPENDED;
+    }
+    if (code == 0 && !tb_session.exited &&
+        JS_PromiseState(tb_session.ctx, tb_session.main) == JS_PROMISE_PENDING) {
+        static const char warning[] = "Warning: Detected unsettled top-level await\n";
+        tb_write_stderr((const uint8_t *)warning, (int32_t)(sizeof(warning) - 1));
+        code = 13;
     }
     return session_finish(code);
 }
@@ -1269,6 +1282,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
         return 1;
     }
     memset(&tb_session, 0, sizeof(tb_session));
+    tb_session.main = JS_UNDEFINED;
 
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) {
@@ -1369,7 +1383,20 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
         JS_NewStringLen(ctx, source, source_len),
         JS_NewString(ctx, script_path),
     };
-    int32_t code = handle_eval_result(ctx, JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args));
+    JSValue main = JS_Call(ctx, run_main, JS_UNDEFINED, 2, run_args);
+    int32_t code = 0;
+    if (JS_IsException(main)) {
+        code = handle_eval_result(ctx, main);
+    } else {
+        tb_session.main = main;
+        /* Rejected before its first await: a synchronous throw, which ends the
+         * program before any queued job runs. */
+        if (JS_PromiseState(ctx, main) == JS_PROMISE_REJECTED) {
+            JSValue reason = JS_PromiseResult(ctx, main);
+            code = handle_exception(ctx, reason);
+            JS_FreeValue(ctx, reason);
+        }
+    }
     /* Released before settling: suspending returns from this frame, so nothing
      * owned by it may still be live. */
     JS_FreeValue(ctx, run_args[0]);

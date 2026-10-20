@@ -37,7 +37,7 @@ import { createEngine } from "@tinysandbox/js-runtime";
 import quickjsModule from "@tinysandbox/js-runtime/quickjs.wasm";
 
 const engine = await createEngine(quickjsModule);
-const result = await engine.runCode("(async () => { console.log(await context.value(null)) })()", {
+const result = await engine.runCode("console.log(await context.value(null))", {
   globals: { "context.value": async () => await doConvexWork() },
 });
 ```
@@ -97,7 +97,7 @@ control to the V8 event loop, so `runCode()` and `runFile()` are awaited:
 
 ```js
 const result = await engine.runCode(
-  "(async () => { console.log(JSON.stringify(await tools.search({ q: 'kittens' }))) })()",
+  "console.log(JSON.stringify(await tools.search({ q: 'kittens' })))",
   { globals: { "tools.search": async (args) => await performSearch(args) } },
 );
 ```
@@ -112,6 +112,11 @@ slots are occupied, another global call is rejected before its host callback
 runs, including a synchronous callback; an `fs.promises` call waits for a slot
 instead. Promises returned by admitted callbacks remain observed even when the
 run is cancelled before consuming their results.
+
+The entry script runs as an async function, so `await` works at its top level,
+as in the examples above. Modules loaded with `require()` stay synchronous. A
+program that runs out of work while a top-level `await` is still pending exits
+with code 13 and a warning, as in Node.
 
 `process.exit()` ends the guest at once, as in Node: queued promise callbacks
 do not run, and pending host calls are abandoned rather than awaited.
@@ -164,7 +169,7 @@ whose `FileHandle` supports `read`, `write`, `truncate`, and `close`.
 
 ```js
 const result = await engine.runCode(
-  "(async () => { console.log(await require('fs').promises.readFile('/data/report.csv', 'utf8')) })()",
+  "console.log(await require('fs').promises.readFile('/data/report.csv', 'utf8'))",
   { vfs: objectStoreVfs },
 );
 ```

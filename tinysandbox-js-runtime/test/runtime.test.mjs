@@ -268,6 +268,17 @@ test("concurrent awaited globals settle in completion order", async () => {
   assert.equal(result.stdout, "slow,fast\n");
 });
 
+test("top-level await suspends on async globals until they settle", async () => {
+  const engine = await createEngine(bytes);
+  const later = (ms, value) => async () => { await new Promise((r) => setTimeout(r, ms)); return value; };
+  const result = await engine.runCode(
+    "const first = await slow(); const [a, b] = await Promise.all([fast(), slow()]); console.log(first, a, b)",
+    { globals: { slow: later(20, "slow"), fast: later(5, "fast") } },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "slow fast slow\n");
+});
+
 test("process.exit ends the guest while awaited globals are still pending", async () => {
   // Node runs nothing after process.exit(), whatever the status. A pending host
   // call used to keep the guest alive, and its continuation ran after the exit.

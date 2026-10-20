@@ -41,7 +41,7 @@ export const jsRuntimeSmoke = action({
     // while the promise settles, so Convex queries and object reads no longer
     // have to be hoisted above the run.
     const result = await engine.runCode(
-      "(async () => { console.log(await context.value(null), await require('fs').promises.readFile('/notes/today.txt', 'utf8')) })()",
+      "console.log(await context.value(null), await require('fs').promises.readFile('/notes/today.txt', 'utf8'))",
       {
         globals: { "context.value": async () => await Promise.resolve("convex") },
         vfs: objectStoreVfs(async (key) => objects.get(key)),

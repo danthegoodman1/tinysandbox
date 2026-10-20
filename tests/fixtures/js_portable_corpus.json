@@ -52,8 +52,50 @@
     "stderrPrefix": ""
   },
   {
+    "name": "top-level-await",
+    "code": "const v = await Promise.resolve(3); console.log('tla', v)",
+    "exitCode": 0,
+    "stdout": "tla 3\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "top-level-await-order",
+    "code": "Promise.resolve().then(() => console.log('job')); await null; console.log('after')",
+    "exitCode": 0,
+    "stdout": "job\nafter\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "top-level-await-exit",
+    "code": "await null; console.log('a'); process.exit(5); console.log('never')",
+    "exitCode": 5,
+    "stdout": "a\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "top-level-await-unsettled",
+    "code": "console.log('start'); await new Promise(() => {})",
+    "exitCode": 13,
+    "stdout": "start\n",
+    "stderrPrefix": "Warning: Detected unsettled top-level await"
+  },
+  {
+    "name": "top-level-await-rejection",
+    "code": "await null; throw new Error('late')",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: late\n"
+  },
+  {
     "name": "exception",
     "code": "throw new Error('boom')",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: boom\n"
+  },
+  {
+    "name": "exception-skips-queued-jobs",
+    "code": "Promise.resolve().then(() => console.log('queued')); throw new Error('boom')",
     "exitCode": 1,
     "stdout": "",
     "stderrPrefix": "Error: boom\n"
