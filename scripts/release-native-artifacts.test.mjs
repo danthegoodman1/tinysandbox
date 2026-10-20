@@ -29,12 +29,6 @@ const expectedBuilds = [
     binding: "tinysandbox-node.linux-arm64-gnu.node"
   },
   {
-    os: "macos-26-intel",
-    artifact: "macos-x64",
-    unameArch: "x86_64",
-    binding: "tinysandbox-node.darwin-x64.node"
-  },
-  {
     os: "macos-26",
     artifact: "macos-arm64",
     unameArch: "arm64",
@@ -53,7 +47,7 @@ const linuxContainers = new Map([
   ]
 ])
 
-test("release matrix builds the four supported native bindings", () => {
+test("release matrix builds the three supported native bindings", () => {
   const matrixEntries = [...workflow.matchAll(
     /- os: ([^\n]+)\n\s+artifact: ([^\n]+)\n\s+uname_arch: ([^\n]+)\n\s+binding: ([^\n]+)/g
   )].map((match) => ({
@@ -74,8 +68,8 @@ test("release matrix builds the four supported native bindings", () => {
     macosNodeMatrix[1].split(",").map((value) => value.trim()),
     expectedBuilds.filter(({ os }) => os.startsWith("macos")).map(({ os }) => os)
   )
-  // rust-cache separates entries by job, matrix, and rustc host triple, so the
-  // two macOS architectures cannot share a cache.
+  // rust-cache separates entries by job, matrix, and rustc host triple, so
+  // every architecture can use the same key without sharing a cache.
   assert.match(ciWorkflow, /uses: Swatinem\/rust-cache@[0-9a-f]{40} #[^\n]*\n\s+with:\n\s+key: node/)
 })
 

@@ -7,7 +7,6 @@ const loader = readFileSync(new URL('../native.cjs', import.meta.url), 'utf8')
 
 const supportedTargets = [
   { platform: 'darwin', arch: 'arm64', target: 'darwin-arm64' },
-  { platform: 'darwin', arch: 'x64', target: 'darwin-x64' },
   { platform: 'linux', arch: 'arm64', target: 'linux-arm64-gnu' },
   { platform: 'linux', arch: 'x64', target: 'linux-x64-gnu' }
 ]
@@ -85,6 +84,10 @@ test('unsupported platforms and musl fail clearly without probing packages', () 
   assert.throws(
     () => evaluateLoader({ platform: 'win32', arch: 'x64' }),
     /Unsupported platform: win32-x64/
+  )
+  assert.throws(
+    () => evaluateLoader({ platform: 'darwin', arch: 'x64' }),
+    /Unsupported platform: darwin-x64/
   )
   assert.throws(
     () => evaluateLoader({ platform: 'linux', arch: 'arm64', musl: true }),

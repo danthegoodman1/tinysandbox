@@ -5,11 +5,11 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 
-const targets = ['darwin-arm64', 'darwin-x64', 'linux-arm64-gnu', 'linux-x64-gnu']
+const targets = ['darwin-arm64', 'linux-arm64-gnu', 'linux-x64-gnu']
 
 function currentTarget() {
-  if (process.platform === 'darwin' && ['arm64', 'x64'].includes(process.arch)) {
-    return `darwin-${process.arch}`
+  if (process.platform === 'darwin' && process.arch === 'arm64') {
+    return 'darwin-arm64'
   }
   if (process.platform === 'linux' && ['arm64', 'x64'].includes(process.arch)) {
     return `linux-${process.arch}-gnu`

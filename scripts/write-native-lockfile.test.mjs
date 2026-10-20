@@ -9,7 +9,6 @@ const INTEGRITY = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 function fixture(version = "1.2.3") {
   const manifests = {
     "darwin-arm64": { cpu: ["arm64"], os: ["darwin"] },
-    "darwin-x64": { cpu: ["x64"], os: ["darwin"] },
     "linux-arm64-gnu": { cpu: ["arm64"], os: ["linux"], libc: ["glibc"] },
     "linux-x64-gnu": { cpu: ["x64"], os: ["linux"], libc: ["glibc"] },
   }
@@ -55,7 +54,7 @@ test("refuses to write when a manifest disagrees with the release version", () =
 
 test("refuses to invent a lockfile entry that does not exist", () => {
   const f = fixture()
-  delete f.lockfile.packages["node_modules/@tinysandbox/tinysandbox-darwin-x64"]
+  delete f.lockfile.packages["node_modules/@tinysandbox/tinysandbox-darwin-arm64"]
   assert.throws(() => writeNativeLockfile("1.2.3", f.options), /no entry for/)
 })
 

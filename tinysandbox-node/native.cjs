@@ -26,8 +26,8 @@ function isMusl() {
 }
 
 function targetFor(platform, arch) {
-  if (platform === 'darwin' && (arch === 'arm64' || arch === 'x64')) {
-    return `darwin-${arch}`
+  if (platform === 'darwin' && arch === 'arm64') {
+    return 'darwin-arm64'
   }
   if (platform === 'linux' && (arch === 'arm64' || arch === 'x64')) {
     if (isMusl()) {

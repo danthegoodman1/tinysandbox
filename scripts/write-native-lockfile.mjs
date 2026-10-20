@@ -13,7 +13,7 @@ import { readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-export const nativeTargets = ["darwin-arm64", "darwin-x64", "linux-arm64-gnu", "linux-x64-gnu"]
+export const nativeTargets = ["darwin-arm64", "linux-arm64-gnu", "linux-x64-gnu"]
 
 const defaultRepoRoot = process.env.RELEASE_REPO_ROOT ?? fileURLToPath(new URL("..", import.meta.url))
 

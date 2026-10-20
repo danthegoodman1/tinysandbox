@@ -432,7 +432,6 @@ tinysandbox = { version = "0.3.0", path = "..", features = ["s3"] }
 
 const nativePackageNames = [
   "@tinysandbox/tinysandbox-darwin-arm64",
-  "@tinysandbox/tinysandbox-darwin-x64",
   "@tinysandbox/tinysandbox-linux-arm64-gnu",
   "@tinysandbox/tinysandbox-linux-x64-gnu"
 ]
