@@ -45,12 +45,10 @@ const result = await engine.runCode("console.log(await context.value(null))", {
 ## Browser playground
 
 The package includes a minimal two-pane
-[browser example](examples/browser/index.html) that displays guest console
-output, the evaluated script's return value, exit status, elapsed time, and
-initial/peak wasm linear memory. It deliberately ends with an expression so
-the example can capture that value through a synchronous custom global; when
-the value is a promise, the guest awaits it first. The browser never evaluates
-the source itself.
+[browser example](examples/browser/index.html) that runs the editor's source
+as the entry script, exactly as `runCode()` does, and displays guest stdout and
+stderr, exit status, elapsed time, and initial/peak wasm linear memory. The
+browser never evaluates the source itself.
 
 From this directory in either a source checkout or the unpacked package:
 
@@ -59,8 +57,8 @@ npm run example:browser
 ```
 
 Then open `http://127.0.0.1:4173/`. The default script prints that `window` and
-`document` are unavailable inside the guest, then returns a promise that a
-`setTimeout` resolves. Each click creates the same fresh,
+`document` are unavailable inside the guest, then awaits a `setTimeout` at its
+top level before printing a result. Each click creates the same fresh,
 bounded QuickJS/WASM instance as a direct `runCode()` call.
 
 ### Cloudflare Pages

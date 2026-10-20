@@ -344,14 +344,14 @@ native bindings, a concrete storage backend, or ambient network access. Its
 [package README](tinysandbox-js-runtime/README.md) documents the small API and
 host examples. A minimal
 [browser playground](tinysandbox-js-runtime/examples/browser/index.html) runs
-editable source in the wasm guest and shows console output, the return value,
-and peak linear memory side by side.
+editable source in the wasm guest as the entry script and shows console output,
+exit status, and peak linear memory side by side.
 
-Not there on purpose: timers, an event loop, direct networking,
-`child_process`/process spawning, built-in shell command execution from
-JavaScript, and `node_modules` resolution — bare `require('lodash')` tells you
-plainly that there is no npm in the sandbox. Async is intentionally narrow:
-already-settled microtasks drain before exit, and `fetch` is available only
+Not there on purpose: direct networking, `child_process`/process spawning,
+built-in shell command execution from JavaScript, and `node_modules`
+resolution — bare `require('lodash')` reports that there is no npm in the
+sandbox. The event loop runs promise jobs, timers, and host calls until none
+remain, within the run's wall-clock budget, and `fetch` is available only
 through an embedder-granted handler. All file access goes through the same VFS
 and quotas as the shell. Known deviations (fetch subset details,
 stack-frame naming, line-1 column offsets) are documented in the `js` module

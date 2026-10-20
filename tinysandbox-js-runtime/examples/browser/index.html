@@ -207,7 +207,7 @@
       <section>
         <div class="pane-header">
           <span>output</span>
-          <span>console + return value</span>
+          <span>stdout + stderr</span>
         </div>
         <textarea id="output" aria-label="Execution output" readonly>Loading QuickJS WebAssembly…</textarea>
       </section>
@@ -231,8 +231,9 @@
 console.log("window:", typeof window);
 console.log("document:", typeof document);
 
-// A promise result is awaited, so timers can finish first.
-new Promise(resolve => setTimeout(() => resolve({ answer: 6 * 7, engine: "quickjs-wasm" }), 10));`;
+// Top-level await works, and a pending timer keeps the script alive.
+await new Promise(resolve => setTimeout(resolve, 10));
+console.log(JSON.stringify({ answer: 6 * 7, engine: "quickjs-wasm" }));`;
 
     const source = document.querySelector("#source");
     const output = document.querySelector("#output");
@@ -251,38 +252,11 @@ new Promise(resolve => setTimeout(() => resolve({ answer: 6 * 7, engine: "quickj
       return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
     }
 
-    function guestProgram(userSource) {
-      // The browser only constructs this string. QuickJS evaluates it inside
-      // the wasm instance; browser eval() and Function() are never used. A
-      // promise completion value is awaited at the guest's top level.
-      return `const capture = playground.capture;
-const completion = (0, eval)(${JSON.stringify(userSource)});
-const awaited = completion instanceof Promise;
-const value = awaited ? await completion : completion;
-const type = value === null ? "null" : typeof value;
-let text;
-if (type === "undefined") text = "undefined";
-else if (type === "bigint") text = String(value) + "n";
-else if (type === "function" || type === "symbol") text = String(value);
-else {
-  try {
-    text = JSON.stringify(value, function (_key, item) {
-      return typeof item === "bigint" ? String(item) + "n" : item;
-    }, 2);
-  } catch (_error) {
-    text = String(value);
-  }
-  if (text === undefined) text = String(value);
-}
-await capture({ type: type, text: text, awaited: awaited });`;
-    }
-
-    function renderResult(result, returned, durationMs) {
+    function renderResult(result, durationMs) {
       const sections = [];
       if (result.stdout) sections.push(`stdout\n${result.stdout.trimEnd()}`);
       if (result.stderr) sections.push(`stderr\n${result.stderr.trimEnd()}`);
-      sections.push(returned ? `return (${returned.awaited ? "awaited " : ""}${returned.type})\n${returned.text}` : "return\n<not reached>");
-      output.value = sections.join("\n\n");
+      output.value = sections.length > 0 ? sections.join("\n\n") : "(no output)";
 
       exit.textContent = `exit ${result.exitCode}`;
       exit.dataset.state = result.exitCode === 0 ? "ok" : "error";
@@ -294,8 +268,7 @@ await capture({ type: type, text: text, awaited: awaited });`;
         smoke.textContent = result.exitCode === 0 &&
           result.stdout.includes("hello from QuickJS") &&
           result.stdout.includes("window: undefined") &&
-          returned?.awaited === true &&
-          returned.text.includes('"answer": 42')
+          result.stdout.includes('{"answer":42,"engine":"quickjs-wasm"}')
             ? "PASS"
             : "FAIL";
       }
@@ -309,21 +282,16 @@ await capture({ type: type, text: text, awaited: awaited });`;
       exit.dataset.state = "";
       await new Promise(resolve => setTimeout(resolve, 0));
 
-      let returned;
       const started = performance.now();
       try {
-        const result = await engine.runCode(guestProgram(source.value), {
-          globals: {
-            "playground.capture": value => {
-              returned = value;
-              return null;
-            },
-          },
+        // The source runs as the entry script, exactly as runCode() runs it.
+        // The browser never evaluates it; QuickJS does, inside the wasm instance.
+        const result = await engine.runCode(source.value, {
           wasmMemoryBytes: MEMORY_LIMIT_BYTES,
           quickjsHeapBytes: 8 * 1024 * 1024,
           timeoutMs: 1000,
         });
-        renderResult(result, returned, performance.now() - started);
+        renderResult(result, performance.now() - started);
       } catch (error) {
         output.value = `host error\n${error instanceof Error ? error.stack : String(error)}`;
         exit.textContent = "host error";
