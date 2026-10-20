@@ -37,11 +37,11 @@ export const jsRuntimeSmoke = action({
   handler: async (): Promise<string> => {
     const engine = await createEngine(quickjsModule);
     const objects = new Map([["/notes/today.txt", new TextEncoder().encode("stored")]]);
-    // Awaited work can happen inside a global or a Vfs call: the guest suspends
-    // while the promise settles, so Convex queries and object reads no longer
-    // have to be hoisted above the run.
+    // Awaited work can happen inside a global, a Vfs call, or a timer: the guest
+    // suspends while the promise settles or the timer runs down, so Convex
+    // queries and object reads no longer have to be hoisted above the run.
     const result = await engine.runCode(
-      "console.log(await context.value(null), await require('fs').promises.readFile('/notes/today.txt', 'utf8'))",
+      "await new Promise((resolve) => setTimeout(resolve, 5)); console.log(await context.value(null), await require('fs').promises.readFile('/notes/today.txt', 'utf8'))",
       {
         globals: { "context.value": async () => await Promise.resolve("convex") },
         vfs: objectStoreVfs(async (key) => objects.get(key)),
