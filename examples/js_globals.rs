@@ -54,21 +54,19 @@ async fn main() {
         })
         .build();
 
-    // Host globals return promises, so the whole script is one async scope.
+    // Host globals return promises, which the script awaits at its top level.
     let script = r#"
-(async () => {
-  await kv.put({ key: 'answer', value: 42 })
-  console.log(`answer=${await kvGet('answer')} user=${(await whoami()).name}`)
+await kv.put({ key: 'answer', value: 42 })
+console.log(`answer=${await kvGet('answer')} user=${(await whoami()).name}`)
 
-  try {
-    await kv.get({})
-  } catch (err) {
-    console.log(`${err.code}:${err.message}`)
-  }
+try {
+  await kv.get({})
+} catch (err) {
+  console.log(`${err.code}:${err.message}`)
+}
 
-  const response = await fetch('https://example.test/config')
-  console.log(`${response.status}:${await response.text()}`)
-})()
+const response = await fetch('https://example.test/config')
+console.log(`${response.status}:${await response.text()}`)
 "#;
     sandbox
         .fs()

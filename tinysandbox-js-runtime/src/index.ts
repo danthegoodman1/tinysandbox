@@ -10,6 +10,8 @@ type GuestExports = WebAssembly.Exports & {
   tinysandbox_free(pointer: number): void;
   tinysandbox_run(pointer: number, length: number, heap: number): number;
   tinysandbox_resolve(callId: number): number;
+  tinysandbox_timer_delay(): number;
+  tinysandbox_wake(): number;
 };
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -37,12 +39,14 @@ const VFS_OPERATIONS = new Set([
 const RESERVED_GLOBALS = new Set([
   "Buffer", "Headers", "Response", "__dirname", "__filename", "console",
   "exports", "fetch", "globalThis", "module", "process", "require",
+  "setTimeout", "clearTimeout", "setInterval", "clearInterval", "setImmediate", "clearImmediate",
 ]);
-const ABI_VERSION = 14;
+const ABI_VERSION = 15;
 /* Host answer to a guest call: response staged now, or settled later. */
 const HOST_INLINE = 0;
 const HOST_DEFERRED = 1;
-/* tinysandbox_run/tinysandbox_resolve returned with the guest still alive. */
+/* tinysandbox_run/tinysandbox_resolve/tinysandbox_wake returned with the guest
+ * still alive. */
 const SUSPENDED = -2147483648;
 const REQUIRED_IMPORTS = [
   "env.memory:memory",
@@ -66,6 +70,8 @@ const REQUIRED_EXPORTS = [
   "tinysandbox_free:function",
   "tinysandbox_run:function",
   "tinysandbox_resolve:function",
+  "tinysandbox_timer_delay:function",
+  "tinysandbox_wake:function",
 ].sort();
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -166,7 +172,7 @@ function probeArtifactAbi(module: WebAssembly.Module) {
     throw new TypeError(`incompatible QuickJS wasm memory contract: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (instance.exports.memory !== memory) throw new TypeError("incompatible QuickJS wasm: env.memory is not re-exported");
-  for (const [name, arity] of [["tinysandbox_abi_version", 0], ["tinysandbox_alloc", 1], ["tinysandbox_free", 1], ["tinysandbox_run", 3], ["tinysandbox_resolve", 1]] as const) {
+  for (const [name, arity] of [["tinysandbox_abi_version", 0], ["tinysandbox_alloc", 1], ["tinysandbox_free", 1], ["tinysandbox_run", 3], ["tinysandbox_resolve", 1], ["tinysandbox_timer_delay", 0], ["tinysandbox_wake", 0]] as const) {
     if ((instance.exports[name] as Function).length !== arity) throw new TypeError(`incompatible QuickJS wasm export signature '${name}'`);
   }
   if ((instance.exports as GuestExports).tinysandbox_abi_version() !== ABI_VERSION) throw new TypeError(`incompatible QuickJS wasm ABI version; expected ${ABI_VERSION}`);
@@ -775,6 +781,14 @@ function* remapHostFailure<T>(operation: () => VfsOperation<T>, syscall: string,
 
 type HostResponse = { value: unknown } | { error: unknown };
 type DeferredSettlement = { callId: number; response: HostResponse };
+const TIMER_DUE = Symbol("timer due");
+
+/* Resolves when the guest's next timer is due; cancel frees the host timer. */
+function timerWait(delay: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const due = new Promise<typeof TIMER_DUE>((resolve) => { timer = setTimeout(() => resolve(TIMER_DUE), delay); });
+  return { due, cancel: () => clearTimeout(timer) };
+}
 
 export async function createEngine(wasm: BufferSource | WebAssembly.Module): Promise<JsEngine> {
   let module;
@@ -1066,14 +1080,24 @@ export async function createEngine(wasm: BufferSource | WebAssembly.Module): Pro
         while (exitCode === SUSPENDED) {
           isCancelled();
           if (timedOut) break;
-          if (deferred.size === 0) throw new Error("guest suspended with no host call outstanding");
+          // The guest waits on its outstanding host calls and, when it has
+          // one, its next timer.
+          const delay = (instance.exports as GuestExports).tinysandbox_timer_delay();
+          if (deferred.size === 0 && delay < 0) throw new Error("guest suspended with nothing to wait on");
           // Settle whichever finishes first so concurrent awaits in the guest
           // progress in completion order rather than call order. A host promise
           // that never settles must not outlive the deadline, so the wait races
           // a timer: suspension is the one point where no guest checkpoint can
           // observe the clock.
-          const settled = await Promise.race([...deferred.values(), expiry.wait()]);
+          const wake = delay < 0 ? undefined : timerWait(delay);
+          const settled = await Promise.race(wake === undefined ? [...deferred.values(), expiry.wait()] : [...deferred.values(), expiry.wait(), wake.due]);
+          wake?.cancel();
           if (settled === undefined) { timedOut = true; break; }
+          if (settled === TIMER_DUE) {
+            checkpoint();
+            exitCode = (instance.exports as GuestExports).tinysandbox_wake();
+            continue;
+          }
           deferred.delete(settled.callId);
           checkpoint();
           setResponse(settled.response);

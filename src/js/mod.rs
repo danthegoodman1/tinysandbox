@@ -1,9 +1,11 @@
 //! Wasmtime-hosted QuickJS command.
 //!
 //! The supported Node `fs` subset intentionally omits `statSync` timestamp,
-//! inode, uid, and gid fields until the VFS exposes them. Scripts still execute
-//! as CommonJS wrappers, so top-level `await` is a syntax error; already-settled
-//! promise chains and `await` inside async functions are drained before exit.
+//! inode, uid, and gid fields until the VFS exposes them. Scripts execute as
+//! CommonJS wrappers; the entry script's wrapper is an async function, so it may
+//! use top-level `await`. The guest runs a Node-style event loop over promise
+//! jobs, timers, and immediates; while it waits for a timer, the host thread
+//! sleeps until the timer is due or the run is cancelled.
 //! The guest also receives `fetch`, `Headers`, and `Response` globals backed by
 //! an embedder-provided fetch handler. This is a WHATWG subset: there is no
 //! `Request` class, streams, `AbortController`, redirects, or full header
@@ -34,6 +36,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::{
     Caller, Engine, Extern, Linker, Memory, MemoryType, Module, ResourceLimiter, Store, Trap,
+    TypedFunc,
 };
 
 use crate::sandbox::HostContext;
@@ -53,6 +56,8 @@ const QUICKJS_INITIAL_MEMORY_PAGES: u32 = 19;
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
 const QUICKJS_HOST_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+/// `tinysandbox_run` or `tinysandbox_wake` returned with the guest still alive.
+const GUEST_SUSPENDED: i32 = i32::MIN;
 
 /// Registers the `js` command in a sandbox command registry.
 pub(crate) fn register(commands: &mut BTreeMap<String, Arc<dyn Command>>) {
@@ -371,6 +376,8 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
     let alloc = instance.get_typed_func::<i32, i32>(&mut store, "tinysandbox_alloc")?;
     let free = instance.get_typed_func::<i32, ()>(&mut store, "tinysandbox_free")?;
     let run = instance.get_typed_func::<(i32, i32, i32), i32>(&mut store, "tinysandbox_run")?;
+    let timer_delay = instance.get_typed_func::<(), i32>(&mut store, "tinysandbox_timer_delay")?;
+    let wake = instance.get_typed_func::<(), i32>(&mut store, "tinysandbox_wake")?;
 
     let global_names = store.data().globals.keys().cloned().collect::<Vec<_>>();
     let config = GuestConfig {
@@ -388,7 +395,13 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
     let ptr = alloc.call(&mut store, len)?;
     memory.write(&mut store, ptr_usize(ptr)?, &input)?;
     let heap_limit = i32::try_from(limits.wasm_memory_bytes).unwrap_or(i32::MAX);
-    let exit_code = match run.call(&mut store, (ptr, len, heap_limit)) {
+    let exit_code = match run_guest(
+        &mut store,
+        &run,
+        &timer_delay,
+        &wake,
+        (ptr, len, heap_limit),
+    ) {
         Ok(exit_code) => exit_code,
         Err(_) if store.data().limiter.limit_exceeded => {
             return Ok(JsRunResult {
@@ -432,6 +445,43 @@ fn run_quickjs_inner(config: JsRunConfig) -> wasmtime::Result<JsRunResult> {
         stderr: Vec::new(),
         peak_wasm_memory_bytes: state.limiter.peak_memory_bytes,
     })
+}
+
+/// Runs the guest to its own end. This host answers every host call inline, so
+/// the guest parks only to wait for its next timer: the host sleeps until that
+/// timer is due, then wakes the guest.
+fn run_guest(
+    store: &mut Store<HostState>,
+    run: &TypedFunc<(i32, i32, i32), i32>,
+    timer_delay: &TypedFunc<(), i32>,
+    wake: &TypedFunc<(), i32>,
+    input: (i32, i32, i32),
+) -> wasmtime::Result<i32> {
+    let mut exit_code = run.call(&mut *store, input)?;
+    while exit_code == GUEST_SUSPENDED {
+        let delay = timer_delay.call(&mut *store, ())?;
+        let delay = u64::try_from(delay)
+            .map_err(|_| wasmtime::Error::msg("guest suspended with no timer pending"))?;
+        sleep_until_timer(store.data(), Duration::from_millis(delay))?;
+        exit_code = wake.call(&mut *store, ())?;
+    }
+    Ok(exit_code)
+}
+
+/// Sleeps until the guest's next timer is due. Cancellation or the end of the
+/// wall-clock budget cuts the sleep short with an interrupt.
+fn sleep_until_timer(state: &HostState, delay: Duration) -> wasmtime::Result<()> {
+    let remaining = state.remaining_wall_time();
+    let context = state.fs.host_context();
+    let cancelled = state.host_runtime.block_on(async {
+        tokio::time::timeout(delay.min(remaining), context.cancelled())
+            .await
+            .is_ok()
+    });
+    if cancelled || delay >= remaining || state.fs.is_cancelled() {
+        return Err(Trap::Interrupt.into());
+    }
+    Ok(())
 }
 
 fn is_epoch_timeout(err: &wasmtime::Error) -> bool {

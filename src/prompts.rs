@@ -44,7 +44,7 @@ pub const JS: &str = "`js script.js [args...]` and `js -e 'code'` run JavaScript
 - The sync `fs` API over the same filesystem as the shell: readFileSync, readLinesSync (UTF-8 line iterator, 64KB buffer), writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, rmdirSync, existsSync, copyFileSync, openSync, readSync, writeSync, ftruncateSync, closeSync. Errors are Node-shaped (`err.code === 'ENOENT'` etc.).
 - `fs.promises` (also `require('fs/promises')`) with readFile, writeFile, appendFile, mkdir, readdir, stat, rename, rm, unlink, rmdir, copyFile, and open, whose FileHandle has read, write, truncate, and close.
 - `console`, `process.argv/env/cwd()/exit()`, `Buffer`, `__filename`, `__dirname`.
-There are no timers and no event loop: only already-settled promise callbacks run before exit. Scripts run under memory and CPU limits; an infinite loop exits with code 124.";
+`await` works at the top level of the script you run; `require`d modules are synchronous. `setTimeout`, `setInterval`, `setImmediate`, their `clear*` functions, and `require('timers/promises')` work as in Node; a script exits once no timer or pending call remains. Scripts run under memory and CPU limits; an infinite loop exits with code 124.";
 
 /// Host functions bound into the sandboxed JavaScript global scope. Pass the
 /// names registered with

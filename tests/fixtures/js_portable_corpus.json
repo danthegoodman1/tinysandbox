@@ -52,8 +52,50 @@
     "stderrPrefix": ""
   },
   {
+    "name": "top-level-await",
+    "code": "const v = await Promise.resolve(3); console.log('tla', v)",
+    "exitCode": 0,
+    "stdout": "tla 3\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "top-level-await-order",
+    "code": "Promise.resolve().then(() => console.log('job')); await null; console.log('after')",
+    "exitCode": 0,
+    "stdout": "job\nafter\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "top-level-await-exit",
+    "code": "await null; console.log('a'); process.exit(5); console.log('never')",
+    "exitCode": 5,
+    "stdout": "a\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "top-level-await-unsettled",
+    "code": "console.log('start'); await new Promise(() => {})",
+    "exitCode": 13,
+    "stdout": "start\n",
+    "stderrPrefix": "Warning: Detected unsettled top-level await"
+  },
+  {
+    "name": "top-level-await-rejection",
+    "code": "await null; throw new Error('late')",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: late\n"
+  },
+  {
     "name": "exception",
     "code": "throw new Error('boom')",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: boom\n"
+  },
+  {
+    "name": "exception-skips-queued-jobs",
+    "code": "Promise.resolve().then(() => console.log('queued')); throw new Error('boom')",
     "exitCode": 1,
     "stdout": "",
     "stderrPrefix": "Error: boom\n"
@@ -63,6 +105,125 @@
     "code": "function f(n) { return n === 0 ? 'ok' : f(n - 1) } console.log(f(2000))",
     "exitCode": 0,
     "stdout": "ok\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-order",
+    "code": "setTimeout(() => console.log('b'), 50); setTimeout(() => console.log('a'), 1); setTimeout(() => console.log('c'), 50)",
+    "exitCode": 0,
+    "stdout": "a\nb\nc\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-delay-coercion",
+    "code": "setTimeout(() => console.log('zero'), 0); setTimeout(() => console.log('negative'), -5); setTimeout(() => console.log('nan'), NaN)",
+    "exitCode": 0,
+    "stdout": "zero\nnegative\nnan\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-arguments",
+    "code": "setTimeout((a, b) => console.log(a + b), 1, 2, 3)",
+    "exitCode": 0,
+    "stdout": "5\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-interval-clear",
+    "code": "let n = 0; const t = setInterval(() => { console.log(++n); if (n === 3) clearInterval(t) }, 1)",
+    "exitCode": 0,
+    "stdout": "1\n2\n3\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-clear",
+    "code": "const t = setTimeout(() => console.log('never'), 10); clearTimeout(t); const u = setTimeout(() => console.log('never'), 10); clearTimeout(+u); console.log('done')",
+    "exitCode": 0,
+    "stdout": "done\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-unref",
+    "code": "setTimeout(() => console.log('never'), 50).unref(); console.log('done')",
+    "exitCode": 0,
+    "stdout": "done\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-refresh",
+    "code": "let n = 0; const t = setTimeout(function () { console.log('fired', ++n, this === t); if (n < 3) this.refresh() }, 2)",
+    "exitCode": 0,
+    "stdout": "fired 1 true\nfired 2 true\nfired 3 true\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-handle",
+    "code": "const t = setTimeout(() => {}, 1); console.log(typeof t, t.hasRef(), typeof t[Symbol.toPrimitive](), t.unref() === t, t.hasRef())",
+    "exitCode": 0,
+    "stdout": "object true number true false\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-microtasks-between-callbacks",
+    "code": "setTimeout(() => { console.log('t1'); Promise.resolve().then(() => console.log('m1')) }, 1); setTimeout(() => console.log('t2'), 1)",
+    "exitCode": 0,
+    "stdout": "t1\nm1\nt2\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-immediates",
+    "code": "setImmediate(() => { console.log('i1'); setImmediate(() => console.log('i3')) }); setImmediate((x) => console.log(x), 'i2'); clearImmediate(setImmediate(() => console.log('never'))); Promise.resolve().then(() => console.log('micro')); console.log('sync')",
+    "exitCode": 0,
+    "stdout": "sync\nmicro\ni1\ni2\ni3\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-invalid-callback",
+    "code": "try { setTimeout('x') } catch (e) { console.log(e.code, e.message) }",
+    "exitCode": 0,
+    "stdout": "ERR_INVALID_ARG_TYPE The \"callback\" argument must be of type function. Received type string ('x')\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-promises",
+    "code": "const timers = require('timers'); const { setTimeout: sleep } = require('timers/promises'); console.log(timers.setTimeout === setTimeout, timers.promises === require('timers/promises')); sleep(5, 'v').then(console.log)",
+    "exitCode": 0,
+    "stdout": "true true\nv\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-top-level-await",
+    "code": "await new Promise(r => setTimeout(r, 5)); console.log('slept')",
+    "exitCode": 0,
+    "stdout": "slept\n",
+    "stderrPrefix": ""
+  },
+  {
+    "name": "timers-unref-top-level-await",
+    "code": "await new Promise(r => setTimeout(r, 5).unref()); console.log('never')",
+    "exitCode": 13,
+    "stdout": "",
+    "stderrPrefix": "Warning: Detected unsettled top-level await"
+  },
+  {
+    "name": "timers-exception",
+    "code": "setTimeout(() => { throw new Error('tick') }, 1); setTimeout(() => console.log('never'), 5)",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: tick\n"
+  },
+  {
+    "name": "timers-rejection",
+    "code": "setTimeout(() => Promise.reject(new Error('later')), 1); setTimeout(() => console.log('never'), 5)",
+    "exitCode": 1,
+    "stdout": "",
+    "stderrPrefix": "Error: later\n"
+  },
+  {
+    "name": "timers-exit",
+    "code": "setTimeout(() => { console.log('exiting'); process.exit(3) }, 1); setInterval(() => {}, 1000)",
+    "exitCode": 3,
+    "stdout": "exiting\n",
     "stderrPrefix": ""
   }
 ]

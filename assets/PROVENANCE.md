@@ -21,12 +21,12 @@ network, process, or environment capability; time comes from one explicit import
 - Commit: `fd0a0210b7be00957751871e7e01b8291268fc29`
 - Toolchain: WASI SDK `27.0`, `wasm32-wasip1`, downloaded from https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-27
 - Host used for the checked-in artifact: Linux x86_64, WASI SDK asset `wasi-sdk-27.0-x86_64-linux.tar.gz`. The same host rebuilt the previous (ABI 13, macOS arm64) artifact byte for byte.
-- Build flags: `-Oz -DNDEBUG -D_GNU_SOURCE -DTINYSANDBOX_WASI_STACK_LIMIT -mexec-model=reactor`, linked with `--allow-undefined`, `--import-memory`, `-z stack-size=1048576`, explicit exports `tinysandbox_alloc`, `tinysandbox_free`, `tinysandbox_abi_version`, `tinysandbox_run`, `tinysandbox_resolve`, and the imported memory, then stripped with `llvm-strip`
+- Build flags: `-Oz -DNDEBUG -D_GNU_SOURCE -DTINYSANDBOX_WASI_STACK_LIMIT -mexec-model=reactor`, linked with `--allow-undefined`, `--import-memory`, `-z stack-size=1048576`, explicit exports `tinysandbox_alloc`, `tinysandbox_free`, `tinysandbox_abi_version`, `tinysandbox_run`, `tinysandbox_resolve`, `tinysandbox_timer_delay`, `tinysandbox_wake`, and the imported memory, then stripped with `llvm-strip`
 - Source patch: the build script enables QuickJS's stack-limit branch under WASI so `JS_SetMaxStackSize` raises catchable `RangeError` exceptions before wasmtime stack traps.
 - QuickJS stack limit: 786,432 bytes (`768 KiB`), leaving headroom inside the linked 1 MiB C stack
 - QuickJS sources linked: `quickjs.c`, `dtoa.c`, `libregexp.c`, `libunicode.c`
 - Tinysandbox shim: `src/js/quickjs_shim.c`
-- Artifact: 631,445 bytes, SHA-256 `0f22c90b184359272a5022d28abadf0f52371e1a89129ac968cfe9beb6155e12`
+- Artifact: 641,503 bytes, SHA-256 `887ea1e9369c5b1957252c06919a3b9aa9674a94701c0420b0ae67034980af60`
 - Initial linear memory: 19 WebAssembly pages, 1,245,184 bytes (1.1875 MiB)
 
 Inspect the artifact without installing `wasm-tools` or another package:
@@ -55,7 +55,7 @@ a fresh bounded imported memory per run and consume these same bytes. The
 interrupt import is a synchronous monotonic-deadline check in V8; Wasmtime also
 retains epoch interruption as defense in depth.
 
-The artifact exports `tinysandbox_abi_version()`, currently `14`. The portable
+The artifact exports `tinysandbox_abi_version()`, currently `15`. The portable
 host checks that marker, the exact import/export contract and exported function
 arities, then performs a fixed-minimum/full-wasm32-maximum probe instantiation
 before accepting either bytes or a precompiled module. Two independent final
@@ -78,5 +78,17 @@ The portable host can then defer `fs.promises` calls to an asynchronous VFS
 without ever deferring an answer a synchronous caller needs. An ABI 13 guest
 reserves slots for synchronous calls too, so the host rejects it. The same
 artifact ends the guest as soon as it calls `process.exit()`, as Node does,
-without draining queued jobs or waiting on outstanding host calls. Two rebuilds
-on Linux x86_64 produced the current SHA-256 above byte for byte.
+without draining queued jobs or waiting on outstanding host calls. It runs the
+entry script as an async function, so top-level `await` works without any host
+change.
+
+ABI 15 adds Node timers. The guest keeps its timers and immediates and runs the
+event loop itself, so a host only has to wait. When `tinysandbox_run`,
+`tinysandbox_resolve`, or the new `tinysandbox_wake` returns `INT32_MIN`, the new
+`tinysandbox_timer_delay` export gives the milliseconds until the next timer is
+due, or `-1` when only outstanding host calls can resume the guest. The host
+waits for whichever comes first: a host call settles, which it delivers with
+`tinysandbox_resolve`, or the delay passes, after which it calls
+`tinysandbox_wake`. Wasmtime, which answers every host call inline, sleeps the
+worker thread; the portable host sets a timer on its event loop. Two rebuilds on
+Linux x86_64 produced the current SHA-256 above byte for byte.

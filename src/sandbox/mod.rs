@@ -2232,6 +2232,12 @@ const RESERVED_JS_GLOBALS: &[&str] = &[
     "module",
     "process",
     "require",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "setImmediate",
+    "clearImmediate",
 ];
 
 #[cfg(feature = "js")]

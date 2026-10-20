@@ -37,7 +37,7 @@ import { createEngine } from "@tinysandbox/js-runtime";
 import quickjsModule from "@tinysandbox/js-runtime/quickjs.wasm";
 
 const engine = await createEngine(quickjsModule);
-const result = await engine.runCode("(async () => { console.log(await context.value(null)) })()", {
+const result = await engine.runCode("console.log(await context.value(null))", {
   globals: { "context.value": async () => await doConvexWork() },
 });
 ```
@@ -97,7 +97,7 @@ control to the V8 event loop, so `runCode()` and `runFile()` are awaited:
 
 ```js
 const result = await engine.runCode(
-  "(async () => { console.log(JSON.stringify(await tools.search({ q: 'kittens' }))) })()",
+  "console.log(JSON.stringify(await tools.search({ q: 'kittens' })))",
   { globals: { "tools.search": async (args) => await performSearch(args) } },
 );
 ```
@@ -113,8 +113,21 @@ runs, including a synchronous callback; an `fs.promises` call waits for a slot
 instead. Promises returned by admitted callbacks remain observed even when the
 run is cancelled before consuming their results.
 
+The entry script runs as an async function, so `await` works at its top level,
+as in the examples above. Modules loaded with `require()` stay synchronous. A
+program that runs out of work while a top-level `await` is still pending exits
+with code 13 and a warning, as in Node.
+
+Timers follow Node: `setTimeout`, `setInterval`, `setImmediate`, their `clear*`
+counterparts, `require('timers')`, and `require('timers/promises')`. Timer and
+immediate handles support `ref()`, `unref()`, and `hasRef()`, and timeouts also
+support `refresh()`. While the guest waits for a timer it suspends, and the host
+sets a timer of its own, so the V8 event loop stays free. A run ends once no
+referenced timer, immediate, or host call remains, and its timers count against
+`timeoutMs` like any other wait.
+
 `process.exit()` ends the guest at once, as in Node: queued promise callbacks
-do not run, and pending host calls are abandoned rather than awaited.
+and timers do not run, and pending host calls are abandoned rather than awaited.
 
 ## Optional filesystem capability
 
@@ -164,7 +177,7 @@ whose `FileHandle` supports `read`, `write`, `truncate`, and `close`.
 
 ```js
 const result = await engine.runCode(
-  "(async () => { console.log(await require('fs').promises.readFile('/data/report.csv', 'utf8')) })()",
+  "console.log(await require('fs').promises.readFile('/data/report.csv', 'utf8'))",
   { vfs: objectStoreVfs },
 );
 ```
@@ -213,7 +226,7 @@ requested to stay within the response budget. Paths and recursive traversal
 are limited to 256 components.
 
 The monotonic `timeoutMs` budget covers source loading in `runFile`, guest
-execution, synchronous host calls, and the promises the guest awaits. A host callback already executing cannot
+execution, synchronous host calls, the promises the guest awaits, and its timers. A host callback already executing cannot
 be interrupted mid-call; further guest filesystem operations are rejected after
 it returns if the deadline has expired.
 
