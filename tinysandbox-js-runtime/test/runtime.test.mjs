@@ -72,6 +72,7 @@ test("supports dotted globals, JSON-safe values, and awaited async globals", asy
   assert.equal(awaited.stdout, "42\n");
   await assert.rejects(() => engine.runCode("", { globals: { "tools": () => null, "tools.search": () => null } }), /conflicts/);
   await assert.rejects(() => engine.runCode("", { globals: { "console.log": () => null } }), /reserved/);
+  await assert.rejects(() => engine.runCode("", { globals: { setTimeout: () => null } }), /reserved/);
   await assert.rejects(() => engine.runCode("", { globals: { "bad-name": () => null } }), /invalid name/);
 });
 
@@ -277,6 +278,34 @@ test("top-level await suspends on async globals until they settle", async () => 
   );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "slow fast slow\n");
+});
+
+test("timers keep running while the guest awaits host calls", async () => {
+  const engine = await createEngine(bytes);
+  const later = (ms, value) => async () => { await new Promise((r) => setTimeout(r, ms)); return value; };
+  // The unreferenced timer fires because the pending call keeps the loop alive.
+  const result = await engine.runCode(
+    "let ticks = 0; const t = setInterval(() => ticks++, 2); setTimeout(() => console.log('unref fired'), 5).unref(); const value = await slow(); clearInterval(t); console.log(value, ticks > 1)",
+    { globals: { slow: later(100, "slow") } },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "unref fired\nslow true\n");
+});
+
+test("a pending timer cannot outlive the deadline or an abort", async () => {
+  const engine = await createEngine(bytes);
+  for (const code of ["setTimeout(() => console.log('never'), 60000)", "setInterval(() => {}, 1)", "(function spin() { setImmediate(spin) })()"]) {
+    const started = performance.now();
+    const result = await engine.runCode(code, { timeoutMs: 100 });
+    assert.equal(result.exitCode, 124, code);
+    assert.equal(result.stderr, "js: command timed out\n", code);
+    assert.ok(performance.now() - started < 1000, code);
+  }
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 20);
+  const result = await engine.runCode("setTimeout(() => console.log('never'), 60000)", { signal: controller.signal });
+  assert.equal(result.exitCode, 124);
+  assert.equal(result.stderr, "js: command cancelled\n");
 });
 
 test("process.exit ends the guest while awaited globals are still pending", async () => {

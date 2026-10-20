@@ -820,7 +820,7 @@ fn js_global_names_are_validated_at_build() {
     });
     assert!(duplicate.is_err(), "duplicate global names should panic");
 
-    for name in ["fetch", "console", "process", "require"] {
+    for name in ["fetch", "console", "process", "require", "setTimeout"] {
         let reserved = std::panic::catch_unwind(|| {
             Sandbox::builder()
                 .js_global(name, |_args| async { Ok(Value::Null) })
@@ -2294,6 +2294,56 @@ async fn js_host_file_reads_and_open_files_have_explicit_budgets() {
     let fds = sandbox.exec(r#"js -e 'const fs = require("fs"); const a = fs.openSync("/workspace/exact", "r"); fs.openSync("/workspace/exact", "r"); try { fs.openSync("/workspace/exact", "r") } catch (e) { console.log(e.code) } fs.closeSync(a); console.log(fs.openSync("/workspace/exact", "r") > a)'"#).await;
     assert_eq!(fds.exit_code, 0, "{}", fds.stderr);
     assert_eq!(fds.stdout, "ENOSPC\ntrue\n");
+}
+
+#[tokio::test]
+async fn js_timer_waits_end_at_the_wall_clock_budget() {
+    // A pending timer parks the guest while the host thread sleeps. The sleep
+    // ends at the deadline with the same 124 status as a busy loop, and timers
+    // that keep coming due cannot outrun the deadline either.
+    warm_js_runtime().await;
+    for script in [
+        "setTimeout(() => console.log(\"never\"), 60000)",
+        "setInterval(() => {}, 1)",
+        "(function spin() { setImmediate(spin) })()",
+    ] {
+        let sandbox = Sandbox::builder()
+            .limits(Limits::default().with_wall_time(Duration::from_millis(200)))
+            .build();
+        let start = Instant::now();
+        let result = sandbox.exec(&format!("js -e '{script}'")).await;
+        assert_eq!(result.exit_code, 124, "{script}: {}", result.stderr);
+        assert_eq!(result.stdout, "", "{script}");
+        assert!(start.elapsed() < Duration::from_secs(2), "{script}");
+    }
+}
+
+#[tokio::test]
+async fn js_dropping_an_exec_ends_its_timer_wait() {
+    // A worker sleeping on a guest timer must notice that its exec was dropped
+    // and release its permit, or the next exec could not start.
+    use tinysandbox::sandbox::{PoolCapacity, Pools};
+    warm_js_runtime().await;
+    let sandbox = Sandbox::builder()
+        .pools(Pools::new(PoolCapacity::default().with_js_workers(1)))
+        .limits(Limits::default().with_wall_time(Duration::from_secs(60)))
+        .build();
+    let parked = tokio::time::timeout(
+        Duration::from_millis(100),
+        sandbox.exec("js -e 'setTimeout(() => {}, 60000)'"),
+    )
+    .await;
+    assert!(
+        parked.is_err(),
+        "the exec should still be waiting on its timer"
+    );
+    let start = Instant::now();
+    let result = sandbox
+        .exec("js -e 'setTimeout(() => console.log(\"next\"), 1)'")
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    assert_eq!(result.stdout, "next\n");
+    assert!(start.elapsed() < Duration::from_secs(5));
 }
 
 #[tokio::test]

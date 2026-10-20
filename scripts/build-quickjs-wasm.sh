@@ -82,6 +82,8 @@ TMP_OUT="${WORK}/quickjs-tinysandbox.wasm"
   -Wl,--export=tinysandbox_abi_version \
   -Wl,--export=tinysandbox_run \
   -Wl,--export=tinysandbox_resolve \
+  -Wl,--export=tinysandbox_timer_delay \
+  -Wl,--export=tinysandbox_wake \
   -Wl,--export-memory \
   -Wl,--strip-all \
   -o "${TMP_OUT}"

@@ -5,7 +5,7 @@
 #include "quickjs.h"
 
 #define TINYSANDBOX_QUICKJS_STACK_SIZE (768 * 1024)
-#define TINYSANDBOX_ABI_VERSION 14
+#define TINYSANDBOX_ABI_VERSION 15
 
 /* Host answer to a call: the response is staged, or it will arrive later. */
 #define TB_HOST_INLINE 0
@@ -14,7 +14,8 @@
  * but every slot is taken, or the guest needs the answer inline. */
 #define TB_CALL_NO_SLOT (-1)
 #define TB_CALL_INLINE (-2)
-/* tinysandbox_run/tinysandbox_resolve returned with the guest still alive. */
+/* tinysandbox_run/tinysandbox_resolve/tinysandbox_wake returned with the guest
+ * still alive. */
 #define TB_SUSPENDED INT32_MIN
 #define TB_MAX_PENDING 64
 
@@ -80,6 +81,14 @@ typedef struct {
     /* The entry script's completion promise, settled when its top-level code
      * finishes, including any top-level await. */
     JSValue main;
+    /* The glue's event-loop hooks: how long the loop may wait, and running the
+     * timers and immediates that are due. */
+    JSValue timer_delay;
+    JSValue timer_begin;
+    JSValue timer_run;
+    /* Milliseconds from the last suspension until the next timer is due, or -1
+     * when the guest waits on host calls alone. */
+    int32_t wake_delay;
 } Session;
 
 static Session tb_session;
@@ -101,12 +110,14 @@ static const char TINYSANDBOX_GLUE[] =
 "  const writeStderr = globalThis.__tinysandbox_stderr\n"
 "  const exit = globalThis.__tinysandbox_exit\n"
 "  const evalModule = globalThis.__tinysandbox_eval_module\n"
+"  const registerTimers = globalThis.__tinysandbox_timers\n"
 "  const config = globalThis.__tinysandboxConfig\n"
 "  delete globalThis.__tinysandbox_host_call\n"
 "  delete globalThis.__tinysandbox_stdout\n"
 "  delete globalThis.__tinysandbox_stderr\n"
 "  delete globalThis.__tinysandbox_exit\n"
 "  delete globalThis.__tinysandbox_eval_module\n"
+"  delete globalThis.__tinysandbox_timers\n"
 "  delete globalThis.__tinysandboxConfig\n"
 "  function lower(code) { return String(code || '').toLowerCase().replace(/^e/, '') }\n"
 "  function normalizeEncoding(encoding) {\n"
@@ -622,6 +633,206 @@ static const char TINYSANDBOX_GLUE[] =
 "    if (name !== 'exists') fs[name] = callbackUnsupported(name)\n"
 "  }\n"
 "  for (const name of ['readFile', 'writeFile', 'appendFile', 'mkdir', 'readdir', 'stat', 'rename', 'rm', 'unlink', 'rmdir', 'copyFile']) promises[name] = promiseFs(operations[name])\n"
+"  // Timers. The shim runs the event loop: once the job queue drains it asks\n"
+"  // timerDelay() how long it may wait, and once that reaches zero it calls\n"
+"  // beginTimers() and then runTimer() until that returns false, draining the\n"
+"  // job queue after each callback. As in Node, one turn runs the timers due\n"
+"  // when it began and then the immediates queued before its immediate phase.\n"
+"  const clock = performance.now.bind(performance)\n"
+"  const TIMEOUT_MAX = 2 ** 31 - 1\n"
+"  const kTimer = Symbol('timer')\n"
+"  const kImmediate = Symbol('immediate')\n"
+"  // A min-heap of {timer, due, seq}. Clearing or rescheduling a timer leaves\n"
+"  // its old entry behind; an entry is live only while its timer points at it.\n"
+"  const timerHeap = []\n"
+"  const activeTimers = new Map()\n"
+"  const immediates = []\n"
+"  let immediateHead = 0\n"
+"  let immediateBudget = 0\n"
+"  let nextTimerId = 1\n"
+"  let timerSeq = 0\n"
+"  let refedTimers = 0\n"
+"  let queuedImmediates = 0\n"
+"  let refedImmediates = 0\n"
+"  let turnStarted = 0\n"
+"  let timersPhase = false\n"
+"  function precedes(a, b) { return a.due < b.due || (a.due === b.due && a.seq < b.seq) }\n"
+"  function heapPush(entry) {\n"
+"    let i = timerHeap.push(entry) - 1\n"
+"    while (i > 0) {\n"
+"      const parent = (i - 1) >> 1\n"
+"      if (!precedes(timerHeap[i], timerHeap[parent])) break\n"
+"      ;[timerHeap[i], timerHeap[parent]] = [timerHeap[parent], timerHeap[i]]\n"
+"      i = parent\n"
+"    }\n"
+"  }\n"
+"  function heapPop() {\n"
+"    const last = timerHeap.pop()\n"
+"    if (timerHeap.length === 0) return\n"
+"    timerHeap[0] = last\n"
+"    let i = 0\n"
+"    for (;;) {\n"
+"      const left = 2 * i + 1\n"
+"      let least = i\n"
+"      if (left < timerHeap.length && precedes(timerHeap[left], timerHeap[least])) least = left\n"
+"      if (left + 1 < timerHeap.length && precedes(timerHeap[left + 1], timerHeap[least])) least = left + 1\n"
+"      if (least === i) return\n"
+"      ;[timerHeap[i], timerHeap[least]] = [timerHeap[least], timerHeap[i]]\n"
+"      i = least\n"
+"    }\n"
+"  }\n"
+"  function nextTimer() {\n"
+"    while (timerHeap.length > 0 && timerHeap[0].timer.entry !== timerHeap[0]) heapPop()\n"
+"    return timerHeap[0]\n"
+"  }\n"
+"  function schedule(timer, from) {\n"
+"    if (!activeTimers.has(timer.id)) {\n"
+"      activeTimers.set(timer.id, timer)\n"
+"      if (timer.ref) refedTimers++\n"
+"    }\n"
+"    timer.entry = { timer, due: from + timer.delay, seq: timerSeq++ }\n"
+"    heapPush(timer.entry)\n"
+"    // Drop stale entries once they outnumber live ones. A sorted array is a heap.\n"
+"    if (timerHeap.length > 64 && timerHeap.length > 2 * activeTimers.size) {\n"
+"      const live = timerHeap.filter(entry => entry.timer.entry === entry).sort((a, b) => precedes(a, b) ? -1 : 1)\n"
+"      for (let i = 0; i < live.length; i++) timerHeap[i] = live[i]\n"
+"      timerHeap.length = live.length\n"
+"    }\n"
+"  }\n"
+"  function unschedule(timer) {\n"
+"    if (!activeTimers.delete(timer.id)) return\n"
+"    if (timer.ref) refedTimers--\n"
+"    timer.entry = null\n"
+"  }\n"
+"  function received(value) {\n"
+"    if (value === null || value === undefined) return String(value)\n"
+"    if (typeof value === 'object') return value.constructor && value.constructor.name ? `an instance of ${value.constructor.name}` : formatInspect(value)\n"
+"    return `type ${typeof value} (${inspect(value, true)})`\n"
+"  }\n"
+"  function timerCallback(callback) {\n"
+"    if (typeof callback === 'function') return callback\n"
+"    const err = new TypeError(`The \"callback\" argument must be of type function. Received ${received(callback)}`)\n"
+"    err.code = 'ERR_INVALID_ARG_TYPE'\n"
+"    throw err\n"
+"  }\n"
+"  class Timeout {\n"
+"    constructor(timer) { this[kTimer] = timer }\n"
+"    ref() { setTimerRef(this[kTimer], true); return this }\n"
+"    unref() { setTimerRef(this[kTimer], false); return this }\n"
+"    hasRef() { return this[kTimer].ref }\n"
+"    // Restarts the countdown, including for a timer that already fired.\n"
+"    refresh() {\n"
+"      const timer = this[kTimer]\n"
+"      if (!timer.cleared) schedule(timer, clock())\n"
+"      return this\n"
+"    }\n"
+"    close() { clearTimeout(this); return this }\n"
+"    [Symbol.toPrimitive]() { return this[kTimer].id }\n"
+"  }\n"
+"  function setTimerRef(timer, ref) {\n"
+"    if (timer.ref !== ref && activeTimers.has(timer.id)) refedTimers += ref ? 1 : -1\n"
+"    timer.ref = ref\n"
+"  }\n"
+"  function startTimer(callback, delay, args, repeat) {\n"
+"    // Node's coercion: anything outside 1..TIMEOUT_MAX, NaN included, becomes 1.\n"
+"    let ms = delay * 1\n"
+"    if (!(ms >= 1 && ms <= TIMEOUT_MAX)) ms = 1\n"
+"    const timer = { id: nextTimerId++, callback: timerCallback(callback), args, delay: ms, repeat, ref: true, cleared: false, entry: null, handle: null }\n"
+"    timer.handle = new Timeout(timer)\n"
+"    schedule(timer, clock())\n"
+"    return timer.handle\n"
+"  }\n"
+"  function clearTimer(handle) {\n"
+"    const timer = handle instanceof Timeout ? handle[kTimer]\n"
+"      : typeof handle === 'number' || typeof handle === 'string' ? activeTimers.get(Number(handle)) : undefined\n"
+"    if (timer === undefined) return\n"
+"    timer.cleared = true\n"
+"    unschedule(timer)\n"
+"  }\n"
+"  function setTimeout(callback, delay, ...args) { return startTimer(callback, delay, args, false) }\n"
+"  function setInterval(callback, delay, ...args) { return startTimer(callback, delay, args, true) }\n"
+"  function clearTimeout(handle) { clearTimer(handle) }\n"
+"  function clearInterval(handle) { clearTimer(handle) }\n"
+"  class Immediate {\n"
+"    constructor(immediate) { this[kImmediate] = immediate }\n"
+"    ref() { setImmediateRef(this[kImmediate], true); return this }\n"
+"    unref() { setImmediateRef(this[kImmediate], false); return this }\n"
+"    hasRef() { return this[kImmediate].ref }\n"
+"  }\n"
+"  function setImmediateRef(immediate, ref) {\n"
+"    if (immediate.ref !== ref && immediate.queued) refedImmediates += ref ? 1 : -1\n"
+"    immediate.ref = ref\n"
+"  }\n"
+"  function dequeueImmediate(immediate) {\n"
+"    if (!immediate.queued) return\n"
+"    immediate.queued = false\n"
+"    queuedImmediates--\n"
+"    if (immediate.ref) refedImmediates--\n"
+"  }\n"
+"  function setImmediate(callback, ...args) {\n"
+"    const immediate = { callback: timerCallback(callback), args, ref: true, queued: true, handle: null }\n"
+"    immediate.handle = new Immediate(immediate)\n"
+"    immediates.push(immediate)\n"
+"    queuedImmediates++\n"
+"    refedImmediates++\n"
+"    return immediate.handle\n"
+"  }\n"
+"  function clearImmediate(handle) {\n"
+"    if (handle instanceof Immediate) dequeueImmediate(handle[kImmediate])\n"
+"  }\n"
+"  // Milliseconds until the next callback is due, or -1 when nothing keeps the\n"
+"  // loop alive. Unreferenced timers still fire while host calls are pending.\n"
+"  function timerDelay(hostPending) {\n"
+"    if (!hostPending && refedTimers === 0 && refedImmediates === 0) return -1\n"
+"    if (queuedImmediates > 0) return 0\n"
+"    const entry = nextTimer()\n"
+"    return entry === undefined ? -1 : Math.max(0, Math.ceil(entry.due - clock()))\n"
+"  }\n"
+"  function beginTimers() {\n"
+"    immediates.splice(0, immediateHead)\n"
+"    immediateHead = 0\n"
+"    turnStarted = clock()\n"
+"    timersPhase = true\n"
+"  }\n"
+"  function runTimer() {\n"
+"    if (timersPhase) {\n"
+"      const entry = nextTimer()\n"
+"      if (entry !== undefined && entry.due <= turnStarted) {\n"
+"        heapPop()\n"
+"        const timer = entry.timer\n"
+"        if (timer.repeat) timer.entry = null\n"
+"        else unschedule(timer)\n"
+"        timer.callback.apply(timer.handle, timer.args)\n"
+"        // An interval reschedules unless its callback cleared or refreshed it.\n"
+"        if (timer.repeat && timer.entry === null && activeTimers.has(timer.id)) schedule(timer, turnStarted)\n"
+"        return true\n"
+"      }\n"
+"      timersPhase = false\n"
+"      immediateBudget = immediates.length - immediateHead\n"
+"    }\n"
+"    while (immediateBudget > 0) {\n"
+"      immediateBudget--\n"
+"      const immediate = immediates[immediateHead]\n"
+"      immediates[immediateHead++] = undefined\n"
+"      if (!immediate.queued) continue\n"
+"      dequeueImmediate(immediate)\n"
+"      immediate.callback.apply(immediate.handle, immediate.args)\n"
+"      return true\n"
+"    }\n"
+"    return false\n"
+"  }\n"
+"  registerTimers(timerDelay, beginTimers, runTimer)\n"
+"  function promiseTimer(start, options) {\n"
+"    return new Promise(resolve => {\n"
+"      const handle = start(resolve)\n"
+"      if (options && options.ref === false) handle.unref()\n"
+"    })\n"
+"  }\n"
+"  const timersPromises = {\n"
+"    setTimeout: (delay, value, options) => promiseTimer(resolve => setTimeout(resolve, delay, value), options),\n"
+"    setImmediate: (value, options) => promiseTimer(resolve => setImmediate(resolve, value), options),\n"
+"  }\n"
+"  const timersModule = { setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, clearImmediate, promises: timersPromises }\n"
 "  const moduleCache = Object.create(null)\n"
 "  const MAX_REQUIRE_DEPTH = 256\n"
 "  let mainModule = null\n"
@@ -705,6 +916,8 @@ static const char TINYSANDBOX_GLUE[] =
 "  }\n"
 "  function makeRequire(module) {\n"
 "    function localRequire(specifier) {\n"
+"      if (specifier === 'timers') return timersModule\n"
+"      if (specifier === 'timers/promises') return timersPromises\n"
 "      if (!config.vfs) {\n"
 "        const err = new Error('filesystem capability is not available in this runtime')\n"
 "        err.code = 'ERR_CAPABILITY_UNAVAILABLE'\n"
@@ -826,6 +1039,7 @@ static const char TINYSANDBOX_GLUE[] =
 "  globalThis.Response = Response\n"
 "  globalThis.fetch = fetch\n"
 "  globalThis.console = { log: (...args) => writeStdout(line(args)), info: (...args) => writeStdout(line(args)), error: (...args) => writeStderr(line(args)), warn: (...args) => writeStderr(line(args)) }\n"
+"  Object.assign(globalThis, { setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, clearImmediate })\n"
 "  globalThis.process = { argv: config.argv, env: config.env, cwd: () => config.cwd, exit: code => exit(code === undefined ? 0 : Number(code) || 0) }\n"
 "  if (Array.isArray(config.globals) && config.globals.length > 0) installGlobals(config.globals)\n"
 "  return runMain\n"
@@ -994,6 +1208,21 @@ static JSValue js_eval_module(JSContext *ctx, JSValueConst this_val, int argc, J
     JS_FreeCString(ctx, source);
     JS_FreeCString(ctx, filename);
     return result;
+}
+
+static JSValue js_register_timers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "timer registration requires three hooks");
+    }
+    JS_FreeValue(ctx, tb_session.timer_delay);
+    JS_FreeValue(ctx, tb_session.timer_begin);
+    JS_FreeValue(ctx, tb_session.timer_run);
+    tb_session.timer_delay = JS_DupValue(ctx, argv[0]);
+    tb_session.timer_begin = JS_DupValue(ctx, argv[1]);
+    tb_session.timer_run = JS_DupValue(ctx, argv[2]);
+    return JS_UNDEFINED;
 }
 
 static void set_function(JSContext *ctx, const char *name, JSCFunction *func, int argc)
@@ -1188,7 +1417,13 @@ static int32_t session_finish(int32_t code)
     }
     tb_session.pending_count = 0;
     JS_FreeValue(ctx, tb_session.main);
+    JS_FreeValue(ctx, tb_session.timer_delay);
+    JS_FreeValue(ctx, tb_session.timer_begin);
+    JS_FreeValue(ctx, tb_session.timer_run);
     tb_session.main = JS_UNDEFINED;
+    tb_session.timer_delay = JS_UNDEFINED;
+    tb_session.timer_begin = JS_UNDEFINED;
+    tb_session.timer_run = JS_UNDEFINED;
     clear_unhandled_rejections(ctx, &tb_session.rejections);
     JS_FreeContext(ctx);
     JS_FreeRuntime(tb_session.rt);
@@ -1198,27 +1433,112 @@ static int32_t session_finish(int32_t code)
     return code;
 }
 
-/* Drains the job queue, then either parks the guest awaiting the host or ends
- * it. Outstanding host calls are the only thing that can advance a drained
- * queue, so their presence is exactly the suspend condition. As in Node,
+/* Asks the glue how long the event loop may wait: milliseconds until the next
+ * timer or immediate is due, or -1 when nothing but host calls can wake it. */
+static int32_t timers_delay(int32_t *delay)
+{
+    JSContext *ctx = tb_session.ctx;
+    JSValue host_pending = JS_NewBool(ctx, tb_session.pending_count > 0);
+    JSValue result = JS_Call(ctx, tb_session.timer_delay, JS_UNDEFINED, 1, (JSValueConst *)&host_pending);
+    if (JS_IsException(result)) {
+        return handle_eval_result(ctx, result);
+    }
+    double ms = -1;
+    JS_ToFloat64(ctx, &ms, result);
+    JS_FreeValue(ctx, result);
+    *delay = !(ms >= 0) ? -1 : ms >= INT32_MAX ? INT32_MAX : (int32_t)ms;
+    return 0;
+}
+
+/* Runs one turn of the event loop: the timers due when it began, then the
+ * immediates queued before its immediate phase, draining the job queue after
+ * each callback as Node does. */
+static int32_t run_timers(void)
+{
+    JSContext *ctx = tb_session.ctx;
+    JSValue begun = JS_Call(ctx, tb_session.timer_begin, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(begun)) {
+        return handle_eval_result(ctx, begun);
+    }
+    JS_FreeValue(ctx, begun);
+    for (;;) {
+        JSValue ran = JS_Call(ctx, tb_session.timer_run, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(ran)) {
+            return handle_eval_result(ctx, ran);
+        }
+        int more = JS_ToBool(ctx, ran);
+        JS_FreeValue(ctx, ran);
+        if (!more) {
+            return 0;
+        }
+        int32_t code = drain_pending_jobs(tb_session.rt, ctx, &tb_session.rejections);
+        if (code != 0 || tb_session.exited) {
+            return code;
+        }
+    }
+}
+
+/* Runs the event loop until the guest must wait or has nothing left to do.
+ * Due timers run here; outstanding host calls or a timer not yet due park the
+ * guest, and the host resumes it with tinysandbox_resolve or tinysandbox_wake.
+ * While host calls are outstanding the guest parks even for a due timer, so a
+ * stream of timers cannot keep their answers from being delivered. As in Node,
  * process.exit() ends the program at once, whatever its status: queued jobs
- * never run and outstanding host calls are abandoned, and a program that runs
- * out of work while its top-level await is still pending exits with 13. */
+ * and timers never run and outstanding host calls are abandoned, and a program
+ * that runs out of work while its top-level await is still pending exits with
+ * 13. */
 static int32_t session_settle(int32_t code)
 {
-    if (code == 0 && !tb_session.exited) {
-        code = drain_pending_jobs(tb_session.rt, tb_session.ctx, &tb_session.rejections);
+    for (;;) {
+        if (code == 0 && !tb_session.exited) {
+            code = drain_pending_jobs(tb_session.rt, tb_session.ctx, &tb_session.rejections);
+        }
+        if (code != 0 || tb_session.exited) {
+            return session_finish(code);
+        }
+        int32_t delay = -1;
+        code = timers_delay(&delay);
+        if (code != 0 || tb_session.exited) {
+            return session_finish(code);
+        }
+        if (tb_session.pending_count > 0 || delay > 0) {
+            tb_session.wake_delay = delay;
+            return TB_SUSPENDED;
+        }
+        if (delay < 0) {
+            break;
+        }
+        /* Timers that keep coming due never return to the host, so check the
+         * deadline here as well as inside their callbacks. */
+        if (tb_should_interrupt()) {
+            return session_finish(1);
+        }
+        code = run_timers();
     }
-    if (code == 0 && !tb_session.exited && tb_session.pending_count > 0) {
-        return TB_SUSPENDED;
-    }
-    if (code == 0 && !tb_session.exited &&
-        JS_PromiseState(tb_session.ctx, tb_session.main) == JS_PROMISE_PENDING) {
+    if (JS_PromiseState(tb_session.ctx, tb_session.main) == JS_PROMISE_PENDING) {
         static const char warning[] = "Warning: Detected unsettled top-level await\n";
         tb_write_stderr((const uint8_t *)warning, (int32_t)(sizeof(warning) - 1));
-        code = 13;
+        return session_finish(13);
     }
-    return session_finish(code);
+    return session_finish(0);
+}
+
+/* How long the parked guest may sleep before tinysandbox_wake: milliseconds
+ * until its next timer is due, or -1 when only a host call can resume it. */
+__attribute__((export_name("tinysandbox_timer_delay")))
+int32_t tinysandbox_timer_delay(void)
+{
+    return tb_session.active ? tb_session.wake_delay : -1;
+}
+
+/* Runs the timers that came due while the guest was parked and resumes it. */
+__attribute__((export_name("tinysandbox_wake")))
+int32_t tinysandbox_wake(void)
+{
+    if (!tb_session.active) {
+        return 1;
+    }
+    return session_settle(run_timers());
 }
 
 /* Settles one deferred host call with the staged response and resumes. */
@@ -1283,6 +1603,9 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     }
     memset(&tb_session, 0, sizeof(tb_session));
     tb_session.main = JS_UNDEFINED;
+    tb_session.timer_delay = JS_UNDEFINED;
+    tb_session.timer_begin = JS_UNDEFINED;
+    tb_session.timer_run = JS_UNDEFINED;
 
     JSRuntime *rt = JS_NewRuntime();
     if (!rt) {
@@ -1315,6 +1638,7 @@ int32_t tinysandbox_run(const uint8_t *input, int32_t input_len, int32_t heap_li
     set_function(ctx, "__tinysandbox_stderr", js_write_stderr, 1);
     set_function(ctx, "__tinysandbox_exit", js_process_exit, 1);
     set_function(ctx, "__tinysandbox_eval_module", js_eval_module, 2);
+    set_function(ctx, "__tinysandbox_timers", js_register_timers, 3);
 
     JSValue config = JS_ParseJSON(ctx, (const char *)input, (size_t)input_len, "<tinysandbox-config>");
     if (JS_IsException(config)) {
