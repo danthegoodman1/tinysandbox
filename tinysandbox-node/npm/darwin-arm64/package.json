@@ -1,6 +1,6 @@
 {
   "name": "@tinysandbox/tinysandbox-darwin-arm64",
-  "version": "0.8.7",
+  "version": "0.9.0",
   "cpu": [
     "arm64"
   ],
