@@ -185,7 +185,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-26-intel, macos-26]
+        os: [macos-26]
     runs-on: ${{ matrix.os }}
 
     steps:

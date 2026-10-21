@@ -17,12 +17,6 @@ export const nativeTargets = [
     cpu: ['arm64']
   },
   {
-    triple: 'x86_64-apple-darwin',
-    target: 'darwin-x64',
-    os: ['darwin'],
-    cpu: ['x64']
-  },
-  {
     triple: 'aarch64-unknown-linux-gnu',
     target: 'linux-arm64-gnu',
     os: ['linux'],

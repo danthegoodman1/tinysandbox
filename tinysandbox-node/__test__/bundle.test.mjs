@@ -10,8 +10,8 @@ import { build } from 'esbuild'
 const packageRoot = new URL('../', import.meta.url)
 
 function currentTarget() {
-  if (process.platform === 'darwin' && ['arm64', 'x64'].includes(process.arch)) {
-    return `darwin-${process.arch}`
+  if (process.platform === 'darwin' && process.arch === 'arm64') {
+    return 'darwin-arm64'
   }
   if (process.platform === 'linux' && ['arm64', 'x64'].includes(process.arch)) {
     return `linux-${process.arch}-gnu`
@@ -68,7 +68,6 @@ test('a bundled facade loads only the auto-detected native package', async (t) =
   const bundle = readFileSync(bundlePath, 'utf8')
   for (const unsupportedTarget of [
     'darwin-arm64',
-    'darwin-x64',
     'linux-arm64-gnu',
     'linux-x64-gnu'
   ].filter((candidate) => candidate !== target)) {

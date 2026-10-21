@@ -10,7 +10,6 @@ const rustManifests = [
 ]
 const nativeNpmPackages = [
   { path: "tinysandbox-node/npm/darwin-arm64/package.json", packageName: "@tinysandbox/tinysandbox-darwin-arm64" },
-  { path: "tinysandbox-node/npm/darwin-x64/package.json", packageName: "@tinysandbox/tinysandbox-darwin-x64" },
   { path: "tinysandbox-node/npm/linux-arm64-gnu/package.json", packageName: "@tinysandbox/tinysandbox-linux-arm64-gnu" },
   { path: "tinysandbox-node/npm/linux-x64-gnu/package.json", packageName: "@tinysandbox/tinysandbox-linux-x64-gnu" }
 ]

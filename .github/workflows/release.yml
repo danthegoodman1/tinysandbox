@@ -193,10 +193,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-26-intel
-            artifact: macos-x64
-            uname_arch: x86_64
-            binding: tinysandbox-node.darwin-x64.node
           - os: macos-26
             artifact: macos-arm64
             uname_arch: arm64
@@ -327,7 +323,6 @@ jobs:
           required_native_bindings=(
             tinysandbox-node.linux-x64-gnu.node
             tinysandbox-node.linux-arm64-gnu.node
-            tinysandbox-node.darwin-x64.node
             tinysandbox-node.darwin-arm64.node
           )
           artifact_count="$(find native-artifacts -maxdepth 1 -name '*.node' | wc -l | tr -d ' ')"
@@ -421,7 +416,7 @@ jobs:
             exit 1
           fi
 
-          native_targets=(darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu)
+          native_targets=(darwin-arm64 linux-arm64-gnu linux-x64-gnu)
           for target in "${native_targets[@]}"; do
             package_dir="npm/${target}"
             package_name="$(node -p "require('./${package_dir}/package.json').name")"
